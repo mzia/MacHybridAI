@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "machybrid-engine"
+version = "1.0.0"
+description = "Hybrid Compute AI Engine for macOS with PII Guardian, Google Antigravity, Gemini, Local Models, OpenAI Extension, and M365 Copilot Proxy"
+readme = "../README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "mzia" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+cloud = [
+    "google-genai>=2.3.0",
+    "google-antigravity>=0.1.0",
+]
+local = [
+    "litert-lm>=0.15.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+    "bandit>=1.7.8",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+machybrid-daemon = "machybrid.server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
