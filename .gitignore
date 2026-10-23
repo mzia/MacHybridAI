@@ -1,0 +1,29 @@
+# macOS & Swift
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+*.app/
+*.pkg
+*.dmg
+dmg_stage/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+coverage.xml
+pytest-report.xml
+
+# Secrets & Local Config
+.env
+*.env
+secrets.json
+msal-cache.json
+agent-id.json
