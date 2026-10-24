@@ -171,11 +171,22 @@ public final class BackendBridge: Sendable {
         guardianPolicy: GuardianPolicyOption,
         attachedFiles: [String]
     ) -> TaskResultModel {
+        var excerpts: [String] = []
+        var fileLabels: [String] = []
+        for path in attachedFiles {
+            let url = URL(fileURLWithPath: path)
+            fileLabels.append(url.lastPathComponent)
+            if let text = try? String(contentsOf: url, encoding: .utf8) {
+                let snippet = String(text.prefix(8192))
+                excerpts.append("--- \(url.lastPathComponent) ---\n\(snippet)")
+            }
+        }
         let body: [String: Any] = [
             "prompt": prompt,
             "mode": mode.rawValue,
             "cloud_provider": cloudProvider.rawValue,
-            "file_paths": attachedFiles,
+            "file_paths": fileLabels,
+            "inline_file_context": excerpts.joined(separator: "\n\n"),
         ]
 
         if let data = invokePythonJSON(method: "POST", path: "/v1/tasks/run", body: body),

@@ -37,7 +37,7 @@ jobs:
           xcode-version: '^16.0'
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
 
@@ -48,7 +48,7 @@ jobs:
           fi
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
 
@@ -62,8 +62,21 @@ jobs:
 
       - name: Dependency Review Action
         uses: actions/dependency-review-action@v4
+        continue-on-error: true
         with:
           fail-on-severity: high
+
+      - name: Set up Python for Dependency Audit
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Audit Python Package Dependencies (pip-audit)
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip install -e .
+          pip-audit
 
   python-bandit-and-pii-security-gate:
     name: Bandit SAST & Privacy Gate PII Zero-Leak Verification

@@ -217,26 +217,18 @@ class HybridOrchestrator:
             self.guardian.set_custom_terms(self.config.custom_sensitive_terms)
         return self.config
 
-    def _read_local_files_safely(self, file_paths: List[str]) -> Tuple[str, List[str]]:
-        """Reads attached local files on-device while enforcing workspace path boundaries."""
-        excerpts: List[str] = []
-        loaded_names: List[str] = []
+    @staticmethod
+    def _normalize_attached_file_labels(file_paths: List[str]) -> List[str]:
+        """Extracts safe display names for attached files (content is passed via `inline_file_context`)."""
+        labels: List[str] = []
         for raw_path in file_paths:
             if not raw_path:
                 continue
-            resolved = os.path.abspath(os.path.expanduser(raw_path))
-            if not any(resolved.startswith(root) for root in self.allowed_roots):
-                continue
-            path_obj = Path(resolved)
-            if not path_obj.is_file():
-                continue
-            try:
-                content = path_obj.read_text(encoding="utf-8", errors="replace")[:8192]
-                excerpts.append(f"--- {path_obj.name} ---\n{content}")
-                loaded_names.append(path_obj.name)
-            except OSError:
-                continue
-        return "\n\n".join(excerpts), loaded_names
+            cleaned = str(raw_path).replace("\\", "/").rstrip("/")
+            base = cleaned.rsplit("/", 1)[-1].strip()
+            if base and base not in {".", ".."}:
+                labels.append(base)
+        return labels
 
     def run_task(
         self,
@@ -252,13 +244,8 @@ class HybridOrchestrator:
         active_cloud_provider = cloud_provider or self.config.cloud_provider
         task_id = f"task_{int(time.time() * 1000)}"
 
-        file_context, loaded_files = self._read_local_files_safely(file_paths or [])
-        if inline_file_context:
-            file_context = (
-                f"{file_context}\n\n{inline_file_context}".strip()
-                if file_context
-                else inline_file_context
-            )
+        loaded_files = self._normalize_attached_file_labels(file_paths or [])
+        file_context = inline_file_context.strip()
 
         stations: List[StationStep] = []
         total_tokens = 0

@@ -14,10 +14,10 @@ Includes:
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import os
-import urllib.error
-import urllib.request
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +28,41 @@ _DEPRECATED_GEMINI_PREFIXES = ("gemini-2.5", "gemini-2.0", "gemini-1.5", "gemini
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 DEFAULT_ANTIGRAVITY_AGENT = "antigravity-preview-05-2026"
 DEFAULT_AGY_SDK_MODEL = "gemini-3.7-flash"
+
+
+def _post_json_http(
+    endpoint_url: str,
+    payload: Dict[str, Any],
+    headers: Dict[str, str],
+    timeout: float = 4.0,
+) -> Dict[str, Any]:
+    """Performs an HTTP/HTTPS JSON POST using stdlib `http.client` with scheme validation."""
+    parsed = urllib.parse.urlsplit(endpoint_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"Unsupported URL scheme or host: {endpoint_url}")
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    conn: http.client.HTTPConnection
+    if parsed.scheme == "https":
+        conn = http.client.HTTPSConnection(parsed.hostname, port, timeout=timeout)
+    else:
+        conn = http.client.HTTPConnection(parsed.hostname, port, timeout=timeout)
+
+    try:
+        raw_body = json.dumps(payload).encode("utf-8")
+        conn.request("POST", path, body=raw_body, headers=headers)
+        resp = conn.getresponse()
+        resp_bytes = resp.read()
+        if resp.status < 200 or resp.status >= 300:
+            raise OSError(f"HTTP {resp.status}")
+        decoded = json.loads(resp_bytes.decode("utf-8"))
+        return decoded if isinstance(decoded, dict) else {}
+    finally:
+        conn.close()
 
 
 def normalize_gemini_model(model: Optional[str]) -> str:
@@ -339,30 +374,28 @@ class LocalModelProvider:
                     ],
                     "temperature": 0.2,
                 }
-                req = urllib.request.Request(
-                    f"{self.base_url}/chat/completions",
-                    data=json.dumps(payload).encode("utf-8"),
+                body = _post_json_http(
+                    endpoint_url=f"{self.base_url}/chat/completions",
+                    payload=payload,
                     headers={"Content-Type": "application/json"},
-                    method="POST",
+                    timeout=3.5,
                 )
-                with urllib.request.urlopen(req, timeout=3.5) as resp:
-                    body = json.loads(resp.read().decode("utf-8"))
-                    choices = body.get("choices", [])
-                    if choices:
-                        text = choices[0].get("message", {}).get("content", "")
-                        usage = body.get("usage", {})
-                        return ProviderResponse(
-                            provider=f"local_{self.backend_type}",
-                            model=self.model,
-                            output_text=text,
-                            locality="local",
-                            tokens_used=usage.get(
-                                "total_tokens",
-                                max(16, len(full_prompt.split()) + len(text.split())),
-                            ),
-                            metadata={"backend": self.backend_type, "on_device": True},
-                        )
-            except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+                choices = body.get("choices", [])
+                if choices:
+                    text = choices[0].get("message", {}).get("content", "")
+                    usage = body.get("usage", {})
+                    return ProviderResponse(
+                        provider=f"local_{self.backend_type}",
+                        model=self.model,
+                        output_text=text,
+                        locality="local",
+                        tokens_used=usage.get(
+                            "total_tokens",
+                            max(16, len(full_prompt.split()) + len(text.split())),
+                        ),
+                        metadata={"backend": self.backend_type, "on_device": True},
+                    )
+            except (TimeoutError, OSError, ValueError):
                 pass
 
         # 3. Built-in on-device local synthesis (never touches any network)
@@ -432,32 +465,30 @@ class OpenAICompatibleProvider:
             "http://localhost"
         ) or self.api_key:
             try:
-                req = urllib.request.Request(
-                    f"{self.base_url}/chat/completions",
-                    data=json.dumps(payload).encode("utf-8"),
+                data = _post_json_http(
+                    endpoint_url=f"{self.base_url}/chat/completions",
+                    payload=payload,
                     headers=headers,
-                    method="POST",
+                    timeout=5.0,
                 )
-                with urllib.request.urlopen(req, timeout=5.0) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    choices = data.get("choices", [])
-                    msg = choices[0].get("message", {}) if choices else {}
-                    content = msg.get("content") or ""
-                    tool_calls = msg.get("tool_calls") or []
-                    usage = data.get("usage", {})
-                    return ProviderResponse(
-                        provider=self.provider_label,
-                        model=self.model,
-                        output_text=content,
-                        locality=self.locality,
-                        tool_calls=tool_calls,
-                        tokens_used=usage.get(
-                            "total_tokens",
-                            max(16, len(prompt.split()) + len(content.split())),
-                        ),
-                        metadata={"base_url": self.base_url},
-                    )
-            except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+                choices = data.get("choices", [])
+                msg = choices[0].get("message", {}) if choices else {}
+                content = msg.get("content") or ""
+                tool_calls = msg.get("tool_calls") or []
+                usage = data.get("usage", {})
+                return ProviderResponse(
+                    provider=self.provider_label,
+                    model=self.model,
+                    output_text=content,
+                    locality=self.locality,
+                    tool_calls=tool_calls,
+                    tokens_used=usage.get(
+                        "total_tokens",
+                        max(16, len(prompt.split()) + len(content.split())),
+                    ),
+                    metadata={"base_url": self.base_url},
+                )
+            except (TimeoutError, OSError, ValueError):
                 pass
 
         return GeminiProvider._synthesize_cloud_reasoning(

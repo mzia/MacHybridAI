@@ -289,7 +289,9 @@ class PIIGuardian:
                 candidate = match.group(0)
                 if category == "CREDIT_CARD" and not _passes_luhn(candidate):
                     continue
-                if category == "IP_ADDR" and candidate in {"127.0.0.1", "0.0.0.0"}:
+                if category == "IP_ADDR" and (
+                    candidate == "127.0.0.1" or candidate.startswith("0.")
+                ):
                     continue
                 if category == "PERSON" and candidate in self._SAFE_CAPITALIZED_PHRASES:
                     continue

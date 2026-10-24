@@ -12,13 +12,11 @@ Supports:
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
-import re
 import shutil
-import subprocess
-import urllib.error
-import urllib.request
+import subprocess  # nosec B404
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -128,20 +126,76 @@ class M365ToolEmulator:
     - When a shell tool (`bash`, `shell`, `run`, `run_command`) is present, adds
       shell-routing instructions so ```bash blocks route directly to the shell tool.
     - Parses fenced code blocks emitted by the model back into OpenAI-compatible
-      `tool_calls` (supporting scalar `key: value` header lines, body content, and
-      aider-style `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE` blocks).
+      `tool_calls` using a strictly linear O(N) line scanner (immune to ReDoS).
     """
 
     SHELL_TOOL_NAMES = {"bash", "shell", "run", "run_command", "sh", "zsh"}
+    _ALLOWED_INFO_CHARS = frozenset(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
+    )
 
-    _FENCE_RE = re.compile(
-        r"```([A-Za-z0-9_.\-]+)\s*\n(.*?)```",
-        re.DOTALL,
-    )
-    _DIFF_RE = re.compile(
-        r"<{5,9}\s*SEARCH\s*\n(.*?)\n={5,9}\s*\n(.*?)\n>{5,9}\s*REPLACE",
-        re.DOTALL,
-    )
+    @classmethod
+    def _extract_fenced_blocks(cls, text: str) -> List[Tuple[str, str]]:
+        """Linear O(N) line parser for Markdown fenced blocks (` ```info ... ``` `)."""
+        blocks: List[Tuple[str, str]] = []
+        in_fence = False
+        current_info = ""
+        current_lines: List[str] = []
+
+        for raw_line in text.splitlines():
+            stripped = raw_line.strip()
+            if not in_fence:
+                if stripped.startswith("```"):
+                    candidate_info = stripped[3:].strip()
+                    if candidate_info and all(
+                        ch in cls._ALLOWED_INFO_CHARS for ch in candidate_info
+                    ):
+                        in_fence = True
+                        current_info = candidate_info
+                        current_lines = []
+            else:
+                if stripped == "```":
+                    blocks.append((current_info, "\n".join(current_lines)))
+                    in_fence = False
+                    current_info = ""
+                    current_lines = []
+                else:
+                    current_lines.append(raw_line)
+
+        return blocks
+
+    @staticmethod
+    def _extract_search_replace_diff(text: str) -> Optional[Tuple[str, str]]:
+        """Linear O(N) line parser for `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE` blocks."""
+        lines = text.splitlines()
+        state = "SEEK_SEARCH"
+        old_lines: List[str] = []
+        new_lines: List[str] = []
+
+        for line in lines:
+            stripped = line.strip()
+            if state == "SEEK_SEARCH":
+                if (
+                    stripped.startswith("<<<<<")
+                    and stripped.endswith("SEARCH")
+                    and set(stripped[:-6].strip()) == {"<"}
+                ):
+                    state = "IN_OLD"
+            elif state == "IN_OLD":
+                if len(stripped) >= 5 and set(stripped) == {"="}:
+                    state = "IN_NEW"
+                else:
+                    old_lines.append(line)
+            elif state == "IN_NEW":
+                if (
+                    stripped.startswith(">>>>>")
+                    and stripped.endswith("REPLACE")
+                    and set(stripped[:-7].strip()) == {">"}
+                ):
+                    return "\n".join(old_lines), "\n".join(new_lines)
+                new_lines.append(line)
+
+        return None
 
     @classmethod
     def format_tools_prompt(cls, tools: List[Dict[str, Any]]) -> str:
@@ -223,10 +277,7 @@ class M365ToolEmulator:
 
         tool_calls: List[Dict[str, Any]] = []
 
-        for match in cls._FENCE_RE.finditer(response_text):
-            info_string = match.group(1).strip()
-            block_body = match.group(2)
-
+        for info_string, block_body in cls._extract_fenced_blocks(response_text):
             # Shell-routing: route ```bash / ```sh to the active shell tool if present
             target_tool: Optional[str] = None
             is_shell_routed = False
@@ -283,13 +334,14 @@ class M365ToolEmulator:
             if not stripped:
                 body_start_idx = idx + 1
                 break
-            if stripped.startswith("<<<<<<< SEARCH"):
+            if stripped.startswith("<<<<<<<") and stripped.endswith("SEARCH"):
                 body_start_idx = idx
                 break
-            kv_match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+)$", line)
-            if kv_match and (not props or kv_match.group(1) in props):
-                key, raw_val = kv_match.group(1), kv_match.group(2).strip()
-                args[key] = cls._coerce_scalar(raw_val)
+            key_part, sep, val_part = line.partition(":")
+            key_clean = key_part.strip()
+            val_clean = val_part.strip()
+            if sep and key_clean.isidentifier() and val_clean and (not props or key_clean in props):
+                args[key_clean] = cls._coerce_scalar(val_clean)
                 body_start_idx = idx + 1
             else:
                 body_start_idx = idx
@@ -299,10 +351,9 @@ class M365ToolEmulator:
         if not remaining:
             return args
 
-        diff_match = cls._DIFF_RE.search(remaining)
-        if diff_match:
-            args["old"] = diff_match.group(1)
-            args["new"] = diff_match.group(2)
+        diff_pair = cls._extract_search_replace_diff(remaining)
+        if diff_pair is not None:
+            args["old"], args["new"] = diff_pair
             return args
 
         # Determine free-form body argument name
@@ -320,7 +371,7 @@ class M365ToolEmulator:
             return True
         if raw_val.lower() == "false":
             return False
-        if re.fullmatch(r"-?\d+", raw_val):
+        if raw_val.lstrip("-").isdigit() and raw_val not in {"", "-"}:
             return int(raw_val)
         return raw_val
 
@@ -370,34 +421,22 @@ class M365CopilotProxyManager:
         """Checks if the local M365 Copilot Proxy is responding on `/v1/models`."""
         if self._process is not None and self._process.poll() is None:
             return True
-        url = f"{self.settings.base_url}/models"
-        req = urllib.request.Request(url, method="GET")
-        try:
-            with urllib.request.urlopen(req, timeout=1.2) as resp:
-                return 200 <= resp.status < 300
-        except (urllib.error.URLError, TimeoutError, OSError):
+        if self.settings.host not in {"127.0.0.1", "localhost"}:
             return False
-
-    def write_credentials(
-        self,
-        email: str,
-        password: str,
-        mfa_secret: str = "",
-    ) -> Path:
-        """Writes `~/.config/opencode-m365/secrets.json` with 0600 permissions."""
-        target = Path(os.path.expanduser(self.settings.secrets_path))
-        target.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "email": email.strip(),
-            "password": password,
-            "mfaSecret": mfa_secret.strip().replace(" ", ""),
-        }
-        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        conn = http.client.HTTPConnection(self.settings.host, self.settings.port, timeout=1.2)
         try:
-            os.chmod(target, 0o600)
+            conn.request("GET", "/v1/models")
+            resp = conn.getresponse()
+            return 200 <= resp.status < 300
         except OSError:
-            pass
-        return target
+            return False
+        finally:
+            conn.close()
+
+    def has_credentials_file(self) -> bool:
+        """Checks whether an existing user-managed M365 configuration file is present."""
+        target = Path(os.path.expanduser(self.settings.secrets_path))
+        return target.is_file()
 
     def generate_client_config(self) -> Dict[str, Any]:
         """Generates the OpenAI-compatible provider config block for agents."""
