@@ -1,0 +1,104 @@
+name: "Security Scanning (CodeQL, SAST, Dependency Review & PII Gate)"
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  codeql-sast:
+    name: GitHub CodeQL SAST (${{ matrix.language }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: python
+            runner: ubuntu-latest
+          - language: swift
+            runner: macos-14
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode 16 for Swift CodeQL
+        if: matrix.language == 'swift'
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '^16.0'
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Autobuild / Compile Target
+        run: |
+          if [ "${{ matrix.language }}" = "swift" ]; then
+            swift build
+          fi
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  dependency-review:
+    name: GitHub Native Dependency Vulnerability Review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Dependency Review Action
+        uses: actions/dependency-review-action@v4
+        continue-on-error: true
+        with:
+          fail-on-severity: high
+
+      - name: Set up Python for Dependency Audit
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Audit Python Package Dependencies (pip-audit)
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip install -e .
+          pip-audit
+
+  python-bandit-and-pii-security-gate:
+    name: Bandit SAST & Privacy Gate PII Zero-Leak Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Bandit & Pip-Audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit[sarif] pip-audit
+
+      - name: Run Bandit SAST on Python Hybrid Engine
+        run: |
+          bandit -r backend/machybrid -ll -ii
+
+      - name: Run Privacy Gate Zero-PII-Leak Regression Suite
+        run: |
+          PYTHONPATH=backend python -m unittest backend/tests/test_guardian.py backend/tests/test_orchestrator.py -v
