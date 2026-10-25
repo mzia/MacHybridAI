@@ -92,7 +92,7 @@ jobs:
           test -f dist/MacHybridAI-1.0.0.dmg
 
       - name: Upload macOS Installer Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: MacHybridAI-macOS-Distributables
           path: dist/*
