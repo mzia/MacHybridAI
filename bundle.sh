@@ -22,7 +22,14 @@ mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 cp "${BUILD_DIR}/${APP_NAME}" "${MACOS_DIR}/${APP_NAME}"
 chmod +x "${MACOS_DIR}/${APP_NAME}"
 
-echo "==> [3/4] Bundling Python Hybrid Compute & Antigravity Engine..."
+echo "==> [3/5] Generating custom MacHybridAI Split-Compute AppIcon.icns..."
+mkdir -p "${PROJECT_DIR}/build"
+swift "${PROJECT_DIR}/scripts/generate_app_icon.swift" "${PROJECT_DIR}/build/AppIcon.iconset" || true
+if [ -d "${PROJECT_DIR}/build/AppIcon.iconset" ]; then
+    iconutil -c icns "${PROJECT_DIR}/build/AppIcon.iconset" -o "${RESOURCES_DIR}/AppIcon.icns" || true
+fi
+
+echo "==> [4/5] Bundling Python Hybrid Compute & Antigravity Engine..."
 mkdir -p "${BACKEND_DEST}"
 cp -R "${PROJECT_DIR}/backend/machybrid" "${BACKEND_DEST}/"
 cp "${PROJECT_DIR}/backend/pyproject.toml" "${BACKEND_DEST}/"
@@ -34,6 +41,8 @@ cat <<EOF > "${CONTENTS_DIR}/Info.plist"
 <dict>
     <key>CFBundleExecutable</key>
     <string>${APP_NAME}</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.mzia.${APP_NAME}</string>
     <key>CFBundleName</key>
@@ -52,7 +61,7 @@ cat <<EOF > "${CONTENTS_DIR}/Info.plist"
 </plist>
 EOF
 
-echo "==> [4/4] Ad-hoc signing ${APP_BUNDLE}..."
+echo "==> [5/5] Ad-hoc signing ${APP_BUNDLE}..."
 codesign --force --deep --sign - -r='designated => identifier "com.mzia.MacHybridAI"' "${APP_BUNDLE}" 2>/dev/null || codesign --force --deep --sign - "${APP_BUNDLE}" 2>/dev/null || true
 
 echo "=================================================================="

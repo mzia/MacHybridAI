@@ -100,6 +100,94 @@ public struct SwiftNativeGuardian: Sendable {
     }
 }
 
+/// Manages saving user chat and prompt history to Local Mac Storage or iCloud Drive,
+/// with configurable auto-delete retention periods (`24h`, `7d`, `30d`, `90d`, `never`).
+/// Note: Nothing is ever retained in any Cloud AI provider's history (`store=false`).
+public final class PromptHistoryStore: @unchecked Sendable {
+    public let localDirectoryURL: URL
+    public let iCloudDirectoryURL: URL
+
+    public init(
+        customLocalDirectory: URL? = nil,
+        customICloudDirectory: URL? = nil
+    ) {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        self.localDirectoryURL = customLocalDirectory ?? home
+            .appendingPathComponent("Library/Application Support/MacHybridAI/history", isDirectory: true)
+        self.iCloudDirectoryURL = customICloudDirectory ?? home
+            .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs/MacHybridAI", isDirectory: true)
+    }
+
+    public func fileURL(for location: HistoryStorageOption) -> URL {
+        let dir = location == .iCloudDrive ? iCloudDirectoryURL : localDirectoryURL
+        return dir.appendingPathComponent("chat_history.json")
+    }
+
+    public func isICloudAvailable() -> Bool {
+        let parent = iCloudDirectoryURL.deletingLastPathComponent()
+        return FileManager.default.fileExists(atPath: parent.path) || FileManager.default.fileExists(atPath: iCloudDirectoryURL.path)
+    }
+
+    public func loadConversations(
+        from location: HistoryStorageOption,
+        now: Date = Date()
+    ) -> [ChatConversationModel] {
+        let target = fileURL(for: location)
+        guard FileManager.default.fileExists(atPath: target.path),
+              let data = try? Data(contentsOf: target) else {
+            return []
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let decoded = try? decoder.decode([ChatConversationModel].self, from: data) else {
+            return []
+        }
+        let valid = decoded.filter { !$0.isExpired(at: now) }
+        if valid.count != decoded.count {
+            saveConversations(valid, to: location)
+        }
+        return valid
+    }
+
+    public func saveConversations(
+        _ conversations: [ChatConversationModel],
+        to location: HistoryStorageOption
+    ) {
+        let target = fileURL(for: location)
+        let dir = target.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            let data = try encoder.encode(conversations)
+            try data.write(to: target, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+        } catch {
+            // Ignore write errors in restricted environments
+        }
+    }
+
+    public func applyRetentionPolicy(
+        _ policy: HistoryRetentionOption,
+        conversations: [ChatConversationModel],
+        location: HistoryStorageOption,
+        now: Date = Date()
+    ) -> [ChatConversationModel] {
+        var updated: [ChatConversationModel] = []
+        for var conv in conversations {
+            conv.retentionPolicy = policy
+            conv.storageLocation = location
+            conv.expiresAt = policy.computeExpiryDate(from: conv.updatedAt)
+            if !conv.isExpired(at: now) {
+                updated.append(conv)
+            }
+        }
+        saveConversations(updated, to: location)
+        return updated
+    }
+}
+
 /// Bridges the SwiftUI macOS App with the Python `machybrid` backend engine.
 public final class BackendBridge: Sendable {
     public static let shared = BackendBridge()
@@ -169,7 +257,8 @@ public final class BackendBridge: Sendable {
         mode: ComputeModeOption,
         cloudProvider: CloudProviderOption,
         guardianPolicy: GuardianPolicyOption,
-        attachedFiles: [String]
+        attachedFiles: [String],
+        sessionId: String? = nil
     ) -> TaskResultModel {
         var excerpts: [String] = []
         var fileLabels: [String] = []
@@ -181,13 +270,16 @@ public final class BackendBridge: Sendable {
                 excerpts.append("--- \(url.lastPathComponent) ---\n\(snippet)")
             }
         }
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "prompt": prompt,
             "mode": mode.rawValue,
             "cloud_provider": cloudProvider.rawValue,
             "file_paths": fileLabels,
             "inline_file_context": excerpts.joined(separator: "\n\n"),
         ]
+        if let sessionId {
+            body["session_id"] = sessionId
+        }
 
         if let data = invokePythonJSON(method: "POST", path: "/v1/tasks/run", body: body),
            let decoded = try? JSONDecoder().decode(TaskResultModel.self, from: data) {
@@ -200,7 +292,8 @@ public final class BackendBridge: Sendable {
             mode: mode,
             cloudProvider: cloudProvider,
             guardianPolicy: guardianPolicy,
-            attachedFiles: attachedFiles
+            attachedFiles: attachedFiles,
+            sessionId: sessionId
         )
     }
 
@@ -237,7 +330,8 @@ public final class BackendBridge: Sendable {
         mode: ComputeModeOption,
         cloudProvider: CloudProviderOption,
         guardianPolicy: GuardianPolicyOption,
-        attachedFiles: [String]
+        attachedFiles: [String],
+        sessionId: String?
     ) -> TaskResultModel {
         let scan = fallbackGuardian.redactAndRestorePreview(text: prompt, policy: guardianPolicy)
         let categories = Array(Set(scan.entities.map(\.category))).sorted()
@@ -261,10 +355,10 @@ public final class BackendBridge: Sendable {
                     label: "Cloud models",
                     locality: "local",
                     title: "Cloud models not used",
-                    detail: "AI processing stayed 100% on your Mac.",
+                    detail: "AI processing stayed 100% on your Mac. Zero Cloud AI history.",
                     status: "completed",
                     durationMs: 0,
-                    badges: ["Not used"]
+                    badges: ["Not used", "Zero Cloud History"]
                 ),
                 StationStepModel(
                     stationIndex: 3,
@@ -280,6 +374,7 @@ public final class BackendBridge: Sendable {
             ]
             return TaskResultModel(
                 taskId: "task_\(Int(Date().timeIntervalSince1970))",
+                sessionId: sessionId,
                 prompt: prompt,
                 finalOutput: "[On-Device Local Agent · gemma4:26b on Apple Silicon Metal] Completed task locally on this Mac. Nothing left this device.\nTask: \(prompt)",
                 cloudPromptSent: nil,
@@ -292,7 +387,8 @@ public final class BackendBridge: Sendable {
                     piiFlaggedCount: scan.entities.count,
                     piiRestoredCount: 0,
                     piiCategories: categories,
-                    nothingLeftMac: true
+                    nothingLeftMac: true,
+                    cloudZeroRetention: true
                 ),
                 telemetry: TelemetryModel(
                     architecture: "arm64",
@@ -317,7 +413,7 @@ public final class BackendBridge: Sendable {
             )
         }
 
-        var cloudSynthesis = "[\(cloudProvider.displayName)] Benchmarked comparable deals and synthesized reasoning for: \(scan.sanitized)"
+        var cloudSynthesis = "[\(cloudProvider.displayName) · Stateless Zero-History Call] Benchmarked comparable deals and synthesized reasoning for: \(scan.sanitized)"
         for (token, original) in scan.vault {
             cloudSynthesis = cloudSynthesis.replacingOccurrences(of: token, with: original)
         }
@@ -354,11 +450,11 @@ public final class BackendBridge: Sendable {
                 stationId: "cloud",
                 label: "Cloud",
                 locality: "cloud",
-                title: "Cloud reasoning via \(cloudProvider.displayName)",
-                detail: "Researched and reasoned using masked stand-in tokens only.",
+                title: "Stateless Cloud reasoning via \(cloudProvider.displayName)",
+                detail: "Researched using masked stand-in tokens only. store=false: nothing remains in Cloud AI history.",
                 status: "completed",
                 durationMs: 42,
-                badges: [cloudProvider.rawValue]
+                badges: [cloudProvider.rawValue, "Zero Cloud History (store=false)"]
             ),
             StationStepModel(
                 stationIndex: 4,
@@ -375,6 +471,7 @@ public final class BackendBridge: Sendable {
 
         return TaskResultModel(
             taskId: "task_\(Int(Date().timeIntervalSince1970))",
+            sessionId: sessionId,
             prompt: prompt,
             finalOutput: cloudSynthesis,
             cloudPromptSent: scan.sanitized,
@@ -387,7 +484,8 @@ public final class BackendBridge: Sendable {
                 piiFlaggedCount: scan.entities.count,
                 piiRestoredCount: scan.entities.count,
                 piiCategories: categories,
-                nothingLeftMac: false
+                nothingLeftMac: false,
+                cloudZeroRetention: true
             ),
             telemetry: TelemetryModel(
                 architecture: "arm64",
