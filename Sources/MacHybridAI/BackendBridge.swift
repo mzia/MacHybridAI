@@ -101,7 +101,7 @@ public struct SwiftNativeGuardian: Sendable {
         var cursor = 0
         for entity in entities {
             if entity.start > cursor {
-                result += (text as NSString).substring(from: cursor, length: entity.start - cursor)
+                result += (text as NSString).substring(with: NSRange(location: cursor, length: entity.start - cursor))
             }
             result += entity.replacementToken
             cursor = entity.end
@@ -178,7 +178,7 @@ public final class PromptHistoryStore: @unchecked Sendable {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            encoder.dateDecodingStrategy = .iso8601
+            encoder.dateEncodingStrategy = .iso8601
             let data = try encoder.encode(conversations)
             try data.write(to: target, options: .atomic)
             try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)

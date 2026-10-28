@@ -345,68 +345,76 @@ final class HybridAppViewModel: ObservableObject {
         let policy = guardianPolicy
         let files = attachedFiles
 
-        let result = BackendBridge.shared.runTask(
-            prompt: trimmed,
-            mode: mode,
-            cloudProvider: provider,
-            guardianPolicy: policy,
-            attachedFiles: files,
-            sessionId: currentSessionId
-        )
-        self.lastResult = result
+        // Run the blocking Python subprocess on a background thread so the UI
+        // stays responsive (spinner animates, buttons remain interactive).
+        Task.detached(priority: .userInitiated) {
+            let result = BackendBridge.shared.runTask(
+                prompt: trimmed,
+                mode: mode,
+                cloudProvider: provider,
+                guardianPolicy: policy,
+                attachedFiles: files,
+                sessionId: currentSessionId
+            )
 
-        let now = Date()
-        let userMsg = ChatMessageModel(
-            role: "user",
-            content: trimmed,
-            createdAt: now,
-            computeMode: mode.rawValue,
-            cloudProvider: provider.rawValue,
-            sanitizedCloudPrompt: result.cloudPromptSent,
-            piiMaskedCount: result.receipt.piiFlaggedCount,
-            piiRestoredCount: 0,
-            stations: [],
-            receipt: nil,
-            telemetry: nil,
-            cloudZeroRetention: true
-        )
+            // All @Published mutations must happen on MainActor.
+            await MainActor.run {
+                self.lastResult = result
 
-        let assistantMsg = ChatMessageModel(
-            role: "assistant",
-            content: result.finalOutput,
-            createdAt: now,
-            computeMode: mode.rawValue,
-            cloudProvider: provider.rawValue,
-            sanitizedCloudPrompt: result.cloudPromptSent,
-            piiMaskedCount: result.receipt.piiFlaggedCount,
-            piiRestoredCount: result.receipt.piiRestoredCount,
-            stations: result.stations,
-            receipt: result.receipt,
-            telemetry: result.telemetry,
-            cloudZeroRetention: true
-        )
+                let now = Date()
+                let userMsg = ChatMessageModel(
+                    role: "user",
+                    content: trimmed,
+                    createdAt: now,
+                    computeMode: mode.rawValue,
+                    cloudProvider: provider.rawValue,
+                    sanitizedCloudPrompt: result.cloudPromptSent,
+                    piiMaskedCount: result.receipt.piiFlaggedCount,
+                    piiRestoredCount: 0,
+                    stations: [],
+                    receipt: nil,
+                    telemetry: nil,
+                    cloudZeroRetention: true
+                )
 
-        if let idx = conversations.firstIndex(where: { $0.id == currentSessionId }) {
-            if conversations[idx].messages.isEmpty || conversations[idx].title == "New Hybrid Chat" {
-                let firstLine = trimmed.components(separatedBy: .newlines).first ?? trimmed
-                conversations[idx].title = String(firstLine.prefix(46))
+                let assistantMsg = ChatMessageModel(
+                    role: "assistant",
+                    content: result.finalOutput,
+                    createdAt: now,
+                    computeMode: mode.rawValue,
+                    cloudProvider: provider.rawValue,
+                    sanitizedCloudPrompt: result.cloudPromptSent,
+                    piiMaskedCount: result.receipt.piiFlaggedCount,
+                    piiRestoredCount: result.receipt.piiRestoredCount,
+                    stations: result.stations,
+                    receipt: result.receipt,
+                    telemetry: result.telemetry,
+                    cloudZeroRetention: true
+                )
+
+                if let idx = self.conversations.firstIndex(where: { $0.id == currentSessionId }) {
+                    if self.conversations[idx].messages.isEmpty || self.conversations[idx].title == "New Hybrid Chat" {
+                        let firstLine = trimmed.components(separatedBy: .newlines).first ?? trimmed
+                        self.conversations[idx].title = String(firstLine.prefix(46))
+                    }
+                    self.conversations[idx].messages.append(userMsg)
+                    self.conversations[idx].messages.append(assistantMsg)
+                    self.conversations[idx].updatedAt = now
+                    self.conversations[idx].storageLocation = self.historyStorage
+                    self.conversations[idx].retentionPolicy = self.historyRetention
+                    self.conversations[idx].expiresAt = self.historyRetention.computeExpiryDate(from: now)
+
+                    let updatedConv = self.conversations.remove(at: idx)
+                    self.conversations.insert(updatedConv, at: 0)
+                }
+
+                self.historyStore.saveConversations(self.conversations, to: self.historyStorage)
+                self.promptText = ""
+                self.attachedFiles.removeAll()
+                self.updateComposerLiveAudit()
+                self.isRunning = false
             }
-            conversations[idx].messages.append(userMsg)
-            conversations[idx].messages.append(assistantMsg)
-            conversations[idx].updatedAt = now
-            conversations[idx].storageLocation = historyStorage
-            conversations[idx].retentionPolicy = historyRetention
-            conversations[idx].expiresAt = historyRetention.computeExpiryDate(from: now)
-
-            let updatedConv = conversations.remove(at: idx)
-            conversations.insert(updatedConv, at: 0)
         }
-
-        historyStore.saveConversations(conversations, to: historyStorage)
-        self.promptText = ""
-        self.attachedFiles.removeAll()
-        self.updateComposerLiveAudit()
-        self.isRunning = false
     }
 
     func executeTask() {
