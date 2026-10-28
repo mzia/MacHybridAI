@@ -142,5 +142,37 @@ class TestHybridOrchestratorAndServer(unittest.TestCase):
         )
 
 
+class TestRealTelemetry(unittest.TestCase):
+    def test_collect_telemetry_returns_valid_ranges(self) -> None:
+        """collect_telemetry() must always return in-range values regardless of platform."""
+        from machybrid.orchestrator import HybridOrchestrator
+
+        t = HybridOrchestrator.collect_telemetry(tokens=42)
+        self.assertGreaterEqual(t.cpu_percent, 0)
+        self.assertLessEqual(t.cpu_percent, 100)
+        self.assertGreaterEqual(t.memory_percent, 0)
+        self.assertLessEqual(t.memory_percent, 100)
+        self.assertGreaterEqual(t.gpu_percent, 0)
+        self.assertLessEqual(t.gpu_percent, 100)
+        self.assertGreaterEqual(t.unified_memory_gb, 8)
+        self.assertEqual(t.tokens_processed, 42)
+
+    def test_cpu_helper_returns_int_in_range(self) -> None:
+        from machybrid.orchestrator import HybridOrchestrator
+
+        val = HybridOrchestrator._read_cpu_percent_darwin()
+        self.assertIsInstance(val, int)
+        self.assertGreaterEqual(val, 0)
+        self.assertLessEqual(val, 100)
+
+    def test_memory_helper_returns_int_in_range(self) -> None:
+        from machybrid.orchestrator import HybridOrchestrator
+
+        val = HybridOrchestrator._read_memory_percent_darwin()
+        self.assertIsInstance(val, int)
+        self.assertGreaterEqual(val, 0)
+        self.assertLessEqual(val, 100)
+
+
 if __name__ == "__main__":
     unittest.main()
