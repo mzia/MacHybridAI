@@ -116,3 +116,84 @@ class TestPromptHistoryAndZeroCloudRetention(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEncryptionKeyPersistence(unittest.TestCase):
+    """Verify that the encryption key is persisted and reloaded correctly.
+
+    The critical regression this guards against: encrypted history files must
+    remain readable across process restarts.  If the key were ephemeral (a
+    fresh os.urandom(32) on every __init__), the HMAC tag would never match
+    on reload, silently returning an empty session list.
+    """
+
+    def test_key_is_reloaded_from_disk_across_instances(self) -> None:
+        with tempfile.TemporaryDirectory() as local_dir:
+            # First manager: writes encrypted file
+            mgr1 = PromptHistoryManager(
+                storage_location=HistoryStorageLocation.LOCAL,
+                retention_policy=HistoryRetentionPolicy.NEVER,
+                custom_local_dir=local_dir,
+                encrypt_at_rest=True,
+            )
+            mgr1.record_exchange(
+                prompt="Confidential memo",
+                response_text="Reply",
+                compute_mode="local",
+                cloud_provider="none",
+                sanitized_cloud_prompt=None,
+                pii_masked_count=0,
+                pii_restored_count=0,
+            )
+            self.assertTrue(mgr1.active_file_path.is_file())
+            self.assertEqual(len(mgr1.load_sessions()), 1)
+
+            # Confirm the key file was created
+            key_path = mgr1._key_file_path
+            self.assertTrue(key_path.is_file())
+            self.assertEqual(len(key_path.read_bytes()), 32)
+
+            # Second manager: same directory, should reload the same key
+            mgr2 = PromptHistoryManager(
+                storage_location=HistoryStorageLocation.LOCAL,
+                retention_policy=HistoryRetentionPolicy.NEVER,
+                custom_local_dir=local_dir,
+                encrypt_at_rest=True,
+            )
+            sessions = mgr2.load_sessions()
+            self.assertEqual(len(sessions), 1, "Encrypted session should be readable after key reload")
+            self.assertEqual(sessions[0].messages[0].content, "Confidential memo")
+
+    def test_explicit_key_bypasses_key_file(self) -> None:
+        explicit = b"a" * 32
+        with tempfile.TemporaryDirectory() as local_dir:
+            mgr = PromptHistoryManager(
+                storage_location=HistoryStorageLocation.LOCAL,
+                retention_policy=HistoryRetentionPolicy.NEVER,
+                custom_local_dir=local_dir,
+                encrypt_at_rest=True,
+                encryption_key=explicit,
+            )
+            self.assertEqual(mgr._encryption_key, explicit)
+            # No key file should be written when an explicit key is supplied
+            self.assertFalse(mgr._key_file_path.is_file())
+
+    def test_unencrypted_manager_creates_no_key_file(self) -> None:
+        with tempfile.TemporaryDirectory() as local_dir:
+            mgr = PromptHistoryManager(
+                storage_location=HistoryStorageLocation.LOCAL,
+                retention_policy=HistoryRetentionPolicy.NEVER,
+                custom_local_dir=local_dir,
+                encrypt_at_rest=False,
+            )
+            mgr.record_exchange(
+                prompt="Plain text record",
+                response_text="Reply",
+                compute_mode="local",
+                cloud_provider="none",
+                sanitized_cloud_prompt=None,
+                pii_masked_count=0,
+                pii_restored_count=0,
+            )
+            # Key file not touched when encryption is off
+            self.assertFalse(mgr._key_file_path.is_file())

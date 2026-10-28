@@ -179,7 +179,10 @@ class PromptHistoryManager:
         self.retention_policy = retention_policy
         self.encrypt_at_rest = encrypt_at_rest
         self.redacted_only = redacted_only
-        self._encryption_key: bytes = encryption_key or os.urandom(32)
+        # If the caller explicitly provides a key (e.g. tests), use it directly.
+        # Otherwise load-or-create a persistent key file so encrypted history
+        # files remain readable across process restarts.
+        self._explicit_key: Optional[bytes] = encryption_key
         self._local_dir = Path(
             custom_local_dir
             or os.path.expanduser(
@@ -192,6 +195,47 @@ class PromptHistoryManager:
                 "~/Library/Mobile Documents/com~apple~CloudDocs/MacHybridAI"
             )
         )
+
+    @property
+    def _key_file_path(self) -> Path:
+        """Path to the persistent 32-byte encryption key file (chmod 600)."""
+        return self._local_dir / ".encryption_key"
+
+    @property
+    def _encryption_key(self) -> bytes:
+        """Load-or-create the persistent encryption key.
+
+        The key is stored as raw bytes in ``~/.../history/.encryption_key``
+        with permissions 0o600.  On first use the file is created from
+        ``os.urandom(32)``; subsequent calls load it from disk so that
+        encrypted ``chat_history.json`` files survive process restarts.
+
+        If an explicit key was supplied at construction time (e.g. in tests),
+        that key is always returned without any file I/O.
+        """
+        if self._explicit_key is not None:
+            return self._explicit_key
+        key_path = self._key_file_path
+        try:
+            key_path.parent.mkdir(parents=True, exist_ok=True)
+            if key_path.is_file():
+                data = key_path.read_bytes()
+                if len(data) == 32:
+                    return data
+            # Generate and persist a new key
+            new_key = os.urandom(32)
+            key_path.write_bytes(new_key)
+            try:
+                os.chmod(key_path, 0o600)
+            except OSError:
+                pass
+            return new_key
+        except OSError:
+            # Filesystem not writable (e.g. sandboxed test env): fall back to
+            # an in-process ephemeral key so the process still works.
+            ephemeral = os.urandom(32)
+            self._explicit_key = ephemeral
+            return ephemeral
 
     @property
     def active_directory(self) -> Path:
