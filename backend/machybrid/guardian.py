@@ -170,7 +170,7 @@ def _passes_luhn(card_text: str) -> bool:
 class PIIGuardian:
     """On-device Privacy Gate that inspects, masks, and restores sensitive data."""
 
-    # Ordered from highest specificity to broader contextual patterns
+    # Ordered from highest specificity to broader contextual NER patterns
     _PATTERNS: List[Tuple[str, re.Pattern[str], float]] = [
         (
             "SECRET",
@@ -218,14 +218,22 @@ class PIIGuardian:
             0.94,
         ),
         (
+            "ORGANIZATION",
+            re.compile(
+                r"\b([A-Z][A-Za-z0-9&\-]{1,25}(?:\s+[A-Z][A-Za-z0-9&\-]{1,25}){0,3}\s+"
+                r"(?:Corp\.?|Corporation|Inc\.?|LLC|LLP|Ltd\.?|Holdings|Partners|Capital|Ventures|Bank))\b"
+            ),
+            0.92,
+        ),
+        (
             "PERSON",
             re.compile(
                 r"(?:(?<=Mr\.\s)|(?<=Ms\.\s)|(?<=Mrs\.\s)|(?<=Dr\.\s)"
                 r"|(?<=Contact:\s)|(?<=Client:\s)|(?<=Patient:\s)|(?<=Author:\s)"
-                r"|(?<=Name:\s)|(?<=Prepared by\s)|(?<=with\s)|(?<=for\s))"
+                r"|(?<=Name:\s)|(?<=Prepared by\s)|(?<=Prepared for\s)|(?<=with\s)|(?<=for\s))"
                 r"([A-Z][a-z]{1,20}\s+[A-Z][a-z]{1,25})\b"
             ),
-            0.90,
+            0.91,
         ),
     ]
 
@@ -252,15 +260,31 @@ class PIIGuardian:
         policy: GuardianPolicy = GuardianPolicy.REVERSIBLE_MASK,
         vault: Optional[PIIVault] = None,
         custom_sensitive_terms: Optional[Iterable[str]] = None,
+        allowlist_terms: Optional[Iterable[str]] = None,
     ) -> None:
         self.policy = policy
         self.vault = vault or PIIVault()
         self.custom_terms: List[str] = [
             t.strip() for t in (custom_sensitive_terms or []) if t and t.strip()
         ]
+        self.allowlist_terms: List[str] = [
+            t.strip() for t in (allowlist_terms or []) if t and t.strip()
+        ]
 
     def set_custom_terms(self, terms: Iterable[str]) -> None:
         self.custom_terms = [t.strip() for t in terms if t and t.strip()]
+
+    def set_allowlist_terms(self, terms: Iterable[str]) -> None:
+        self.allowlist_terms = [t.strip() for t in terms if t and t.strip()]
+
+    def _is_allowlisted(self, candidate: str) -> bool:
+        cand_lower = candidate.strip().lower()
+        if not cand_lower:
+            return False
+        for safe in self.allowlist_terms:
+            if cand_lower == safe.lower():
+                return True
+        return False
 
     def redact(
         self,
@@ -276,24 +300,28 @@ class PIIGuardian:
 
         # 1. Check user-supplied custom sensitive terms first
         for term in sorted(self.custom_terms, key=len, reverse=True):
+            if self._is_allowlisted(term):
+                continue
             pattern = re.compile(re.escape(term), re.IGNORECASE)
             for match in pattern.finditer(text):
                 raw_matches.append(
                     (match.start(), match.end(), "CUSTOM", match.group(0), 1.0)
                 )
 
-        # 2. Check built-in regex & algorithmic patterns
+        # 2. Check built-in regex, algorithmic, and NER patterns
         for category, regex, confidence in self._PATTERNS:
             for match in regex.finditer(text):
                 start, end = match.span()
                 candidate = match.group(0)
+                if self._is_allowlisted(candidate):
+                    continue
                 if category == "CREDIT_CARD" and not _passes_luhn(candidate):
                     continue
                 if category == "IP_ADDR" and (
                     candidate == "127.0.0.1" or candidate.startswith("0.")
                 ):
                     continue
-                if category == "PERSON" and candidate in self._SAFE_CAPITALIZED_PHRASES:
+                if category in {"PERSON", "ORGANIZATION"} and candidate in self._SAFE_CAPITALIZED_PHRASES:
                     continue
                 raw_matches.append((start, end, category, candidate, confidence))
 

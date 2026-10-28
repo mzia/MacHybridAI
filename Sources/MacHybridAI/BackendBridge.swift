@@ -1,4 +1,5 @@
 import Foundation
+import NaturalLanguage
 
 /// Pure-Swift on-device fallback PII Guardian & Python Engine Bridge.
 /// Ensures 100% deterministic Privacy Gate protection both via the bundled Python
@@ -14,82 +15,100 @@ public struct SwiftNativeGuardian: Sendable {
             return ("", "", [], [:])
         }
 
+        var entities: [PIIEntityModel] = []
+        var vault: [String: String] = [:]
+        var counters: [String: Int] = [:]
+
+        // 1. Native macOS NER using NaturalLanguage framework (The "Native Privacy Layer")
+        let tagger = NLTagger(tagSchemes: [.nameType])
+        tagger.string = text
+        tagger.enumerateTags(in: text.startIndex..<text.endIndex, unit: .word, scheme: .nameType, options: [.joinNames]) { tag, range in
+            if let tag = tag {
+                let category: String
+                switch tag {
+                case .personalName: category = "PERSON"
+                case .organizationName: category = "ORGANIZATION"
+                case .placeName: category = "PLACE"
+                default: return true // skip other tags
+                }
+
+                let value = String(text[range])
+                let start = range.lowerBound.utf16Offset(in: text)
+                let end = range.upperBound.utf16Offset(in: text)
+
+                // Register entity
+                let count = (counters[category] ?? 0) + 1
+                counters[category] = count
+                let token = policy == .strictRedact ? "[REDACTED_\(category)]" : "[\(category)_\(count)]"
+                if policy != .strictRedact { vault[token] = value }
+
+                entities.append(
+                    PIIEntityModel(
+                        category: category,
+                        replacementToken: token,
+                        start: start,
+                        end: end,
+                        confidence: 0.95,
+                        maskedPreview: value.count <= 4 ? "****" : "\(value.prefix(2))****\(value.suffix(2))"
+                    )
+                )
+            }
+            return true
+        }
+
+        // 2. High-precision regex for patterns NLTagger doesn't cover (Secrets, SSNs, etc.)
         let patterns: [(category: String, regex: String, confidence: Double)] = [
             ("SECRET", #"\b(?:AIza[0-9A-Za-z\-_]{35}|sk-[A-Za-z0-9\-_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})\b"#, 0.99),
             ("SSN", #"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"#, 0.99),
             ("EMAIL", #"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"#, 0.99),
             ("PHONE", #"(?:\+?1[-.\s]?)?(?:\(\d{3}\)[-.\s]?|\b\d{3}[-.\s])\d{3}[-.\s]\d{4}\b"#, 0.95),
-            ("PERSON", #"(?:(?<=Contact:\s)|(?<=Client:\s)|(?<=for\s)|(?<=with\s))([A-Z][a-z]{1,20}\s+[A-Z][a-z]{1,25})\b"#, 0.90),
         ]
-
-        struct MatchSpan {
-            let range: NSRange
-            let category: String
-            let value: String
-            let confidence: Double
-        }
-
-        let nsText = text as NSString
-        var rawSpans: [MatchSpan] = []
 
         for item in patterns {
             guard let regex = try? NSRegularExpression(pattern: item.regex) else { continue }
-            let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
+            let matches = regex.matches(in: text, range: NSRange(location: 0, length: (text as NSString).length))
             for m in matches {
-                let val = nsText.substring(with: m.range)
-                rawSpans.append(MatchSpan(range: m.range, category: item.category, value: val, confidence: item.confidence))
+                let val = (text as NSString).substring(with: m.range)
+                
+                // Avoid overlapping with NLTagger entities
+                if entities.contains(where: { $0.start < m.range.location + m.range.length && $0.end > m.range.location }) {
+                    continue
+                }
+
+                let category = item.category
+                let count = (counters[category] ?? 0) + 1
+                counters[category] = count
+                let token = policy == .strictRedact ? "[REDACTED_\(category)]" : "[\(category)_\(count)]"
+                if policy != .strictRedact { vault[token] = val }
+
+                entities.append(
+                    PIIEntityModel(
+                        category: category,
+                        replacementToken: token,
+                        start: m.range.location,
+                        end: m.range.location + m.range.length,
+                        confidence: item.confidence,
+                        maskedPreview: val.count <= 4 ? "****" : "\(val.prefix(2))****\(val.suffix(2))"
+                    )
+                )
             }
         }
 
-        rawSpans.sort { a, b in
-            if a.range.location != b.range.location {
-                return a.range.location < b.range.location
-            }
-            return a.range.length > b.range.length
-        }
+        // Sort entities by start position to build the sanitized string
+        entities.sort { $0.start < $1.start }
 
-        var accepted: [MatchSpan] = []
-        var lastEnd = -1
-        for span in rawSpans {
-            if span.range.location >= lastEnd {
-                accepted.append(span)
-                lastEnd = span.range.location + span.range.length
-            }
-        }
-
-        var counters: [String: Int] = [:]
-        var vault: [String: String] = [:]
-        var entities: [PIIEntityModel] = []
         var result = ""
         var cursor = 0
-
-        for span in accepted {
-            if span.range.location > cursor {
-                result += nsText.substring(with: NSRange(location: cursor, length: span.range.location - cursor))
+        for entity in entities {
+            if entity.start > cursor {
+                result += (text as NSString).substring(from: cursor, length: entity.start - cursor)
             }
-            let count = (counters[span.category] ?? 0) + 1
-            counters[span.category] = count
-            let token = policy == .strictRedact ? "[REDACTED_\(span.category)]" : "[\(span.category)_\(count)]"
-            if policy != .strictRedact {
-                vault[token] = span.value
-            }
-            result += token
-            let preview = span.value.count <= 4 ? "****" : "\(span.value.prefix(2))****\(span.value.suffix(2))"
-            entities.append(
-                PIIEntityModel(
-                    category: span.category,
-                    replacementToken: token,
-                    start: span.range.location,
-                    end: span.range.location + span.range.length,
-                    confidence: span.confidence,
-                    maskedPreview: preview
-                )
-            )
-            cursor = span.range.location + span.range.length
+            result += entity.replacementToken
+            cursor = entity.end
         }
 
-        if cursor < nsText.length {
-            result += nsText.substring(from: cursor)
+        if cursor < (text as NSString).length {
+            result += (text as NSString).substring(from: cursor)
         }
 
         var restored = "Cloud processed request for \(result)"
@@ -159,7 +178,7 @@ public final class PromptHistoryStore: @unchecked Sendable {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            encoder.dateEncodingStrategy = .iso8601
+            encoder.dateDecodingStrategy = .iso8601
             let data = try encoder.encode(conversations)
             try data.write(to: target, options: .atomic)
             try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
@@ -301,17 +320,10 @@ public final class BackendBridge: Sendable {
         text: String,
         policy: GuardianPolicyOption
     ) -> GuardianAuditModel {
-        let body: [String: Any] = [
-            "text": text,
-            "policy": policy.rawValue,
-        ]
-        if let data = invokePythonJSON(method: "POST", path: "/v1/guardian/inspect", body: body),
-           let decoded = try? JSONDecoder().decode(GuardianAuditModel.self, from: data) {
-            return decoded
-        }
-
+        // Use the native macOS privacy layer (NLTagger) as the primary source for high-accuracy, on-device detection
         let scan = fallbackGuardian.redactAndRestorePreview(text: text, policy: policy)
         let categories = Array(Set(scan.entities.map(\.category))).sorted()
+        
         return GuardianAuditModel(
             sanitizedText: scan.sanitized,
             piiFlagged: !scan.entities.isEmpty,

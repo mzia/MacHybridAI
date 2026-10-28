@@ -48,6 +48,7 @@ class ComputeMode(str, Enum):
     """Execution mode for MacHybridAI tasks."""
 
     LOCAL = "local"
+    AUTO = "auto"
     HYBRID = "hybrid"
     CLOUD = "cloud"
 
@@ -71,7 +72,10 @@ class HybridConfig:
     guardian_policy: GuardianPolicy = GuardianPolicy.REVERSIBLE_MASK
     history_storage: HistoryStorageLocation = HistoryStorageLocation.LOCAL
     history_retention: HistoryRetentionPolicy = HistoryRetentionPolicy.DAYS_30
+    history_encrypt_at_rest: bool = False
+    history_redacted_only: bool = False
     custom_sensitive_terms: List[str] = field(default_factory=list)
+    allowlist_terms: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -90,8 +94,11 @@ class HybridConfig:
             "guardian_policy": self.guardian_policy.value,
             "history_storage": self.history_storage.value,
             "history_retention": self.history_retention.value,
+            "history_encrypt_at_rest": self.history_encrypt_at_rest,
+            "history_redacted_only": self.history_redacted_only,
             "cloud_zero_retention": True,
             "custom_sensitive_terms": list(self.custom_sensitive_terms),
+            "allowlist_terms": list(self.allowlist_terms),
         }
 
 
@@ -179,6 +186,7 @@ class HybridOrchestrator:
         self.guardian = PIIGuardian(
             policy=self.config.guardian_policy,
             custom_sensitive_terms=self.config.custom_sensitive_terms,
+            allowlist_terms=self.config.allowlist_terms,
         )
         self.m365_manager = M365CopilotProxyManager(
             M365ProxySettings(
@@ -189,6 +197,8 @@ class HybridOrchestrator:
         self.history_manager = history_manager or PromptHistoryManager(
             storage_location=self.config.history_storage,
             retention_policy=self.config.history_retention,
+            encrypt_at_rest=self.config.history_encrypt_at_rest,
+            redacted_only=self.config.history_redacted_only,
         )
         self.allowed_roots = [
             os.path.abspath(os.path.expanduser(r))
@@ -232,6 +242,12 @@ class HybridOrchestrator:
         if "history_retention" in updates:
             self.config.history_retention = HistoryRetentionPolicy(str(updates["history_retention"]))
             self.history_manager.configure(retention_policy=self.config.history_retention)
+        if "history_encrypt_at_rest" in updates:
+            self.config.history_encrypt_at_rest = bool(updates["history_encrypt_at_rest"])
+            self.history_manager.configure(encrypt_at_rest=self.config.history_encrypt_at_rest)
+        if "history_redacted_only" in updates:
+            self.config.history_redacted_only = bool(updates["history_redacted_only"])
+            self.history_manager.configure(redacted_only=self.config.history_redacted_only)
         if "custom_sensitive_terms" in updates and isinstance(
             updates["custom_sensitive_terms"], list
         ):
@@ -239,6 +255,13 @@ class HybridOrchestrator:
                 str(x) for x in updates["custom_sensitive_terms"]
             ]
             self.guardian.set_custom_terms(self.config.custom_sensitive_terms)
+        if "allowlist_terms" in updates and isinstance(
+            updates["allowlist_terms"], list
+        ):
+            self.config.allowlist_terms = [
+                str(x) for x in updates["allowlist_terms"]
+            ]
+            self.guardian.set_allowlist_terms(self.config.allowlist_terms)
         return self.config
 
     @staticmethod
@@ -254,6 +277,28 @@ class HybridOrchestrator:
                 labels.append(base)
         return labels
 
+    def _resolve_smart_auto_mode(self, prompt: str) -> ComputeMode:
+        """Smart Auto-Router: routes high-risk secret prompts or simple queries locally, and complex reasoning to Hybrid."""
+        pre_scan = self.guardian.redact(prompt)
+        high_risk = {"SECRET", "SSN", "CREDIT_CARD"}
+        if any(cat in high_risk for cat in pre_scan.categories):
+            return ComputeMode.LOCAL
+        words = prompt.split()
+        complex_keywords = {
+            "benchmark",
+            "compare",
+            "research",
+            "analyze",
+            "synthesize",
+            "architecture",
+            "market",
+            "deck",
+            "multi-step",
+        }
+        if len(words) >= 12 or any(w.lower().strip(".,?!") in complex_keywords for w in words):
+            return ComputeMode.HYBRID
+        return ComputeMode.LOCAL
+
     def run_task(
         self,
         prompt: str,
@@ -264,9 +309,15 @@ class HybridOrchestrator:
         tools: Optional[List[Dict[str, Any]]] = None,
         session_id: Optional[str] = None,
         save_to_history: bool = True,
+        approved_sanitized_prompt: Optional[str] = None,
     ) -> TaskExecutionResult:
-        """Executes a task in Fully Local, Hybrid, or Cloud mode with PII Guardian protection."""
-        active_mode = mode or self.config.compute_mode
+        """Executes a task in Fully Local, Auto Hybrid, Hybrid, or Cloud mode with PII Guardian protection."""
+        requested_mode = mode or self.config.compute_mode
+        active_mode = (
+            self._resolve_smart_auto_mode(prompt)
+            if requested_mode == ComputeMode.AUTO
+            else requested_mode
+        )
         active_cloud_provider = cloud_provider or self.config.cloud_provider
         task_id = f"task_{int(time.time() * 1000)}"
 

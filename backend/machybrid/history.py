@@ -163,7 +163,7 @@ class ChatSessionRecord:
 
 
 class PromptHistoryManager:
-    """Manages local Mac and iCloud Drive chat history with auto-delete policies."""
+    """Manages local Mac and iCloud Drive chat history with auto-delete policies and encryption at rest."""
 
     def __init__(
         self,
@@ -171,9 +171,15 @@ class PromptHistoryManager:
         retention_policy: HistoryRetentionPolicy = HistoryRetentionPolicy.DAYS_30,
         custom_local_dir: Optional[str] = None,
         custom_icloud_dir: Optional[str] = None,
+        encrypt_at_rest: bool = False,
+        redacted_only: bool = False,
+        encryption_key: Optional[bytes] = None,
     ) -> None:
         self.storage_location = storage_location
         self.retention_policy = retention_policy
+        self.encrypt_at_rest = encrypt_at_rest
+        self.redacted_only = redacted_only
+        self._encryption_key: bytes = encryption_key or os.urandom(32)
         self._local_dir = Path(
             custom_local_dir
             or os.path.expanduser(
@@ -208,16 +214,78 @@ class PromptHistoryManager:
             return None
         return base_timestamp + ttl
 
-    def load_sessions(self, now: Optional[float] = None) -> List[ChatSessionRecord]:
-        """Loads saved sessions from the active storage location and prunes expired items."""
+    @staticmethod
+    def _xor_keystream(data: bytes, key: bytes, nonce: bytes) -> bytes:
+        import hashlib
+
+        out = bytearray(len(data))
+        block_index = 0
+        offset = 0
+        while offset < len(data):
+            counter_bytes = block_index.to_bytes(8, "big")
+            digest = hashlib.sha256(key + nonce + counter_bytes).digest()
+            chunk_len = min(len(digest), len(data) - offset)
+            for i in range(chunk_len):
+                out[offset + i] = data[offset + i] ^ digest[i]
+            offset += chunk_len
+            block_index += 1
+        return bytes(out)
+
+    def _seal_json_bytes(self, plaintext: bytes) -> Dict[str, Any]:
+        import base64
+        import hashlib
+        import hmac
+
+        nonce = os.urandom(16)
+        ciphertext = self._xor_keystream(plaintext, self._encryption_key, nonce)
+        mac = hmac.new(self._encryption_key, nonce + ciphertext, hashlib.sha256).digest()
+        return {
+            "encrypted": True,
+            "cipher": "SHA256-CTR-HMAC-SHA256",
+            "nonce_b64": base64.b64encode(nonce).decode("ascii"),
+            "ciphertext_b64": base64.b64encode(ciphertext).decode("ascii"),
+            "tag_b64": base64.b64encode(mac).decode("ascii"),
+            "storage_location": self.storage_location.value,
+            "retention_policy": self.retention_policy.value,
+            "cloud_ai_history_retained": False,
+        }
+
+    def _open_json_envelope(self, envelope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        import base64
+        import hashlib
+        import hmac
+
+        if not envelope.get("encrypted"):
+            return envelope
+        try:
+            nonce = base64.b64decode(str(envelope["nonce_b64"]))
+            ciphertext = base64.b64decode(str(envelope["ciphertext_b64"]))
+            expected_tag = base64.b64decode(str(envelope["tag_b64"]))
+            actual_tag = hmac.new(
+                self._encryption_key, nonce + ciphertext, hashlib.sha256
+            ).digest()
+            if not hmac.compare_digest(expected_tag, actual_tag):
+                return None
+            plaintext = self._xor_keystream(ciphertext, self._encryption_key, nonce)
+            parsed = json.loads(plaintext.decode("utf-8"))
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+
+    def _read_raw_sessions(self) -> List[ChatSessionRecord]:
         target = self.active_file_path
         if not target.is_file():
             return []
         try:
             raw_text = target.read_text(encoding="utf-8")
-            data = json.loads(raw_text)
-            raw_list = data.get("sessions", []) if isinstance(data, dict) else []
-            sessions = [
+            outer = json.loads(raw_text)
+            if not isinstance(outer, dict):
+                return []
+            data = self._open_json_envelope(outer)
+            if not isinstance(data, dict):
+                return []
+            raw_list = data.get("sessions", [])
+            return [
                 ChatSessionRecord.from_dict(item)
                 for item in raw_list
                 if isinstance(item, dict)
@@ -225,6 +293,9 @@ class PromptHistoryManager:
         except (OSError, ValueError, TypeError):
             return []
 
+    def load_sessions(self, now: Optional[float] = None) -> List[ChatSessionRecord]:
+        """Loads saved sessions from the active storage location and prunes expired items."""
+        sessions = self._read_raw_sessions()
         valid_sessions = [s for s in sessions if not s.is_expired(now=now)]
         if len(valid_sessions) != len(sessions):
             self._write_sessions(valid_sessions)
@@ -234,15 +305,22 @@ class PromptHistoryManager:
         target_dir = self.active_directory
         try:
             target_dir.mkdir(parents=True, exist_ok=True)
-            payload = {
+            inner_payload: Dict[str, Any] = {
                 "storage_location": self.storage_location.value,
                 "retention_policy": self.retention_policy.value,
+                "encrypt_at_rest": self.encrypt_at_rest,
+                "redacted_only": self.redacted_only,
                 "cloud_ai_history_retained": False,
                 "updated_at": time.time(),
                 "sessions": [s.to_dict() for s in sessions],
             }
+            if self.encrypt_at_rest:
+                raw_inner = json.dumps(inner_payload).encode("utf-8")
+                disk_payload = self._seal_json_bytes(raw_inner)
+            else:
+                disk_payload = inner_payload
             target_file = self.active_file_path
-            target_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            target_file.write_text(json.dumps(disk_payload, indent=2), encoding="utf-8")
             try:
                 os.chmod(target_file, 0o600)
             except OSError:
@@ -254,9 +332,11 @@ class PromptHistoryManager:
         self,
         storage_location: Optional[HistoryStorageLocation] = None,
         retention_policy: Optional[HistoryRetentionPolicy] = None,
+        encrypt_at_rest: Optional[bool] = None,
+        redacted_only: Optional[bool] = None,
         migrate_existing: bool = True,
     ) -> Dict[str, Any]:
-        """Updates storage destination (Local vs iCloud) and auto-delete retention policy."""
+        """Updates storage destination (Local vs iCloud), auto-delete retention, and encryption settings."""
         existing = self.load_sessions()
         if storage_location is not None and storage_location != self.storage_location:
             self.storage_location = storage_location
@@ -266,6 +346,12 @@ class PromptHistoryManager:
             for session in existing:
                 session.retention_policy = self.retention_policy.value
                 session.expires_at = self._compute_expiry(session.updated_at)
+
+        if encrypt_at_rest is not None:
+            self.encrypt_at_rest = encrypt_at_rest
+
+        if redacted_only is not None:
+            self.redacted_only = redacted_only
 
         if migrate_existing:
             for session in existing:
@@ -290,6 +376,12 @@ class PromptHistoryManager:
         ts = now if now is not None else time.time()
         sessions = self.load_sessions(now=ts)
 
+        stored_prompt = (
+            sanitized_cloud_prompt
+            if (self.redacted_only and sanitized_cloud_prompt)
+            else prompt
+        )
+
         target_session: Optional[ChatSessionRecord] = None
         if session_id:
             for s in sessions:
@@ -298,7 +390,7 @@ class PromptHistoryManager:
                     break
 
         if target_session is None:
-            short_title = prompt.strip().splitlines()[0][:48] or "New Hybrid Chat"
+            short_title = stored_prompt.strip().splitlines()[0][:48] or "New Hybrid Chat"
             target_session = ChatSessionRecord(
                 session_id=session_id or f"chat_{uuid.uuid4().hex[:10]}",
                 title=short_title,
@@ -314,7 +406,7 @@ class PromptHistoryManager:
         user_msg = ChatMessageRecord(
             id=f"msg_{uuid.uuid4().hex[:10]}",
             role="user",
-            content=prompt,
+            content=stored_prompt,
             created_at=ts,
             compute_mode=compute_mode,
             cloud_provider=cloud_provider,
@@ -347,6 +439,37 @@ class PromptHistoryManager:
         self._write_sessions(sessions)
         return target_session
 
+    def export_session_markdown(
+        self,
+        session_id: str,
+        use_sanitized: bool = False,
+    ) -> Optional[str]:
+        """Exports a saved chat session as a clean Markdown transcript."""
+        for session in self.load_sessions():
+            if session.session_id == session_id:
+                lines = [
+                    f"# {session.title}",
+                    f"- **Session ID**: `{session.session_id}`",
+                    f"- **Storage**: `{session.storage_location}`",
+                    f"- **Retention Policy**: `{session.retention_policy}`",
+                    "- **Cloud AI Retention**: `None (store=false)`",
+                    "",
+                    "---",
+                    "",
+                ]
+                for msg in session.messages:
+                    speaker = "User" if msg.role == "user" else "MacHybridAI Assistant"
+                    body = (
+                        msg.sanitized_cloud_prompt
+                        if (use_sanitized and msg.role == "user" and msg.sanitized_cloud_prompt)
+                        else msg.content
+                    )
+                    lines.append(f"### {speaker} ({msg.compute_mode.upper()})")
+                    lines.append(body)
+                    lines.append("")
+                return "\n".join(lines)
+        return None
+
     def delete_session(self, session_id: str) -> bool:
         sessions = self.load_sessions()
         filtered = [s for s in sessions if s.session_id != session_id]
@@ -363,20 +486,9 @@ class PromptHistoryManager:
 
     def prune_expired(self, now: Optional[float] = None) -> int:
         """Deletes any sessions past their auto-delete retention period."""
-        target = self.active_file_path
-        if not target.is_file():
+        all_sessions = self._read_raw_sessions()
+        if not all_sessions:
             return 0
-        try:
-            data = json.loads(target.read_text(encoding="utf-8"))
-            raw_list = data.get("sessions", []) if isinstance(data, dict) else []
-            all_sessions = [
-                ChatSessionRecord.from_dict(item)
-                for item in raw_list
-                if isinstance(item, dict)
-            ]
-        except (OSError, ValueError, TypeError):
-            return 0
-
         valid = [s for s in all_sessions if not s.is_expired(now=now)]
         removed = len(all_sessions) - len(valid)
         if removed > 0:
@@ -389,6 +501,8 @@ class PromptHistoryManager:
             "storage_location": self.storage_location.value,
             "retention_policy": self.retention_policy.value,
             "retention_label": self.retention_policy.display_label,
+            "encrypt_at_rest": self.encrypt_at_rest,
+            "redacted_only": self.redacted_only,
             "active_file_path": str(self.active_file_path),
             "icloud_available": self.is_icloud_available(),
             "cloud_ai_zero_retention": True,
