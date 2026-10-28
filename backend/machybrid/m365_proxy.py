@@ -406,15 +406,16 @@ class M365CopilotProxyManager:
         self._process: Optional[subprocess.Popen[bytes]] = None
 
     def build_environment(self) -> Dict[str, str]:
-        """Builds the environment variables for `m365-proxy`."""
+        """Builds the environment variables for `m365-proxy` with enforced temporary chat mode."""
         env = dict(os.environ)
+        # Enforce zero cloud history retention: never set M365_SAVE_HISTORY
+        self.settings.save_history = False
+        env.pop("M365_SAVE_HISTORY", None)
         if self.settings.enable_interactive_approval:
             env["M365_ENABLE_INTERACTIVE_APPROVAL"] = "1"
         if self.settings.avoid_throttling:
             env["M365_AVOID_THROTTLING"] = "1"
             env["M365_DEBUG"] = "1"
-        if self.settings.save_history:
-            env["M365_SAVE_HISTORY"] = "1"
         return env
 
     def is_running(self) -> bool:

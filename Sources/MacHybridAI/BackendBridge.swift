@@ -1,4 +1,5 @@
 import Foundation
+import NaturalLanguage
 
 /// Pure-Swift on-device fallback PII Guardian & Python Engine Bridge.
 /// Ensures 100% deterministic Privacy Gate protection both via the bundled Python
@@ -14,82 +15,100 @@ public struct SwiftNativeGuardian: Sendable {
             return ("", "", [], [:])
         }
 
+        var entities: [PIIEntityModel] = []
+        var vault: [String: String] = [:]
+        var counters: [String: Int] = [:]
+
+        // 1. Native macOS NER using NaturalLanguage framework (The "Native Privacy Layer")
+        let tagger = NLTagger(tagSchemes: [.nameType])
+        tagger.string = text
+        tagger.enumerateTags(in: text.startIndex..<text.endIndex, unit: .word, scheme: .nameType, options: [.joinNames]) { tag, range in
+            if let tag = tag {
+                let category: String
+                switch tag {
+                case .personalName: category = "PERSON"
+                case .organizationName: category = "ORGANIZATION"
+                case .placeName: category = "PLACE"
+                default: return true // skip other tags
+                }
+
+                let value = String(text[range])
+                let start = range.lowerBound.utf16Offset(in: text)
+                let end = range.upperBound.utf16Offset(in: text)
+
+                // Register entity
+                let count = (counters[category] ?? 0) + 1
+                counters[category] = count
+                let token = policy == .strictRedact ? "[REDACTED_\(category)]" : "[\(category)_\(count)]"
+                if policy != .strictRedact { vault[token] = value }
+
+                entities.append(
+                    PIIEntityModel(
+                        category: category,
+                        replacementToken: token,
+                        start: start,
+                        end: end,
+                        confidence: 0.95,
+                        maskedPreview: value.count <= 4 ? "****" : "\(value.prefix(2))****\(value.suffix(2))"
+                    )
+                )
+            }
+            return true
+        }
+
+        // 2. High-precision regex for patterns NLTagger doesn't cover (Secrets, SSNs, etc.)
         let patterns: [(category: String, regex: String, confidence: Double)] = [
             ("SECRET", #"\b(?:AIza[0-9A-Za-z\-_]{35}|sk-[A-Za-z0-9\-_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})\b"#, 0.99),
             ("SSN", #"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"#, 0.99),
             ("EMAIL", #"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"#, 0.99),
             ("PHONE", #"(?:\+?1[-.\s]?)?(?:\(\d{3}\)[-.\s]?|\b\d{3}[-.\s])\d{3}[-.\s]\d{4}\b"#, 0.95),
-            ("PERSON", #"(?:(?<=Contact:\s)|(?<=Client:\s)|(?<=for\s)|(?<=with\s))([A-Z][a-z]{1,20}\s+[A-Z][a-z]{1,25})\b"#, 0.90),
         ]
-
-        struct MatchSpan {
-            let range: NSRange
-            let category: String
-            let value: String
-            let confidence: Double
-        }
-
-        let nsText = text as NSString
-        var rawSpans: [MatchSpan] = []
 
         for item in patterns {
             guard let regex = try? NSRegularExpression(pattern: item.regex) else { continue }
-            let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
+            let matches = regex.matches(in: text, range: NSRange(location: 0, length: (text as NSString).length))
             for m in matches {
-                let val = nsText.substring(with: m.range)
-                rawSpans.append(MatchSpan(range: m.range, category: item.category, value: val, confidence: item.confidence))
+                let val = (text as NSString).substring(with: m.range)
+                
+                // Avoid overlapping with NLTagger entities
+                if entities.contains(where: { $0.start < m.range.location + m.range.length && $0.end > m.range.location }) {
+                    continue
+                }
+
+                let category = item.category
+                let count = (counters[category] ?? 0) + 1
+                counters[category] = count
+                let token = policy == .strictRedact ? "[REDACTED_\(category)]" : "[\(category)_\(count)]"
+                if policy != .strictRedact { vault[token] = val }
+
+                entities.append(
+                    PIIEntityModel(
+                        category: category,
+                        replacementToken: token,
+                        start: m.range.location,
+                        end: m.range.location + m.range.length,
+                        confidence: item.confidence,
+                        maskedPreview: val.count <= 4 ? "****" : "\(val.prefix(2))****\(val.suffix(2))"
+                    )
+                )
             }
         }
 
-        rawSpans.sort { a, b in
-            if a.range.location != b.range.location {
-                return a.range.location < b.range.location
-            }
-            return a.range.length > b.range.length
-        }
+        // Sort entities by start position to build the sanitized string
+        entities.sort { $0.start < $1.start }
 
-        var accepted: [MatchSpan] = []
-        var lastEnd = -1
-        for span in rawSpans {
-            if span.range.location >= lastEnd {
-                accepted.append(span)
-                lastEnd = span.range.location + span.range.length
-            }
-        }
-
-        var counters: [String: Int] = [:]
-        var vault: [String: String] = [:]
-        var entities: [PIIEntityModel] = []
         var result = ""
         var cursor = 0
-
-        for span in accepted {
-            if span.range.location > cursor {
-                result += nsText.substring(with: NSRange(location: cursor, length: span.range.location - cursor))
+        for entity in entities {
+            if entity.start > cursor {
+                result += (text as NSString).substring(with: NSRange(location: cursor, length: entity.start - cursor))
             }
-            let count = (counters[span.category] ?? 0) + 1
-            counters[span.category] = count
-            let token = policy == .strictRedact ? "[REDACTED_\(span.category)]" : "[\(span.category)_\(count)]"
-            if policy != .strictRedact {
-                vault[token] = span.value
-            }
-            result += token
-            let preview = span.value.count <= 4 ? "****" : "\(span.value.prefix(2))****\(span.value.suffix(2))"
-            entities.append(
-                PIIEntityModel(
-                    category: span.category,
-                    replacementToken: token,
-                    start: span.range.location,
-                    end: span.range.location + span.range.length,
-                    confidence: span.confidence,
-                    maskedPreview: preview
-                )
-            )
-            cursor = span.range.location + span.range.length
+            result += entity.replacementToken
+            cursor = entity.end
         }
 
-        if cursor < nsText.length {
-            result += nsText.substring(from: cursor)
+        if cursor < (text as NSString).length {
+            result += (text as NSString).substring(from: cursor)
         }
 
         var restored = "Cloud processed request for \(result)"
@@ -97,6 +116,94 @@ public struct SwiftNativeGuardian: Sendable {
             restored = restored.replacingOccurrences(of: token, with: original)
         }
         return (result, restored, entities, vault)
+    }
+}
+
+/// Manages saving user chat and prompt history to Local Mac Storage or iCloud Drive,
+/// with configurable auto-delete retention periods (`24h`, `7d`, `30d`, `90d`, `never`).
+/// Note: Nothing is ever retained in any Cloud AI provider's history (`store=false`).
+public final class PromptHistoryStore: @unchecked Sendable {
+    public let localDirectoryURL: URL
+    public let iCloudDirectoryURL: URL
+
+    public init(
+        customLocalDirectory: URL? = nil,
+        customICloudDirectory: URL? = nil
+    ) {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        self.localDirectoryURL = customLocalDirectory ?? home
+            .appendingPathComponent("Library/Application Support/MacHybridAI/history", isDirectory: true)
+        self.iCloudDirectoryURL = customICloudDirectory ?? home
+            .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs/MacHybridAI", isDirectory: true)
+    }
+
+    public func fileURL(for location: HistoryStorageOption) -> URL {
+        let dir = location == .iCloudDrive ? iCloudDirectoryURL : localDirectoryURL
+        return dir.appendingPathComponent("chat_history.json")
+    }
+
+    public func isICloudAvailable() -> Bool {
+        let parent = iCloudDirectoryURL.deletingLastPathComponent()
+        return FileManager.default.fileExists(atPath: parent.path) || FileManager.default.fileExists(atPath: iCloudDirectoryURL.path)
+    }
+
+    public func loadConversations(
+        from location: HistoryStorageOption,
+        now: Date = Date()
+    ) -> [ChatConversationModel] {
+        let target = fileURL(for: location)
+        guard FileManager.default.fileExists(atPath: target.path),
+              let data = try? Data(contentsOf: target) else {
+            return []
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let decoded = try? decoder.decode([ChatConversationModel].self, from: data) else {
+            return []
+        }
+        let valid = decoded.filter { !$0.isExpired(at: now) }
+        if valid.count != decoded.count {
+            saveConversations(valid, to: location)
+        }
+        return valid
+    }
+
+    public func saveConversations(
+        _ conversations: [ChatConversationModel],
+        to location: HistoryStorageOption
+    ) {
+        let target = fileURL(for: location)
+        let dir = target.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            let data = try encoder.encode(conversations)
+            try data.write(to: target, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+        } catch {
+            // Ignore write errors in restricted environments
+        }
+    }
+
+    public func applyRetentionPolicy(
+        _ policy: HistoryRetentionOption,
+        conversations: [ChatConversationModel],
+        location: HistoryStorageOption,
+        now: Date = Date()
+    ) -> [ChatConversationModel] {
+        var updated: [ChatConversationModel] = []
+        for var conv in conversations {
+            conv.retentionPolicy = policy
+            conv.storageLocation = location
+            conv.expiresAt = policy.computeExpiryDate(from: conv.updatedAt)
+            if !conv.isExpired(at: now) {
+                updated.append(conv)
+            }
+        }
+        saveConversations(updated, to: location)
+        return updated
     }
 }
 
@@ -169,7 +276,8 @@ public final class BackendBridge: Sendable {
         mode: ComputeModeOption,
         cloudProvider: CloudProviderOption,
         guardianPolicy: GuardianPolicyOption,
-        attachedFiles: [String]
+        attachedFiles: [String],
+        sessionId: String? = nil
     ) -> TaskResultModel {
         var excerpts: [String] = []
         var fileLabels: [String] = []
@@ -181,13 +289,16 @@ public final class BackendBridge: Sendable {
                 excerpts.append("--- \(url.lastPathComponent) ---\n\(snippet)")
             }
         }
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "prompt": prompt,
             "mode": mode.rawValue,
             "cloud_provider": cloudProvider.rawValue,
             "file_paths": fileLabels,
             "inline_file_context": excerpts.joined(separator: "\n\n"),
         ]
+        if let sessionId {
+            body["session_id"] = sessionId
+        }
 
         if let data = invokePythonJSON(method: "POST", path: "/v1/tasks/run", body: body),
            let decoded = try? JSONDecoder().decode(TaskResultModel.self, from: data) {
@@ -200,7 +311,8 @@ public final class BackendBridge: Sendable {
             mode: mode,
             cloudProvider: cloudProvider,
             guardianPolicy: guardianPolicy,
-            attachedFiles: attachedFiles
+            attachedFiles: attachedFiles,
+            sessionId: sessionId
         )
     }
 
@@ -208,17 +320,10 @@ public final class BackendBridge: Sendable {
         text: String,
         policy: GuardianPolicyOption
     ) -> GuardianAuditModel {
-        let body: [String: Any] = [
-            "text": text,
-            "policy": policy.rawValue,
-        ]
-        if let data = invokePythonJSON(method: "POST", path: "/v1/guardian/inspect", body: body),
-           let decoded = try? JSONDecoder().decode(GuardianAuditModel.self, from: data) {
-            return decoded
-        }
-
+        // Use the native macOS privacy layer (NLTagger) as the primary source for high-accuracy, on-device detection
         let scan = fallbackGuardian.redactAndRestorePreview(text: text, policy: policy)
         let categories = Array(Set(scan.entities.map(\.category))).sorted()
+        
         return GuardianAuditModel(
             sanitizedText: scan.sanitized,
             piiFlagged: !scan.entities.isEmpty,
@@ -237,7 +342,8 @@ public final class BackendBridge: Sendable {
         mode: ComputeModeOption,
         cloudProvider: CloudProviderOption,
         guardianPolicy: GuardianPolicyOption,
-        attachedFiles: [String]
+        attachedFiles: [String],
+        sessionId: String?
     ) -> TaskResultModel {
         let scan = fallbackGuardian.redactAndRestorePreview(text: prompt, policy: guardianPolicy)
         let categories = Array(Set(scan.entities.map(\.category))).sorted()
@@ -261,10 +367,10 @@ public final class BackendBridge: Sendable {
                     label: "Cloud models",
                     locality: "local",
                     title: "Cloud models not used",
-                    detail: "AI processing stayed 100% on your Mac.",
+                    detail: "AI processing stayed 100% on your Mac. Zero Cloud AI history.",
                     status: "completed",
                     durationMs: 0,
-                    badges: ["Not used"]
+                    badges: ["Not used", "Zero Cloud History"]
                 ),
                 StationStepModel(
                     stationIndex: 3,
@@ -280,6 +386,7 @@ public final class BackendBridge: Sendable {
             ]
             return TaskResultModel(
                 taskId: "task_\(Int(Date().timeIntervalSince1970))",
+                sessionId: sessionId,
                 prompt: prompt,
                 finalOutput: "[On-Device Local Agent · gemma4:26b on Apple Silicon Metal] Completed task locally on this Mac. Nothing left this device.\nTask: \(prompt)",
                 cloudPromptSent: nil,
@@ -292,7 +399,8 @@ public final class BackendBridge: Sendable {
                     piiFlaggedCount: scan.entities.count,
                     piiRestoredCount: 0,
                     piiCategories: categories,
-                    nothingLeftMac: true
+                    nothingLeftMac: true,
+                    cloudZeroRetention: true
                 ),
                 telemetry: TelemetryModel(
                     architecture: "arm64",
@@ -317,7 +425,7 @@ public final class BackendBridge: Sendable {
             )
         }
 
-        var cloudSynthesis = "[\(cloudProvider.displayName)] Benchmarked comparable deals and synthesized reasoning for: \(scan.sanitized)"
+        var cloudSynthesis = "[\(cloudProvider.displayName) · Stateless Zero-History Call] Benchmarked comparable deals and synthesized reasoning for: \(scan.sanitized)"
         for (token, original) in scan.vault {
             cloudSynthesis = cloudSynthesis.replacingOccurrences(of: token, with: original)
         }
@@ -354,11 +462,11 @@ public final class BackendBridge: Sendable {
                 stationId: "cloud",
                 label: "Cloud",
                 locality: "cloud",
-                title: "Cloud reasoning via \(cloudProvider.displayName)",
-                detail: "Researched and reasoned using masked stand-in tokens only.",
+                title: "Stateless Cloud reasoning via \(cloudProvider.displayName)",
+                detail: "Researched using masked stand-in tokens only. store=false: nothing remains in Cloud AI history.",
                 status: "completed",
                 durationMs: 42,
-                badges: [cloudProvider.rawValue]
+                badges: [cloudProvider.rawValue, "Zero Cloud History (store=false)"]
             ),
             StationStepModel(
                 stationIndex: 4,
@@ -375,6 +483,7 @@ public final class BackendBridge: Sendable {
 
         return TaskResultModel(
             taskId: "task_\(Int(Date().timeIntervalSince1970))",
+            sessionId: sessionId,
             prompt: prompt,
             finalOutput: cloudSynthesis,
             cloudPromptSent: scan.sanitized,
@@ -387,7 +496,8 @@ public final class BackendBridge: Sendable {
                 piiFlaggedCount: scan.entities.count,
                 piiRestoredCount: scan.entities.count,
                 piiCategories: categories,
-                nothingLeftMac: false
+                nothingLeftMac: false,
+                cloudZeroRetention: true
             ),
             telemetry: TelemetryModel(
                 architecture: "arm64",

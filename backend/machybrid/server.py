@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from . import __version__
 from .guardian import GuardianPolicy
+from .history import HistoryRetentionPolicy, HistoryStorageLocation
 from .m365_proxy import M365ToolEmulator
 from .orchestrator import ComputeMode, HybridOrchestrator
 
@@ -103,6 +104,9 @@ def dispatch_request(
                 "compute_mode": orchestrator.config.compute_mode.value,
                 "cloud_provider": orchestrator.config.cloud_provider,
                 "guardian_policy": orchestrator.config.guardian_policy.value,
+                "history_storage": orchestrator.config.history_storage.value,
+                "history_retention": orchestrator.config.history_retention.value,
+                "cloud_zero_retention": True,
                 "m365_proxy_running": orchestrator.m365_manager.is_running(),
                 "telemetry": {
                     "architecture": telemetry.architecture,
@@ -112,6 +116,8 @@ def dispatch_request(
             }
         if path == "/v1/config":
             return HTTPStatus.OK, orchestrator.config.to_dict()
+        if path == "/v1/history":
+            return HTTPStatus.OK, orchestrator.history_manager.status_dict()
         if path == "/v1/m365/status":
             return HTTPStatus.OK, orchestrator.m365_manager.status_dict()
         return HTTPStatus.NOT_FOUND, {"error": f"Unknown path: {path}"}
@@ -123,6 +129,52 @@ def dispatch_request(
                 return HTTPStatus.OK, updated.to_dict()
             except ValueError as exc:
                 return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
+
+        if path == "/v1/history":
+            action = str(payload_in.get("action", "configure"))
+            if action == "configure":
+                try:
+                    loc = (
+                        HistoryStorageLocation(str(payload_in["storage_location"]))
+                        if payload_in.get("storage_location")
+                        else None
+                    )
+                    ret = (
+                        HistoryRetentionPolicy(str(payload_in["retention_policy"]))
+                        if payload_in.get("retention_policy")
+                        else None
+                    )
+                    if loc is not None:
+                        orchestrator.config.history_storage = loc
+                    if ret is not None:
+                        orchestrator.config.history_retention = ret
+                    status_out = orchestrator.history_manager.configure(
+                        storage_location=loc,
+                        retention_policy=ret,
+                    )
+                    return HTTPStatus.OK, status_out
+                except ValueError as exc:
+                    return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
+            if action == "delete_session":
+                sid = str(payload_in.get("session_id", ""))
+                deleted = orchestrator.history_manager.delete_session(sid)
+                return HTTPStatus.OK, {
+                    "deleted": deleted,
+                    "history": orchestrator.history_manager.status_dict(),
+                }
+            if action == "clear_all":
+                cleared = orchestrator.history_manager.clear_all()
+                return HTTPStatus.OK, {
+                    "cleared_count": cleared,
+                    "history": orchestrator.history_manager.status_dict(),
+                }
+            if action == "prune_expired":
+                pruned = orchestrator.history_manager.prune_expired()
+                return HTTPStatus.OK, {
+                    "pruned_count": pruned,
+                    "history": orchestrator.history_manager.status_dict(),
+                }
+            return HTTPStatus.BAD_REQUEST, {"error": f"Unknown history action: {action}"}
 
         if path == "/v1/guardian/inspect":
             text = str(payload_in.get("text", ""))
@@ -179,6 +231,12 @@ def dispatch_request(
                 if isinstance(payload_in.get("tools"), list)
                 else None
             )
+            session_id = (
+                str(payload_in["session_id"])
+                if payload_in.get("session_id")
+                else None
+            )
+            save_to_history = bool(payload_in.get("save_to_history", True))
 
             result = orchestrator.run_task(
                 prompt=prompt,
@@ -187,6 +245,8 @@ def dispatch_request(
                 file_paths=[str(p) for p in file_paths],
                 inline_file_context=inline_context,
                 tools=tools,
+                session_id=session_id,
+                save_to_history=save_to_history,
             )
             return HTTPStatus.OK, result.to_dict()
 

@@ -100,7 +100,8 @@ class GeminiProvider:
     ) -> None:
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
         self.model = normalize_gemini_model(model)
-        self.store = store
+        # Strictly enforce zero cloud history retention: never store interactions on cloud servers
+        self.store = False
 
     def generate(
         self,
@@ -120,12 +121,10 @@ class GeminiProvider:
                 kwargs: Dict[str, Any] = {
                     "model": target_model,
                     "input": prompt,
-                    "store": self.store,
+                    "store": False,
                 }
                 if system_instruction:
                     kwargs["system_instruction"] = system_instruction
-                if previous_interaction_id and self.store:
-                    kwargs["previous_interaction_id"] = previous_interaction_id
                 if tools:
                     kwargs["tools"] = tools
 
@@ -138,9 +137,14 @@ class GeminiProvider:
                     model=target_model,
                     output_text=output_text,
                     locality="cloud",
-                    interaction_id=getattr(interaction, "id", None),
+                    interaction_id=None,
                     tokens_used=total_tokens or max(12, len(prompt.split()) + len(output_text.split())),
-                    metadata={"sdk": "google-genai", "api": "interactions.create"},
+                    metadata={
+                        "sdk": "google-genai",
+                        "api": "interactions.create",
+                        "store": False,
+                        "cloud_zero_retention": True,
+                    },
                 )
             except ImportError:
                 pass
@@ -151,7 +155,7 @@ class GeminiProvider:
                     output_text=f"[Gemini Cloud Error: {exc}]",
                     locality="cloud",
                     tokens_used=len(prompt.split()),
-                    metadata={"error": str(exc)},
+                    metadata={"error": str(exc), "store": False, "cloud_zero_retention": True},
                 )
 
         # 2. Deterministic offline/test synthesis when GEMINI_API_KEY is not set
@@ -191,7 +195,12 @@ class GeminiProvider:
             output_text=summary,
             locality="cloud",
             tokens_used=est_tokens,
-            metadata={"mode": mode_note, "offline_simulation": True},
+            metadata={
+                "mode": mode_note,
+                "offline_simulation": True,
+                "store": False,
+                "cloud_zero_retention": True,
+            },
         )
 
 
@@ -453,11 +462,16 @@ class OpenAICompatibleProvider:
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
+            "store": False,
         }
         if tools:
             payload["tools"] = tools
 
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "X-No-Store": "true",
+            "Cache-Control": "no-store",
+        }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
@@ -486,7 +500,11 @@ class OpenAICompatibleProvider:
                         "total_tokens",
                         max(16, len(prompt.split()) + len(content.split())),
                     ),
-                    metadata={"base_url": self.base_url},
+                    metadata={
+                        "base_url": self.base_url,
+                        "store": False,
+                        "cloud_zero_retention": True,
+                    },
                 )
             except (TimeoutError, OSError, ValueError):
                 pass
@@ -546,4 +564,6 @@ class M365CopilotProvider:
 
         response.metadata["m365_proxy_url"] = self.base_url
         response.metadata["resolved_model"] = resolved_model
+        response.metadata["temporary_chat_mode"] = True
+        response.metadata["cloud_zero_retention"] = True
         return response

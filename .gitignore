@@ -27,3 +27,4 @@ pytest-report.xml
 secrets.json
 msal-cache.json
 agent-id.json
+.aider*

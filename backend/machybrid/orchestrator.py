@@ -21,10 +21,14 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .guardian import GuardianPolicy, PIIGuardian, RedactionResult
+from .history import (
+    HistoryRetentionPolicy,
+    HistoryStorageLocation,
+    PromptHistoryManager,
+)
 from .m365_proxy import M365CopilotProxyManager, M365ModelCatalog, M365ProxySettings
 from .providers import (
     DEFAULT_ANTIGRAVITY_AGENT,
@@ -43,6 +47,7 @@ class ComputeMode(str, Enum):
     """Execution mode for MacHybridAI tasks."""
 
     LOCAL = "local"
+    AUTO = "auto"
     HYBRID = "hybrid"
     CLOUD = "cloud"
 
@@ -64,7 +69,12 @@ class HybridConfig:
     m365_port: int = 4141
     m365_model: str = M365ModelCatalog.DEFAULT_TOOL_MODEL
     guardian_policy: GuardianPolicy = GuardianPolicy.REVERSIBLE_MASK
+    history_storage: HistoryStorageLocation = HistoryStorageLocation.LOCAL
+    history_retention: HistoryRetentionPolicy = HistoryRetentionPolicy.DAYS_30
+    history_encrypt_at_rest: bool = False
+    history_redacted_only: bool = False
     custom_sensitive_terms: List[str] = field(default_factory=list)
+    allowlist_terms: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -81,7 +91,13 @@ class HybridConfig:
             "m365_port": self.m365_port,
             "m365_model": M365ModelCatalog.resolve_model(self.m365_model),
             "guardian_policy": self.guardian_policy.value,
+            "history_storage": self.history_storage.value,
+            "history_retention": self.history_retention.value,
+            "history_encrypt_at_rest": self.history_encrypt_at_rest,
+            "history_redacted_only": self.history_redacted_only,
+            "cloud_zero_retention": True,
             "custom_sensitive_terms": list(self.custom_sensitive_terms),
+            "allowlist_terms": list(self.allowlist_terms),
         }
 
 
@@ -112,6 +128,7 @@ class ExecutionReceipt:
     pii_restored_count: int
     pii_categories: List[str]
     nothing_left_mac: bool
+    cloud_zero_retention: bool = True
 
 
 @dataclass
@@ -139,10 +156,12 @@ class TaskExecutionResult:
     receipt: ExecutionReceipt
     telemetry: MacTelemetry
     guardian_audit: Dict[str, Any]
+    session_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "task_id": self.task_id,
+            "session_id": self.session_id,
             "prompt": self.prompt,
             "final_output": self.final_output,
             "cloud_prompt_sent": self.cloud_Prompt_sent,
@@ -160,11 +179,13 @@ class HybridOrchestrator:
         self,
         config: Optional[HybridConfig] = None,
         allowed_roots: Optional[List[str]] = None,
+        history_manager: Optional[PromptHistoryManager] = None,
     ) -> None:
         self.config = config or HybridConfig()
         self.guardian = PIIGuardian(
             policy=self.config.guardian_policy,
             custom_sensitive_terms=self.config.custom_sensitive_terms,
+            allowlist_terms=self.config.allowlist_terms,
         )
         self.m365_manager = M365CopilotProxyManager(
             M365ProxySettings(
@@ -172,13 +193,19 @@ class HybridOrchestrator:
                 default_model=self.config.m365_model,
             )
         )
+        self.history_manager = history_manager or PromptHistoryManager(
+            storage_location=self.config.history_storage,
+            retention_policy=self.config.history_retention,
+            encrypt_at_rest=self.config.history_encrypt_at_rest,
+            redacted_only=self.config.history_redacted_only,
+        )
         self.allowed_roots = [
             os.path.abspath(os.path.expanduser(r))
             for r in (allowed_roots or [os.path.expanduser("~")])
         ]
 
     def update_config(self, updates: Dict[str, Any]) -> HybridConfig:
-        """Updates orchestrator configuration and syncs Guardian and M365 settings."""
+        """Updates orchestrator configuration and syncs Guardian, M365, and History settings."""
         if "compute_mode" in updates:
             self.config.compute_mode = ComputeMode(updates["compute_mode"])
         if "cloud_provider" in updates:
@@ -208,6 +235,18 @@ class HybridOrchestrator:
         if "guardian_policy" in updates:
             self.config.guardian_policy = GuardianPolicy(updates["guardian_policy"])
             self.guardian.policy = self.config.guardian_policy
+        if "history_storage" in updates:
+            self.config.history_storage = HistoryStorageLocation(str(updates["history_storage"]))
+            self.history_manager.configure(storage_location=self.config.history_storage)
+        if "history_retention" in updates:
+            self.config.history_retention = HistoryRetentionPolicy(str(updates["history_retention"]))
+            self.history_manager.configure(retention_policy=self.config.history_retention)
+        if "history_encrypt_at_rest" in updates:
+            self.config.history_encrypt_at_rest = bool(updates["history_encrypt_at_rest"])
+            self.history_manager.configure(encrypt_at_rest=self.config.history_encrypt_at_rest)
+        if "history_redacted_only" in updates:
+            self.config.history_redacted_only = bool(updates["history_redacted_only"])
+            self.history_manager.configure(redacted_only=self.config.history_redacted_only)
         if "custom_sensitive_terms" in updates and isinstance(
             updates["custom_sensitive_terms"], list
         ):
@@ -215,6 +254,13 @@ class HybridOrchestrator:
                 str(x) for x in updates["custom_sensitive_terms"]
             ]
             self.guardian.set_custom_terms(self.config.custom_sensitive_terms)
+        if "allowlist_terms" in updates and isinstance(
+            updates["allowlist_terms"], list
+        ):
+            self.config.allowlist_terms = [
+                str(x) for x in updates["allowlist_terms"]
+            ]
+            self.guardian.set_allowlist_terms(self.config.allowlist_terms)
         return self.config
 
     @staticmethod
@@ -230,6 +276,28 @@ class HybridOrchestrator:
                 labels.append(base)
         return labels
 
+    def _resolve_smart_auto_mode(self, prompt: str) -> ComputeMode:
+        """Smart Auto-Router: routes high-risk secret prompts or simple queries locally, and complex reasoning to Hybrid."""
+        pre_scan = self.guardian.redact(prompt)
+        high_risk = {"SECRET", "SSN", "CREDIT_CARD"}
+        if any(cat in high_risk for cat in pre_scan.categories):
+            return ComputeMode.LOCAL
+        words = prompt.split()
+        complex_keywords = {
+            "benchmark",
+            "compare",
+            "research",
+            "analyze",
+            "synthesize",
+            "architecture",
+            "market",
+            "deck",
+            "multi-step",
+        }
+        if len(words) >= 12 or any(w.lower().strip(".,?!") in complex_keywords for w in words):
+            return ComputeMode.HYBRID
+        return ComputeMode.LOCAL
+
     def run_task(
         self,
         prompt: str,
@@ -238,9 +306,17 @@ class HybridOrchestrator:
         file_paths: Optional[List[str]] = None,
         inline_file_context: str = "",
         tools: Optional[List[Dict[str, Any]]] = None,
+        session_id: Optional[str] = None,
+        save_to_history: bool = True,
+        approved_sanitized_prompt: Optional[str] = None,
     ) -> TaskExecutionResult:
-        """Executes a task in Fully Local, Hybrid, or Cloud mode with PII Guardian protection."""
-        active_mode = mode or self.config.compute_mode
+        """Executes a task in Fully Local, Auto Hybrid, Hybrid, or Cloud mode with PII Guardian protection."""
+        requested_mode = mode or self.config.compute_mode
+        active_mode = (
+            self._resolve_smart_auto_mode(prompt)
+            if requested_mode == ComputeMode.AUTO
+            else requested_mode
+        )
         active_cloud_provider = cloud_provider or self.config.cloud_provider
         task_id = f"task_{int(time.time() * 1000)}"
 
@@ -291,9 +367,9 @@ class HybridOrchestrator:
                     label="Cloud models",
                     locality="local",
                     title="Cloud models not used",
-                    detail="AI processing stayed 100% on your Mac.",
+                    detail="AI processing stayed 100% on your Mac. Zero Cloud AI history.",
                     duration_ms=0,
-                    badges=["Not used"],
+                    badges=["Not used", "Zero Cloud History"],
                 )
             )
             stations.append(
@@ -318,9 +394,25 @@ class HybridOrchestrator:
                 pii_restored_count=0,
                 pii_categories=[],
                 nothing_left_mac=True,
+                cloud_zero_retention=True,
             )
+            active_session_id = session_id
+            if save_to_history:
+                saved = self.history_manager.record_exchange(
+                    prompt=prompt,
+                    response_text=local_resp.output_text,
+                    compute_mode="local",
+                    cloud_provider="none",
+                    sanitized_cloud_prompt=None,
+                    pii_masked_count=0,
+                    pii_restored_count=0,
+                    session_id=session_id,
+                )
+                active_session_id = saved.session_id
+
             return TaskExecutionResult(
                 task_id=task_id,
+                session_id=active_session_id,
                 prompt=prompt,
                 final_output=local_resp.output_text,
                 cloud_Prompt_sent=None,
@@ -397,9 +489,25 @@ class HybridOrchestrator:
                 pii_restored_count=0,
                 pii_categories=redaction.categories,
                 nothing_left_mac=True,
+                cloud_zero_retention=True,
             )
+            active_session_id = session_id
+            if save_to_history:
+                saved = self.history_manager.record_exchange(
+                    prompt=prompt,
+                    response_text=local_resp.output_text,
+                    compute_mode="hybrid_forced_local",
+                    cloud_provider="blocked",
+                    sanitized_cloud_prompt=None,
+                    pii_masked_count=redaction.pii_count,
+                    pii_restored_count=0,
+                    session_id=session_id,
+                )
+                active_session_id = saved.session_id
+
             return TaskExecutionResult(
                 task_id=task_id,
+                session_id=active_session_id,
                 prompt=prompt,
                 final_output=local_resp.output_text,
                 cloud_Prompt_sent=None,
@@ -436,7 +544,7 @@ class HybridOrchestrator:
             )
         )
 
-        # Station 3: Cloud Research & Reasoning (using sanitized stand-ins ONLY)
+        # Station 3: Cloud Research & Reasoning (using sanitized stand-ins ONLY & store=False)
         t_cloud_start = time.monotonic()
         cloud_resp = self._invoke_cloud_provider(
             provider_name=active_cloud_provider,
@@ -452,10 +560,17 @@ class HybridOrchestrator:
                 station_id="cloud",
                 label="Cloud",
                 locality="cloud",
-                title=f"Cloud reasoning via {cloud_resp.provider} ({cloud_resp.model})",
-                detail="Researched and reasoned using masked stand-in tokens only.",
+                title=f"Stateless Cloud reasoning via {cloud_resp.provider} ({cloud_resp.model})",
+                detail=(
+                    "Researched using masked stand-in tokens only. "
+                    "Stateless call (store=false / temporary chat): nothing remains in Cloud AI history."
+                ),
                 duration_ms=cloud_ms,
-                badges=[cloud_resp.provider, cloud_resp.model],
+                badges=[
+                    cloud_resp.provider,
+                    cloud_resp.model,
+                    "Zero Cloud History (store=false)",
+                ],
             )
         )
 
@@ -466,7 +581,7 @@ class HybridOrchestrator:
             f"### Hybrid Compute Synthesis\n\n"
             f"**On-Device Analysis ({local_resp.model} on This Mac):**\n"
             f"{local_resp.output_text}\n\n"
-            f"**Cloud Research & Reasoning ({cloud_resp.provider} · {cloud_resp.model}):**\n"
+            f"**Cloud Research & Reasoning ({cloud_resp.provider} · {cloud_resp.model} · Zero Cloud History):**\n"
             f"{restored_cloud_text}"
         )
         restore_ms = max(1, int((time.monotonic() - t_restore_start) * 1000))
@@ -481,7 +596,7 @@ class HybridOrchestrator:
                 detail=(
                     f"Restored {restored_count} masked stand-in token(s) from local PIIVault."
                     if restored_count > 0
-                    else "Combined local private file work with cloud research."
+                    else "Combined local private file work with stateless cloud research."
                 ),
                 duration_ms=restore_ms,
                 badges=["Real values restored", "Hybrid Complete"],
@@ -497,10 +612,26 @@ class HybridOrchestrator:
             pii_restored_count=restored_count,
             pii_categories=redaction.categories,
             nothing_left_mac=False,
+            cloud_zero_retention=True,
         )
+
+        active_session_id = session_id
+        if save_to_history:
+            saved = self.history_manager.record_exchange(
+                prompt=prompt,
+                response_text=final_output,
+                compute_mode=active_mode.value,
+                cloud_provider=cloud_resp.provider,
+                sanitized_cloud_prompt=redaction.sanitized_text,
+                pii_masked_count=redaction.pii_count,
+                pii_restored_count=restored_count,
+                session_id=session_id,
+            )
+            active_session_id = saved.session_id
 
         return TaskExecutionResult(
             task_id=task_id,
+            session_id=active_session_id,
             prompt=prompt,
             final_output=final_output,
             cloud_Prompt_sent=redaction.sanitized_text,
@@ -537,11 +668,126 @@ class HybridOrchestrator:
         ).generate(prompt=sanitized_prompt, tools=tools)
 
     @staticmethod
+    def _read_cpu_percent_darwin() -> int:
+        """Reads real CPU busy % on macOS using `host_statistics` via `sysctl vm.loadavg`.
+
+        Falls back to a safe placeholder (0) on any error.
+        Uses the 1-minute load average divided by logical CPU count, capped at 100.
+        This avoids any third-party dependency while remaining accurate enough for
+        a UI sparkline.
+        """
+        try:
+            # sysctl -n vm.loadavg returns: "{ 1.23 0.98 0.87 }"
+            raw = subprocess.check_output(
+                ["/usr/sbin/sysctl", "-n", "vm.loadavg"],
+                timeout=1.0,
+            ).decode("utf-8").strip()
+            # Parse "{ 1.23 0.98 0.87 }" → 1.23 (1-minute average)
+            inner = raw.strip("{} ")
+            load_1min = float(inner.split()[0])
+
+            # Logical CPU count
+            ncpu_raw = subprocess.check_output(
+                ["/usr/sbin/sysctl", "-n", "hw.logicalcpu"],
+                timeout=1.0,
+            ).decode("utf-8").strip()
+            ncpu = max(1, int(ncpu_raw))
+
+            # Load average as a fraction of total CPU capacity, capped at 100
+            return min(100, max(0, int((load_1min / ncpu) * 100)))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _read_memory_percent_darwin() -> int:
+        """Reads real memory pressure % on macOS via `vm_stat` + `hw.memsize`.
+
+        Computes: used_pages / total_pages × 100.
+        Falls back to 0 on any error.
+        """
+        try:
+            # Total physical memory in bytes
+            mem_raw = subprocess.check_output(
+                ["/usr/sbin/sysctl", "-n", "hw.memsize"],
+                timeout=1.0,
+            ).decode("utf-8").strip()
+            total_bytes = int(mem_raw)
+
+            # vm_stat output: "Pages free: 123456." etc.
+            vm_raw = subprocess.check_output(
+                ["/usr/bin/vm_stat"],
+                timeout=1.0,
+            ).decode("utf-8")
+
+            page_size = 16384  # Apple Silicon default page size (16 KiB)
+            # Try to extract page size from the header line
+            for line in vm_raw.splitlines():
+                if "page size of" in line:
+                    parts = line.split("page size of")
+                    if len(parts) > 1:
+                        size_part = parts[1].split()[0]
+                        if size_part.isdigit():
+                            page_size = int(size_part)
+                    break
+
+            def _parse_pages(label: str) -> int:
+                for line in vm_raw.splitlines():
+                    if line.startswith(label):
+                        val = line.split(":")[1].strip().rstrip(".")
+                        if val.isdigit():
+                            return int(val)
+                return 0
+
+            free_pages = _parse_pages("Pages free:")
+            speculative = _parse_pages("Pages speculative:")
+            total_pages = total_bytes // page_size
+            if total_pages == 0:
+                return 0
+            available_pages = free_pages + speculative
+            used_pages = max(0, total_pages - available_pages)
+            return min(100, max(0, int(used_pages / total_pages * 100)))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _read_gpu_percent_darwin(arch: str) -> int:
+        """Reads GPU engine busy % from `powermetrics` on Apple Silicon (arm64).
+
+        Runs a single 200 ms sample — fast enough for a UI refresh.
+        Falls back gracefully on Intel, non-Darwin, or permission errors.
+        """
+        if arch != "arm64" or platform.system() != "Darwin":
+            return 0
+        try:
+            raw = subprocess.check_output(
+                [
+                    "/usr/bin/powermetrics",
+                    "--samplers", "gpu_power",
+                    "-n", "1",
+                    "--sample-rate", "200",
+                ],
+                timeout=3.0,
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", errors="replace")
+            # Look for "GPU HW active residency:  76.34%" or similar
+            import re as _re
+            match = _re.search(r"GPU HW active residency:\s+([\d.]+)%", raw)
+            if match:
+                return min(100, max(0, int(float(match.group(1)))))
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
     def collect_telemetry(tokens: int = 0) -> MacTelemetry:
-        """Collects Apple Silicon hardware metrics for the UI telemetry sparklines."""
+        """Collects real Apple Silicon hardware metrics for the UI telemetry sparklines.
+
+        All reads use stdlib subprocess calls to macOS system utilities only —
+        no third-party dependencies required.
+        """
         arch = platform.machine() or "arm64"
         chip = "Apple Silicon (Metal)" if arch == "arm64" else arch
-        mem_gb = 36
+        mem_gb = 8
         if platform.system() == "Darwin":
             try:
                 out = subprocess.check_output(
@@ -551,12 +797,17 @@ class HybridOrchestrator:
                 mem_gb = max(8, int(out) // (1024**3))
             except Exception:
                 pass
+
+        cpu_pct = HybridOrchestrator._read_cpu_percent_darwin()
+        mem_pct = HybridOrchestrator._read_memory_percent_darwin()
+        gpu_pct = HybridOrchestrator._read_gpu_percent_darwin(arch)
+
         return MacTelemetry(
             architecture=arch,
             chip_brand=chip,
-            cpu_percent=28,
-            memory_percent=64,
-            gpu_percent=76 if arch == "arm64" else 15,
+            cpu_percent=cpu_pct,
+            memory_percent=mem_pct,
+            gpu_percent=gpu_pct,
             tokens_processed=tokens,
             unified_memory_gb=mem_gb,
         )

@@ -20,7 +20,7 @@ struct MacHybridAITests {
         #expect(scan.restored.contains("Sam Reyes"))
     }
 
-    @Test("BackendBridge executes Fully Local and Hybrid modes with PII protection")
+    @Test("BackendBridge executes Fully Local and Hybrid modes with PII protection and Zero Cloud History")
     func testBackendBridgeHybridAndLocalExecution() {
         let bridge = BackendBridge.shared
 
@@ -34,6 +34,7 @@ struct MacHybridAITests {
         )
         #expect(localResult.cloudPromptSent == nil)
         #expect(localResult.receipt.nothingLeftMac == true)
+        #expect(localResult.receipt.cloudZeroRetention == true)
         #expect(localResult.receipt.cloudModelsUsed == "not used")
 
         // 2. Hybrid Mode with Privacy Gate
@@ -48,6 +49,7 @@ struct MacHybridAITests {
         #expect(!(hybridResult.cloudPromptSent?.contains("sam.reyes@meridian.io") ?? true))
         #expect(hybridResult.finalOutput.contains("sam.reyes@meridian.io"))
         #expect(hybridResult.receipt.piiFlaggedCount > 0)
+        #expect(hybridResult.receipt.cloudZeroRetention == true)
     }
 
     @Test("Strict redaction mode permanently strips PII without restoration")
@@ -59,5 +61,52 @@ struct MacHybridAITests {
         )
         #expect(scan.sanitized.contains("[REDACTED_EMAIL]"))
         #expect(!scan.restored.contains("secret@company.com"))
+    }
+
+    @Test("PromptHistoryStore saves to Local Mac or iCloud and enforces auto-delete or never-delete")
+    func testPromptHistoryStoreLocalICloudAndAutoDelete() throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let localDir = tempBase.appendingPathComponent("local", isDirectory: true)
+        let icloudDir = tempBase.appendingPathComponent("icloud", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+
+        let store = PromptHistoryStore(customLocalDirectory: localDir, customICloudDirectory: icloudDir)
+        let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
+
+        let msg = ChatMessageModel(role: "user", content: "Saved prompt", createdAt: baseDate)
+        let conv24h = ChatConversationModel(
+            title: "24h Expiring Chat",
+            createdAt: baseDate,
+            updatedAt: baseDate,
+            storageLocation: .localMac,
+            retentionPolicy: .hours24,
+            messages: [msg]
+        )
+        store.saveConversations([conv24h], to: .localMac)
+
+        // Before 24 hours: still present
+        let loadedBefore = store.loadConversations(from: .localMac, now: baseDate.addingTimeInterval(3600))
+        #expect(loadedBefore.count == 1)
+
+        // After 25 hours: automatically deleted
+        let loadedAfter = store.loadConversations(from: .localMac, now: baseDate.addingTimeInterval(25 * 3600))
+        #expect(loadedAfter.isEmpty)
+
+        // Never delete option on iCloud Drive: persists indefinitely
+        let convNever = ChatConversationModel(
+            title: "Permanent iCloud Chat",
+            createdAt: baseDate,
+            updatedAt: baseDate,
+            storageLocation: .iCloudDrive,
+            retentionPolicy: .neverDelete,
+            messages: [msg]
+        )
+        store.saveConversations([convNever], to: .iCloudDrive)
+        let loadedYearsLater = store.loadConversations(
+            from: .iCloudDrive,
+            now: baseDate.addingTimeInterval(10 * 365 * 86400)
+        )
+        #expect(loadedYearsLater.count == 1)
+        #expect(loadedYearsLater.first?.retentionPolicy == .neverDelete)
     }
 }
