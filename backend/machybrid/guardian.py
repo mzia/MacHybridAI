@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 import threading
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Iterable, List, Optional, Tuple
 

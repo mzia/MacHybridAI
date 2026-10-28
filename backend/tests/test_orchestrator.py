@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import threading
-import urllib.request
 import unittest
 
 from machybrid.guardian import GuardianPolicy
