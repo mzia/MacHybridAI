@@ -400,7 +400,7 @@ public struct ChatMessageModel: Identifiable, Codable, Sendable, Equatable {
     public let createdAt: Date
     public let computeMode: String
     public let cloudProvider: String
-    public let sanitizedCloudPrompt: String?
+    public var sanitizedCloudPrompt: String?   // var — attached after stream completes
     public let piiMaskedCount: Int
     public let piiRestoredCount: Int
     public var stations: [StationStepModel]    // var — attached after stream completes

@@ -437,28 +437,38 @@ final class HybridAppViewModel: ObservableObject {
                     }
                 },
                 onReceipt: { receiptPayload in
+                    let decodedReceipt: ExecutionReceiptModel? = {
+                        guard let recDict = receiptPayload["receipt"],
+                              let recData = try? JSONSerialization.data(withJSONObject: recDict) else { return nil }
+                        return try? JSONDecoder().decode(ExecutionReceiptModel.self, from: recData)
+                    }()
+                    let decodedStations: [StationStepModel] = {
+                        guard let stList = receiptPayload["stations"],
+                              let stData = try? JSONSerialization.data(withJSONObject: stList),
+                              let list = try? JSONDecoder().decode([StationStepModel].self, from: stData) else { return [] }
+                        return list
+                    }()
+                    let decodedTelemetry: TelemetryModel? = {
+                        guard let telDict = receiptPayload["telemetry"],
+                              let telData = try? JSONSerialization.data(withJSONObject: telDict) else { return nil }
+                        return try? JSONDecoder().decode(TelemetryModel.self, from: telData)
+                    }()
+                    let cloudSent = receiptPayload["cloud_prompt_sent"] as? String
+
                     Task { @MainActor in
                         if let convIdx = self.conversations.firstIndex(where: { $0.id == currentSessionId }),
                            let msgIdx = self.conversations[convIdx].messages.firstIndex(where: { $0.id == streamingId }) {
                             self.conversations[convIdx].messages[msgIdx].isStreaming = false
-
-                            // Decode structured receipt, stations, telemetry, and sanitizedCloudPrompt from SSE receipt event
-                            if let recDict = receiptPayload["receipt"],
-                               let recData = try? JSONSerialization.data(withJSONObject: recDict),
-                               let decodedReceipt = try? JSONDecoder().decode(ExecutionReceiptModel.self, from: recData) {
+                            if let decodedReceipt {
                                 self.conversations[convIdx].messages[msgIdx].receipt = decodedReceipt
                             }
-                            if let stList = receiptPayload["stations"],
-                               let stData = try? JSONSerialization.data(withJSONObject: stList),
-                               let decodedStations = try? JSONDecoder().decode([StationStepModel].self, from: stData) {
+                            if !decodedStations.isEmpty {
                                 self.conversations[convIdx].messages[msgIdx].stations = decodedStations
                             }
-                            if let telDict = receiptPayload["telemetry"],
-                               let telData = try? JSONSerialization.data(withJSONObject: telDict),
-                               let decodedTelemetry = try? JSONDecoder().decode(TelemetryModel.self, from: telData) {
+                            if let decodedTelemetry {
                                 self.conversations[convIdx].messages[msgIdx].telemetry = decodedTelemetry
                             }
-                            if let cloudSent = receiptPayload["cloud_prompt_sent"] as? String {
+                            if let cloudSent {
                                 self.conversations[convIdx].messages[msgIdx].sanitizedCloudPrompt = cloudSent
                             }
                         }

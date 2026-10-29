@@ -666,9 +666,10 @@ public final class BackendBridge: Sendable {
     private func nativeSysctlString(_ key: String) -> String? {
         var size: Int = 0
         guard Darwin.sysctlbyname(key, nil, &size, nil, 0) == 0, size > 0 else { return nil }
-        var buf = [CChar](repeating: 0, count: size)
+        var buf = [UInt8](repeating: 0, count: size)
         guard Darwin.sysctlbyname(key, &buf, &size, nil, 0) == 0 else { return nil }
-        return String(cString: buf).trimmingCharacters(in: .whitespacesAndNewlines)
+        let slice = buf.prefix { $0 != 0 }
+        return String(decoding: slice, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func nativeSysctlInt(_ key: String) -> Int? {

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import os
 import platform
-import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
