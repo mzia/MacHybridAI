@@ -60,8 +60,8 @@ class HybridConfig:
     cloud_provider: str = "gemini"  # "gemini" | "antigravity" | "openai_compatible" | "m365_copilot"
     gemini_model: str = DEFAULT_GEMINI_MODEL
     antigravity_agent: str = DEFAULT_ANTIGRAVITY_AGENT
-    local_backend: str = "ollama"  # "litert" | "ollama" | "lmstudio"
-    local_model: str = "gemma4:26b"
+    local_backend: str = "mlx"       # "mlx" | "litert" | "ollama" | "lmstudio"
+    local_model: str = ""            # empty = auto-select best MLX model by available RAM
     local_base_url: str = "http://127.0.0.1:11434/v1"
     litert_model_path: str = "~/.litert-lm/models/gemma4-26b/model.litertlm"
     openai_base_url: str = "https://api.openai.com/v1"

@@ -396,17 +396,19 @@ public struct TaskResultModel: Codable, Sendable, Equatable {
 public struct ChatMessageModel: Identifiable, Codable, Sendable, Equatable {
     public let id: String
     public let role: String // "user" | "assistant"
-    public let content: String
+    public var content: String          // var — filled incrementally during streaming
     public let createdAt: Date
     public let computeMode: String
     public let cloudProvider: String
     public let sanitizedCloudPrompt: String?
     public let piiMaskedCount: Int
     public let piiRestoredCount: Int
-    public let stations: [StationStepModel]
-    public let receipt: ExecutionReceiptModel?
-    public let telemetry: TelemetryModel?
+    public var stations: [StationStepModel]    // var — attached after stream completes
+    public var receipt: ExecutionReceiptModel? // var — attached after stream completes
+    public var telemetry: TelemetryModel?      // var — attached after stream completes
     public let cloudZeroRetention: Bool
+    /// True while the assistant message is still receiving tokens from the MLX stream.
+    public var isStreaming: Bool
 
     public init(
         id: String = UUID().uuidString,
@@ -421,7 +423,8 @@ public struct ChatMessageModel: Identifiable, Codable, Sendable, Equatable {
         stations: [StationStepModel] = [],
         receipt: ExecutionReceiptModel? = nil,
         telemetry: TelemetryModel? = nil,
-        cloudZeroRetention: Bool = true
+        cloudZeroRetention: Bool = true,
+        isStreaming: Bool = false
     ) {
         self.id = id
         self.role = role
@@ -436,6 +439,7 @@ public struct ChatMessageModel: Identifiable, Codable, Sendable, Equatable {
         self.receipt = receipt
         self.telemetry = telemetry
         self.cloudZeroRetention = cloudZeroRetention
+        self.isStreaming = isStreaming
     }
 }
 

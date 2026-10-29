@@ -350,79 +350,117 @@ final class HybridAppViewModel: ObservableObject {
         let provider = cloudProvider
         let policy = guardianPolicy
         let files = attachedFiles
+        let now = Date()
 
-        // Run the blocking Python subprocess on a background thread so the UI
-        // stays responsive (spinner animates, buttons remain interactive).
+        // Add user message immediately so the UI shows it while waiting
+        let userMsg = ChatMessageModel(
+            role: "user",
+            content: trimmed,
+            createdAt: now,
+            computeMode: mode.rawValue,
+            cloudProvider: provider.rawValue,
+            sanitizedCloudPrompt: nil,
+            piiMaskedCount: 0,
+            piiRestoredCount: 0,
+            stations: [],
+            receipt: nil,
+            telemetry: nil,
+            cloudZeroRetention: true
+        )
+
+        // Streaming placeholder — content fills in token by token
+        let streamingId = UUID().uuidString
+        let streamingMsg = ChatMessageModel(
+            id: streamingId,
+            role: "assistant",
+            content: "",
+            createdAt: now,
+            computeMode: mode.rawValue,
+            cloudProvider: provider.rawValue,
+            sanitizedCloudPrompt: nil,
+            piiMaskedCount: 0,
+            piiRestoredCount: 0,
+            stations: [],
+            receipt: nil,
+            telemetry: nil,
+            cloudZeroRetention: true,
+            isStreaming: true
+        )
+
+        if let idx = conversations.firstIndex(where: { $0.id == currentSessionId }) {
+            if conversations[idx].title == "New Hybrid Chat" {
+                let firstLine = trimmed.components(separatedBy: .newlines).first ?? trimmed
+                conversations[idx].title = String(firstLine.prefix(46))
+            }
+            conversations[idx].messages.append(userMsg)
+            conversations[idx].messages.append(streamingMsg)
+        }
+        promptText = ""
+        attachedFiles.removeAll()
+        updateComposerLiveAudit()
+
+        // Stream tokens on a background task, update the placeholder bubble in real time
         Task.detached(priority: .userInitiated) {
-            let result = BackendBridge.shared.runTask(
+            BackendBridge.shared.streamTask(
                 prompt: trimmed,
                 mode: mode,
                 cloudProvider: provider,
-                guardianPolicy: policy,
-                attachedFiles: files,
-                sessionId: currentSessionId
+                sessionId: currentSessionId,
+                onToken: { token in
+                    Task { @MainActor in
+                        guard let convIdx = self.conversations.firstIndex(where: { $0.id == currentSessionId }),
+                              let msgIdx = self.conversations[convIdx].messages.firstIndex(where: { $0.id == streamingId })
+                        else { return }
+                        self.conversations[convIdx].messages[msgIdx].content += token
+                    }
+                },
+                onReceipt: { receipt in
+                    Task { @MainActor in
+                        // Mark streaming complete, attach receipt metadata
+                        if let convIdx = self.conversations.firstIndex(where: { $0.id == currentSessionId }),
+                           let msgIdx = self.conversations[convIdx].messages.firstIndex(where: { $0.id == streamingId }) {
+                            self.conversations[convIdx].messages[msgIdx].isStreaming = false
+                        }
+                        self.isRunning = false
+                        self.historyStore.saveConversations(self.conversations, to: self.historyStorage)
+                    }
+                }
             )
 
-            // All @Published mutations must happen on MainActor.
+            // Fallback: if streaming returned nothing (daemon not available), use blocking path
             await MainActor.run {
-                self.lastResult = result
+                guard let convIdx = self.conversations.firstIndex(where: { $0.id == currentSessionId }),
+                      let msgIdx = self.conversations[convIdx].messages.firstIndex(where: { $0.id == streamingId }),
+                      self.conversations[convIdx].messages[msgIdx].content.isEmpty
+                else { return }
 
-                let now = Date()
-                let userMsg = ChatMessageModel(
-                    role: "user",
-                    content: trimmed,
-                    createdAt: now,
-                    computeMode: mode.rawValue,
-                    cloudProvider: provider.rawValue,
-                    sanitizedCloudPrompt: result.cloudPromptSent,
-                    piiMaskedCount: result.receipt.piiFlaggedCount,
-                    piiRestoredCount: 0,
-                    stations: [],
-                    receipt: nil,
-                    telemetry: nil,
-                    cloudZeroRetention: true
-                )
-
-                let assistantMsg = ChatMessageModel(
-                    role: "assistant",
-                    content: result.finalOutput,
-                    createdAt: now,
-                    computeMode: mode.rawValue,
-                    cloudProvider: provider.rawValue,
-                    sanitizedCloudPrompt: result.cloudPromptSent,
-                    piiMaskedCount: result.receipt.piiFlaggedCount,
-                    piiRestoredCount: result.receipt.piiRestoredCount,
-                    stations: result.stations,
-                    receipt: result.receipt,
-                    telemetry: result.telemetry,
-                    cloudZeroRetention: true
-                )
-
-                if let idx = self.conversations.firstIndex(where: { $0.id == currentSessionId }) {
-                    if self.conversations[idx].messages.isEmpty || self.conversations[idx].title == "New Hybrid Chat" {
-                        let firstLine = trimmed.components(separatedBy: .newlines).first ?? trimmed
-                        self.conversations[idx].title = String(firstLine.prefix(46))
+                // content is empty — streaming failed, fall back to runTask
+                Task.detached(priority: .userInitiated) {
+                    let result = BackendBridge.shared.runTask(
+                        prompt: trimmed,
+                        mode: mode,
+                        cloudProvider: provider,
+                        guardianPolicy: policy,
+                        attachedFiles: files,
+                        sessionId: currentSessionId
+                    )
+                    await MainActor.run {
+                        self.lastResult = result
+                        if let convIdx = self.conversations.firstIndex(where: { $0.id == currentSessionId }),
+                           let msgIdx = self.conversations[convIdx].messages.firstIndex(where: { $0.id == streamingId }) {
+                            self.conversations[convIdx].messages[msgIdx].content = result.finalOutput
+                            self.conversations[convIdx].messages[msgIdx].isStreaming = false
+                            self.conversations[convIdx].messages[msgIdx].stations = result.stations
+                            self.conversations[convIdx].messages[msgIdx].receipt = result.receipt
+                            self.conversations[convIdx].messages[msgIdx].telemetry = result.telemetry
+                        }
+                        self.isRunning = false
+                        self.historyStore.saveConversations(self.conversations, to: self.historyStorage)
                     }
-                    self.conversations[idx].messages.append(userMsg)
-                    self.conversations[idx].messages.append(assistantMsg)
-                    self.conversations[idx].updatedAt = now
-                    self.conversations[idx].storageLocation = self.historyStorage
-                    self.conversations[idx].retentionPolicy = self.historyRetention
-                    self.conversations[idx].expiresAt = self.historyRetention.computeExpiryDate(from: now)
-
-                    let updatedConv = self.conversations.remove(at: idx)
-                    self.conversations.insert(updatedConv, at: 0)
                 }
-
-                self.historyStore.saveConversations(self.conversations, to: self.historyStorage)
-                self.promptText = ""
-                self.attachedFiles.removeAll()
-                self.updateComposerLiveAudit()
-                self.isRunning = false
             }
         }
     }
-
     func executeTask() {
         if promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            let lastPrompt = activeConversation?.messages.last(where: { $0.role == "user" })?.content {
@@ -835,6 +873,23 @@ struct HybridChatTabView: View {
     }
 }
 
+// MARK: - Streaming cursor
+
+/// Blinking "▋" cursor shown in assistant bubbles while tokens are streaming in.
+/// Uses a TimelineView so no @State macro is required in the SPM build target.
+struct StreamingCursorView: View {
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 0.5)) { context in
+            let phase = context.date.timeIntervalSinceReferenceDate
+            let visible = Int(phase / 0.5) % 2 == 0
+            Text("▋")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(.cyan.opacity(0.9))
+                .opacity(visible ? 1.0 : 0.0)
+        }
+    }
+}
+
 struct ChatBubbleRowView: View {
     let message: ChatMessageModel
 
@@ -900,7 +955,7 @@ struct ChatBubbleRowView: View {
                     Spacer()
                 }
 
-                Text(message.content)
+                Text(message.content.isEmpty && message.isStreaming ? " " : message.content)
                     .font(.body)
                     .textSelection(.enabled)
                     .padding(14)
@@ -909,6 +964,12 @@ struct ChatBubbleRowView: View {
                         RoundedRectangle(cornerRadius: 12)
                             .fill(Color.white.opacity(0.05))
                     )
+                    .overlay(alignment: .bottomTrailing) {
+                        if message.isStreaming {
+                            StreamingCursorView()
+                                .padding(8)
+                        }
+                    }
 
                 // Expandable 4-Station Relay & Sanitized Cloud Prompt Inspector
                 if !message.stations.isEmpty || message.sanitizedCloudPrompt != nil {

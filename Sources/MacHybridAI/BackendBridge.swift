@@ -522,6 +522,56 @@ public final class BackendBridge: Sendable {
         return invokePythonJSON(method: method, path: path, body: body)
     }
 
+    // MARK: – Token streaming (SSE)
+
+    /// Connects to `POST /v1/tasks/stream` and calls `onToken` for every token
+    /// as it arrives from the MLX model or hybrid pipeline.
+    /// Call from a background thread — blocks until the stream ends or an error occurs.
+    ///
+    /// - Parameters:
+    ///   - prompt: Raw user prompt (Privacy Gate runs server-side before streaming starts).
+    ///   - mode: Compute mode (local / hybrid / auto).
+    ///   - sessionId: Optional session ID for history continuity.
+    ///   - onToken: Called on each token string as it streams in.
+    ///   - onReceipt: Called once at stream end with the final receipt dictionary.
+    public func streamTask(
+        prompt: String,
+        mode: ComputeModeOption,
+        cloudProvider: CloudProviderOption,
+        sessionId: String? = nil,
+        onToken: @escaping @Sendable (String) -> Void,
+        onReceipt: @escaping @Sendable ([String: Any]) -> Void
+    ) {
+        guard let port = DaemonManager.shared.waitUntilReady(timeout: 8) else {
+            onToken("[Engine not ready — please wait and retry]")
+            onReceipt([:])
+            return
+        }
+
+        guard let url = URL(string: "http://127.0.0.1:\(port)/v1/tasks/stream") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 300   // long-running streams need a generous timeout
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+
+        var body: [String: Any] = [
+            "prompt": prompt,
+            "mode": mode.rawValue,
+            "cloud_provider": cloudProvider.rawValue,
+        ]
+        if let sessionId { body["session_id"] = sessionId }
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        // Use a delegate-based URLSession so we can process data as it arrives.
+        let delegate = SSEStreamDelegate(onToken: onToken, onReceipt: onReceipt)
+        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        let task = session.dataTask(with: req)
+        task.resume()
+        delegate.waitUntilDone()
+        session.invalidateAndCancel()
+    }
+
     public func runTask(
         prompt: String,
         mode: ComputeModeOption,
@@ -771,5 +821,86 @@ public final class BackendBridge: Sendable {
                 restoredCount: scan.entities.count
             )
         )
+    }
+}
+
+// MARK: - SSEStreamDelegate
+
+/// URLSession delegate that parses a Server-Sent Events stream from
+/// `POST /v1/tasks/stream` and forwards tokens and receipts to callbacks.
+///
+/// SSE format expected from the daemon:
+///   data: {"type":"token","text":"Hello"}\n\n
+///   data: {"type":"heartbeat"}\n\n
+///   data: [DONE]\n\n
+///   data: {"type":"receipt", ...}\n\n
+final class SSEStreamDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let onToken: @Sendable (String) -> Void
+    private let onReceipt: @Sendable ([String: Any]) -> Void
+    private let doneSignal = DispatchSemaphore(value: 0)
+    private var buffer = ""
+
+    init(
+        onToken: @escaping @Sendable (String) -> Void,
+        onReceipt: @escaping @Sendable ([String: Any]) -> Void
+    ) {
+        self.onToken = onToken
+        self.onReceipt = onReceipt
+    }
+
+    /// Block the calling thread until the stream ends.
+    func waitUntilDone() { doneSignal.wait() }
+
+    // MARK: URLSessionDataDelegate
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard let chunk = String(data: data, encoding: .utf8) else { return }
+        buffer += chunk
+        processBuffer()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        // Drain any remaining buffer content
+        if !buffer.isEmpty { processBuffer() }
+        doneSignal.signal()
+    }
+
+    // MARK: Private
+
+    private func processBuffer() {
+        // SSE events are delimited by double newlines.
+        while let range = buffer.range(of: "\n\n") {
+            let event = String(buffer[buffer.startIndex..<range.lowerBound])
+            buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+            handle(event: event)
+        }
+    }
+
+    private func handle(event: String) {
+        for line in event.split(separator: "\n", omittingEmptySubsequences: false) {
+            let str = String(line)
+            guard str.hasPrefix("data: ") else { continue }
+            let payload = String(str.dropFirst(6))
+
+            if payload == "[DONE]" { continue }
+
+            guard let data = payload.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+
+            let type_ = json["type"] as? String ?? ""
+            switch type_ {
+            case "token":
+                if let text = json["text"] as? String {
+                    onToken(text)
+                }
+            case "receipt":
+                onReceipt(json)
+            case "heartbeat", "error":
+                break   // heartbeat is expected; errors surface in receipt
+            default:
+                break
+            }
+        }
     }
 }
