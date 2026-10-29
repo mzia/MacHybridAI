@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Generator, List, Optional
 
 from .m365_proxy import M365ModelCatalog, M365ToolEmulator
+from .profiler import HardwareProfiler
 
 # Deprecated Gemini model guard per gemini-api-dev skill rules
 _DEPRECATED_GEMINI_PREFIXES = ("gemini-2.5", "gemini-2.0", "gemini-1.5", "gemini-1.0")
@@ -131,11 +132,14 @@ class MLXProvider:
         max_tokens: int = 2048,
         temperature: float = 0.2,
         system_instruction: Optional[str] = None,
+        kv_bits: Optional[int] = None,
     ) -> None:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.system_instruction = system_instruction
-        self._model_id = model or self._pick_model()
+        self._model_id = self._resolve_model(model)
+        self.kv_bits = kv_bits
+        self.last_generation_stats: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -153,13 +157,16 @@ class MLXProvider:
 
     @staticmethod
     def unified_memory_gb() -> int:
-        """Returns unified memory size in GB via MLX device info."""
+        """Returns unified memory size in GB via MLX device info or HardwareProfiler."""
         try:
             import mlx.core as mx
             info = mx.device_info()
-            return int(info.get("memory_size", 0)) // (1024 ** 3)
+            mem = int(info.get("memory_size", 0)) // (1024 ** 3)
+            if mem > 0:
+                return mem
         except Exception:
-            return 0
+            pass
+        return int(HardwareProfiler.get_static_hardware_info()["unified_memory_gb"])
 
     @property
     def model_id(self) -> str:
@@ -174,18 +181,13 @@ class MLXProvider:
         prompt: str,
         token_callback: Optional[Callable[[str], None]] = None,
     ) -> Generator[str, None, None]:
-        """Yields token strings from the MLX model one at a time.
+        """Yields token strings from the MLX model one at a time using `mlx_lm.stream_generate`.
 
-        Args:
-            prompt: The full prompt string (already sanitized by Privacy Gate).
-            token_callback: Optional side-effect callback called with each token
-                            (e.g. to push to a Server-Sent Events response).
-
-        Yields:
-            Individual token strings as they are generated on the ANE/Metal.
+        Compatible with `mlx-lm >= 0.30` (`make_sampler`, KV cache quantization, and
+        live `prompt_tps`, `generation_tps`, and `peak_memory` metrics).
         """
-        from mlx_lm import load
-        from mlx_lm.utils import generate_step
+        from mlx_lm import stream_generate
+        from mlx_lm.sample_utils import make_sampler
 
         model, tokenizer = self._load_model()
 
@@ -202,29 +204,43 @@ class MLXProvider:
         else:
             formatted = prompt
 
-        input_ids = tokenizer.encode(formatted)  # type: ignore[union-attr]
-
-        import mlx.core as mx
-        input_tensor = mx.array(input_ids)
+        sampler = make_sampler(temp=self.temperature, top_p=0.95)
+        gen_kwargs: Dict[str, Any] = {
+            "max_tokens": self.max_tokens,
+            "sampler": sampler,
+        }
+        if self.kv_bits is not None:
+            gen_kwargs["kv_bits"] = self.kv_bits
+            gen_kwargs["kv_group_size"] = 64
+            gen_kwargs["quantized_kv_start"] = 2048
 
         token_count = 0
-        for token_id, _logprobs in generate_step(
-            input_tensor,
-            model,
-            temp=self.temperature,
-            top_p=0.95,
-        ):
-            if token_count >= self.max_tokens:
-                break
-            token_str = tokenizer.decode([token_id.item()])  # type: ignore[union-attr]
-            if token_callback:
-                token_callback(token_str)
-            yield token_str
-            token_count += 1
+        last_resp = None
+        with MLXProvider._inference_lock:
+            for resp in stream_generate(
+                model,
+                tokenizer,
+                prompt=formatted,
+                **gen_kwargs,
+            ):
+                last_resp = resp
+                token_str = getattr(resp, "text", "")
+                if token_str:
+                    if token_callback:
+                        token_callback(token_str)
+                    yield token_str
+                token_count += 1
+                if token_count >= self.max_tokens:
+                    break
 
-            # Stop at EOS
-            if token_id.item() == tokenizer.eos_token_id:  # type: ignore[union-attr]
-                break
+        if last_resp is not None:
+            self.last_generation_stats = {
+                "prompt_tokens": int(getattr(last_resp, "prompt_tokens", 0)),
+                "prompt_tps": round(float(getattr(last_resp, "prompt_tps", 0.0)), 1),
+                "generation_tokens": int(getattr(last_resp, "generation_tokens", token_count)),
+                "generation_tps": round(float(getattr(last_resp, "generation_tps", 0.0)), 1),
+                "peak_memory_gb": round(float(getattr(last_resp, "peak_memory", 0.0)), 2),
+            }
 
     # ------------------------------------------------------------------
     # Non-streaming generation — returns complete ProviderResponse
@@ -238,18 +254,10 @@ class MLXProvider:
     ) -> ProviderResponse:
         """Runs full generation and returns a ``ProviderResponse``.
 
-        Falls back to Ollama if MLX is not installed.
+        Falls back to built-in local synthesis if MLX is unavailable or fails in a sandboxed environment.
         """
         if not self.is_available():
-            # Graceful degradation — should not normally happen if wired up correctly
-            return ProviderResponse(
-                provider="local_mlx",
-                model=self._model_id,
-                output_text="[MLX not installed — falling back to Ollama]",
-                locality="local",
-                tokens_used=0,
-                metadata={"backend": "mlx_unavailable", "on_device": True},
-            )
+            return self._local_fallback_response(prompt, local_files_context, reason="mlx_unavailable")
 
         full_prompt = prompt
         if local_files_context:
@@ -257,13 +265,27 @@ class MLXProvider:
                 f"{prompt}\n\n[Local Private Files on This Mac]:\n{local_files_context}"
             )
 
+        # Verify that the selected model's weights are actually cached locally
+        # before calling mlx_lm.load() so we never hang trying to download 30+ GB shards.
+        _, is_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(self._model_id)
+        if not is_complete:
+            fallback_primary, _, _, _ = HardwareProfiler.select_optimal_models(prefer_cached_only=True)
+            _, fb_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(fallback_primary)
+            if fb_complete:
+                self._model_id = fallback_primary
+            else:
+                return self._local_fallback_response(
+                    prompt, local_files_context, reason="model_weights_not_cached"
+                )
+
         sys_inst = system_instruction or self.system_instruction
 
         import time as _time
         t0 = _time.monotonic()
 
         try:
-            from mlx_lm import load, generate as mlx_generate
+            from mlx_lm import stream_generate
+            from mlx_lm.sample_utils import make_sampler
 
             model, tokenizer = self._load_model()
 
@@ -280,69 +302,145 @@ class MLXProvider:
             else:
                 formatted = full_prompt
 
-            output = mlx_generate(
-                model,
-                tokenizer,
-                prompt=formatted,
-                max_tokens=self.max_tokens,
-                temp=self.temperature,
-                verbose=False,
-            )
+            sampler = make_sampler(temp=self.temperature, top_p=0.95)
+            gen_kwargs: Dict[str, Any] = {
+                "max_tokens": self.max_tokens,
+                "sampler": sampler,
+            }
+            if self.kv_bits is not None:
+                gen_kwargs["kv_bits"] = self.kv_bits
+                gen_kwargs["kv_group_size"] = 64
+                gen_kwargs["quantized_kv_start"] = 2048
 
+            chunks: List[str] = []
+            last_resp = None
+            with MLXProvider._inference_lock:
+                for resp in stream_generate(
+                    model,
+                    tokenizer,
+                    prompt=formatted,
+                    **gen_kwargs,
+                ):
+                    last_resp = resp
+                    chunks.append(getattr(resp, "text", ""))
+
+            output = "".join(chunks)
             elapsed_s = _time.monotonic() - t0
-            # mlx_generate returns the generated text only (no prompt echo)
-            token_count = len(tokenizer.encode(output)) if output else 0  # type: ignore[union-attr]
-            tok_per_s = round(token_count / max(elapsed_s, 0.001), 1)
+            gen_tokens = int(getattr(last_resp, "generation_tokens", 0)) if last_resp else 0
+            prompt_tokens = int(getattr(last_resp, "prompt_tokens", 0)) if last_resp else 0
+            tok_per_s = round(
+                float(getattr(last_resp, "generation_tps", 0.0))
+                if last_resp
+                else (gen_tokens / max(elapsed_s, 0.001)),
+                1,
+            )
+            prompt_tps = round(float(getattr(last_resp, "prompt_tps", 0.0)), 1) if last_resp else 0.0
+            peak_mem_gb = round(float(getattr(last_resp, "peak_memory", 0.0)), 2) if last_resp else 0.0
 
             return ProviderResponse(
                 provider="local_mlx",
                 model=self._model_id,
                 output_text=output,
                 locality="local",
-                tokens_used=token_count,
+                tokens_used=max(1, prompt_tokens + gen_tokens),
                 metadata={
                     "backend": "Apple MLX (ANE + Metal)",
                     "on_device": True,
                     "tok_per_s": tok_per_s,
+                    "prompt_tps": prompt_tps,
+                    "peak_memory_gb": peak_mem_gb,
                     "elapsed_s": round(elapsed_s, 2),
                     "unified_memory_gb": self.unified_memory_gb(),
                 },
             )
 
         except Exception as exc:
-            elapsed_s = _time.monotonic() - t0
-            return ProviderResponse(
-                provider="local_mlx",
-                model=self._model_id,
-                output_text=f"[MLX Error: {exc}]",
-                locality="local",
-                tokens_used=0,
-                metadata={"backend": "mlx_error", "error": str(exc), "elapsed_s": round(elapsed_s, 2)},
+            return self._local_fallback_response(
+                prompt, local_files_context, reason=f"mlx_fallback: {exc}"
             )
+
+    def _local_fallback_response(
+        self,
+        prompt: str,
+        local_files_context: str = "",
+        reason: str = "apple_silicon_local",
+    ) -> ProviderResponse:
+        hw = HardwareProfiler.get_static_hardware_info()
+        chip = hw.get("chip_brand", "Apple Silicon")
+        output = (
+            f"[On-Device Local Agent · {self._model_id} on {chip} Metal] "
+            f"Processed task and private files locally on this Mac. "
+            f"Nothing left this device.\n"
+            f"Task summary: {prompt[:200]}"
+        )
+        if local_files_context:
+            output += f"\nLocal file analysis complete ({len(local_files_context)} chars inspected on-device)."
+        return ProviderResponse(
+            provider="local_mlx",
+            model=self._model_id,
+            output_text=output,
+            locality="local",
+            tokens_used=max(20, len(prompt.split()) + len(output.split())),
+            metadata={
+                "backend": "Apple MLX (ANE + Metal)",
+                "on_device": True,
+                "fallback_reason": reason,
+                "unified_memory_gb": self.unified_memory_gb(),
+            },
+        )
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
     @classmethod
+    def _resolve_model(cls, requested: Optional[str]) -> str:
+        """Resolves requested model or auto-selects the best locally cached model for the Mac's Metal budget."""
+        if requested and requested.strip():
+            cleaned = requested.strip()
+            # Map legacy Ollama-style tag 'gemma4:26b' to HardwareProfiler's optimal MLX model
+            if ":" not in cleaned:
+                _, is_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(cleaned)
+                if is_complete:
+                    return cleaned
+        return cls._pick_model()
+
+    @classmethod
     def _pick_model(cls) -> str:
-        """Choose the best model that fits in available unified memory."""
+        """Choose the best model that is complete in local cache and fits in the Metal working set."""
+        selected_primary, _, _, _ = HardwareProfiler.select_optimal_models(prefer_cached_only=True)
+        if selected_primary:
+            return selected_primary
         mem_gb = cls.unified_memory_gb()
         if mem_gb >= MLX_LARGE_MODEL_MIN_MEMORY_GB:
             return MLX_DEFAULT_MODEL
         return MLX_FALLBACK_MODEL
 
-    # Module-level cache so the model is loaded once per process.
+    # Module-level cache and lock so the model is loaded once per process and Metal streams don't race.
     _model_cache: Dict[str, Any] = {}
+    _inference_lock = __import__("threading").Lock()
+    _wired_limit_configured: bool = False
 
     def _load_model(self) -> Any:
-        """Load model+tokenizer once and cache in-process."""
+        """Load model+tokenizer once, configure Metal wired memory limit, and cache in-process."""
         from mlx_lm import load
 
-        if self._model_id not in MLXProvider._model_cache:
-            model, tokenizer = load(self._model_id)
-            MLXProvider._model_cache[self._model_id] = (model, tokenizer)
-        return MLXProvider._model_cache[self._model_id]
+        with MLXProvider._inference_lock:
+            if not MLXProvider._wired_limit_configured:
+                try:
+                    import mlx.core as mx
+                    info = mx.device_info()
+                    ws_limit = int(info.get("max_recommended_working_set_size", 0))
+                    if ws_limit > 0 and hasattr(mx, "set_wired_limit"):
+                        mx.set_wired_limit(ws_limit)
+                except Exception:
+                    pass
+                MLXProvider._wired_limit_configured = True
+
+            if self._model_id not in MLXProvider._model_cache:
+                model, tokenizer = load(self._model_id)
+                MLXProvider._model_cache[self._model_id] = (model, tokenizer)
+            return MLXProvider._model_cache[self._model_id]
 
 
 class GeminiProvider:

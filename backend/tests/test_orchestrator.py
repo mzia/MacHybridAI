@@ -6,6 +6,7 @@ import unittest
 
 from machybrid.guardian import GuardianPolicy
 from machybrid.orchestrator import ComputeMode, HybridConfig, HybridOrchestrator
+from machybrid.profiler import HardwareProfiler
 from machybrid.providers import normalize_gemini_model
 from machybrid.server import create_server, dispatch_request
 
@@ -169,6 +170,63 @@ class TestRealTelemetry(unittest.TestCase):
         self.assertIsInstance(val, int)
         self.assertGreaterEqual(val, 0)
         self.assertLessEqual(val, 100)
+
+    def test_hardware_profiler_and_endpoint_detects_cache_and_recommendations(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hub = Path(tmpdir)
+            # 1. Create a complete mock cached model (gemma-3-4b-it-4bit)
+            snap_complete = (
+                hub
+                / "models--mlx-community--gemma-3-4b-it-4bit"
+                / "snapshots"
+                / "abc12345"
+            )
+            snap_complete.mkdir(parents=True)
+            (snap_complete / "config.json").write_text('{"model_type": "gemma3"}')
+            (snap_complete / "model.safetensors").write_bytes(b"0" * 1024)
+
+            # 2. Create an incomplete mock cached model (gemma-4-31B-it-MLX-8bit with missing shards)
+            snap_incomplete = (
+                hub
+                / "models--lmstudio-community--gemma-4-31B-it-MLX-8bit"
+                / "snapshots"
+                / "def67890"
+            )
+            snap_incomplete.mkdir(parents=True)
+            (snap_incomplete / "config.json").write_text('{"model_type": "gemma4"}')
+            (snap_incomplete / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"layer.0": "model-00001-of-00004.safetensors"}})
+            )
+
+            _, complete_ok, _, _, missing_ok = HardwareProfiler.inspect_hf_model_cache(
+                "mlx-community/gemma-3-4b-it-4bit", hf_hub_dir=hub
+            )
+            self.assertTrue(complete_ok)
+            self.assertEqual(missing_ok, 0)
+
+            _, complete_bad, _, _, missing_bad = HardwareProfiler.inspect_hf_model_cache(
+                "lmstudio-community/gemma-4-31B-it-MLX-8bit", hf_hub_dir=hub
+            )
+            self.assertFalse(complete_bad)
+            self.assertGreaterEqual(missing_bad, 1)
+
+            profile = HardwareProfiler.profile(hf_hub_dir=hub)
+            # Because 31B is incomplete in cache, profiler must select the complete 4B model
+            self.assertEqual(profile.selected_local_model, "mlx-community/gemma-3-4b-it-4bit")
+            self.assertGreaterEqual(profile.unified_memory_gb, 8)
+            self.assertGreater(len(profile.recommendations), 0)
+
+        orchestrator = HybridOrchestrator()
+        status, payload = dispatch_request(orchestrator, "GET", "/v1/hardware/profile")
+        self.assertEqual(status, 200)
+        self.assertIn("chip_brand", payload)
+        self.assertIn("metal_working_set_gb", payload)
+        self.assertIn("selected_local_model", payload)
+        self.assertIn("recommendations", payload)
 
 
 if __name__ == "__main__":

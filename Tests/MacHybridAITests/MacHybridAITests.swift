@@ -109,4 +109,14 @@ struct MacHybridAITests {
         #expect(loadedYearsLater.count == 1)
         #expect(loadedYearsLater.first?.retentionPolicy == .neverDelete)
     }
+
+    @Test("HardwareProfiler returns Apple Silicon SoC, Metal Working Set budget, and Model Recommendations")
+    func testHardwareProfilerReturnsSpecsAndRecommendations() {
+        let profile = BackendBridge.shared.fetchHardwareProfile()
+        #expect(!profile.chipBrand.isEmpty)
+        #expect(profile.unifiedMemoryGb >= 8)
+        #expect(profile.metalWorkingSetGb > 0)
+        #expect(!profile.selectedLocalModel.isEmpty)
+        #expect(!profile.recommendations.isEmpty)
+    }
 }

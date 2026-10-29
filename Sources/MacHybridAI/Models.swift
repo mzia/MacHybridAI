@@ -502,3 +502,217 @@ public struct ChatConversationModel: Identifiable, Codable, Sendable, Equatable 
         return "Auto-deletes in \(days)d"
     }
 }
+
+// MARK: - Apple Silicon Hardware Profiler & Model Sizing Models
+
+public struct CachedModelStatusModel: Identifiable, Codable, Sendable, Equatable {
+    public var id: String { modelId }
+    public let modelId: String
+    public let backend: String
+    public let parameterCount: String
+    public let quantization: String
+    public let estimatedMemoryGb: Double
+    public let isCached: Bool
+    public let isComplete: Bool
+    public let sizeBytes: Int
+    public let localPath: String
+    public let missingShards: Int
+
+    public init(
+        modelId: String,
+        backend: String,
+        parameterCount: String,
+        quantization: String,
+        estimatedMemoryGb: Double,
+        isCached: Bool,
+        isComplete: Bool,
+        sizeBytes: Int,
+        localPath: String,
+        missingShards: Int = 0
+    ) {
+        self.modelId = modelId
+        self.backend = backend
+        self.parameterCount = parameterCount
+        self.quantization = quantization
+        self.estimatedMemoryGb = estimatedMemoryGb
+        self.isCached = isCached
+        self.isComplete = isComplete
+        self.sizeBytes = sizeBytes
+        self.localPath = localPath
+        self.missingShards = missingShards
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case modelId = "model_id"
+        case backend
+        case parameterCount = "parameter_count"
+        case quantization
+        case estimatedMemoryGb = "estimated_memory_gb"
+        case isCached = "is_cached"
+        case isComplete = "is_complete"
+        case sizeBytes = "size_bytes"
+        case localPath = "local_path"
+        case missingShards = "missing_shards"
+    }
+}
+
+public struct ModelRecommendationModel: Identifiable, Codable, Sendable, Equatable {
+    public var id: String { modelId }
+    public let role: String
+    public let modelId: String
+    public let parameterCount: String
+    public let quantization: String
+    public let estimatedMemoryGb: Double
+    public let expectedTpsRange: String
+    public let recommendedKvBits: Int?
+    public let fitsInMetalBudget: Bool
+    public let isReadyLocally: Bool
+    public let rationale: String
+
+    public init(
+        role: String,
+        modelId: String,
+        parameterCount: String,
+        quantization: String,
+        estimatedMemoryGb: Double,
+        expectedTpsRange: String,
+        recommendedKvBits: Int?,
+        fitsInMetalBudget: Bool,
+        isReadyLocally: Bool,
+        rationale: String
+    ) {
+        self.role = role
+        self.modelId = modelId
+        self.parameterCount = parameterCount
+        self.quantization = quantization
+        self.estimatedMemoryGb = estimatedMemoryGb
+        self.expectedTpsRange = expectedTpsRange
+        self.recommendedKvBits = recommendedKvBits
+        self.fitsInMetalBudget = fitsInMetalBudget
+        self.isReadyLocally = isReadyLocally
+        self.rationale = rationale
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case role
+        case modelId = "model_id"
+        case parameterCount = "parameter_count"
+        case quantization
+        case estimatedMemoryGb = "estimated_memory_gb"
+        case expectedTpsRange = "expected_tps_range"
+        case recommendedKvBits = "recommended_kv_bits"
+        case fitsInMetalBudget = "fits_in_metal_budget"
+        case isReadyLocally = "is_ready_locally"
+        case rationale
+    }
+}
+
+public struct MacHardwareProfileModel: Codable, Sendable, Equatable {
+    public let architecture: String
+    public let chipBrand: String
+    public let cpuCoresTotal: Int
+    public let cpuCoresPerformance: Int
+    public let cpuCoresEfficiency: Int
+    public let gpuCores: Int
+    public let gpuArchitecture: String
+    public let metalAvailable: Bool
+    public let mlxAvailable: Bool
+    public let unifiedMemoryGb: Int
+    public let metalWorkingSetGb: Double
+    public let metalMaxBufferGb: Double
+    public let memoryUsedPercent: Int
+    public let availableMemoryGb: Double
+    public let cpuBusyPercent: Int
+    public let gpuBusyPercent: Int
+    public let gpuRendererPercent: Int
+    public let gpuTilerPercent: Int
+    public let gpuInUseMemoryGb: Double
+    public let hardwareTier: String
+    public let selectedLocalModel: String
+    public let selectedFastModel: String
+    public let recommendedKvBits: Int?
+    public let cachedModels: [CachedModelStatusModel]
+    public let recommendations: [ModelRecommendationModel]
+
+    public init(
+        architecture: String,
+        chipBrand: String,
+        cpuCoresTotal: Int,
+        cpuCoresPerformance: Int,
+        cpuCoresEfficiency: Int,
+        gpuCores: Int,
+        gpuArchitecture: String,
+        metalAvailable: Bool,
+        mlxAvailable: Bool,
+        unifiedMemoryGb: Int,
+        metalWorkingSetGb: Double,
+        metalMaxBufferGb: Double,
+        memoryUsedPercent: Int,
+        availableMemoryGb: Double,
+        cpuBusyPercent: Int,
+        gpuBusyPercent: Int,
+        gpuRendererPercent: Int,
+        gpuTilerPercent: Int,
+        gpuInUseMemoryGb: Double,
+        hardwareTier: String,
+        selectedLocalModel: String,
+        selectedFastModel: String,
+        recommendedKvBits: Int?,
+        cachedModels: [CachedModelStatusModel],
+        recommendations: [ModelRecommendationModel]
+    ) {
+        self.architecture = architecture
+        self.chipBrand = chipBrand
+        self.cpuCoresTotal = cpuCoresTotal
+        self.cpuCoresPerformance = cpuCoresPerformance
+        self.cpuCoresEfficiency = cpuCoresEfficiency
+        self.gpuCores = gpuCores
+        self.gpuArchitecture = gpuArchitecture
+        self.metalAvailable = metalAvailable
+        self.mlxAvailable = mlxAvailable
+        self.unifiedMemoryGb = unifiedMemoryGb
+        self.metalWorkingSetGb = metalWorkingSetGb
+        self.metalMaxBufferGb = metalMaxBufferGb
+        self.memoryUsedPercent = memoryUsedPercent
+        self.availableMemoryGb = availableMemoryGb
+        self.cpuBusyPercent = cpuBusyPercent
+        self.gpuBusyPercent = gpuBusyPercent
+        self.gpuRendererPercent = gpuRendererPercent
+        self.gpuTilerPercent = gpuTilerPercent
+        self.gpuInUseMemoryGb = gpuInUseMemoryGb
+        self.hardwareTier = hardwareTier
+        self.selectedLocalModel = selectedLocalModel
+        self.selectedFastModel = selectedFastModel
+        self.recommendedKvBits = recommendedKvBits
+        self.cachedModels = cachedModels
+        self.recommendations = recommendations
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case architecture
+        case chipBrand = "chip_brand"
+        case cpuCoresTotal = "cpu_cores_total"
+        case cpuCoresPerformance = "cpu_cores_performance"
+        case cpuCoresEfficiency = "cpu_cores_efficiency"
+        case gpuCores = "gpu_cores"
+        case gpuArchitecture = "gpu_architecture"
+        case metalAvailable = "metal_available"
+        case mlxAvailable = "mlx_available"
+        case unifiedMemoryGb = "unified_memory_gb"
+        case metalWorkingSetGb = "metal_working_set_gb"
+        case metalMaxBufferGb = "metal_max_buffer_gb"
+        case memoryUsedPercent = "memory_used_percent"
+        case availableMemoryGb = "available_memory_gb"
+        case cpuBusyPercent = "cpu_busy_percent"
+        case gpuBusyPercent = "gpu_busy_percent"
+        case gpuRendererPercent = "gpu_renderer_percent"
+        case gpuTilerPercent = "gpu_tiler_percent"
+        case gpuInUseMemoryGb = "gpu_in_use_memory_gb"
+        case hardwareTier = "hardware_tier"
+        case selectedLocalModel = "selected_local_model"
+        case selectedFastModel = "selected_fast_model"
+        case recommendedKvBits = "recommended_kv_bits"
+        case cachedModels = "cached_models"
+        case recommendations
+    }
+}

@@ -22,6 +22,12 @@ from .orchestrator import (
     StationStep,
     TaskExecutionResult,
 )
+from .profiler import (
+    CachedModelStatus,
+    HardwareProfiler,
+    MacHardwareProfile,
+    ModelRecommendation,
+)
 from .providers import (
     AntigravityProvider,
     GeminiProvider,
@@ -46,6 +52,10 @@ __all__ = [
     "HybridOrchestrator",
     "StationStep",
     "TaskExecutionResult",
+    "CachedModelStatus",
+    "HardwareProfiler",
+    "MacHardwareProfile",
+    "ModelRecommendation",
     "AntigravityProvider",
     "GeminiProvider",
     "LocalModelProvider",

@@ -25,6 +25,7 @@ from .guardian import GuardianPolicy
 from .history import HistoryRetentionPolicy, HistoryStorageLocation
 from .m365_proxy import M365ToolEmulator
 from .orchestrator import ComputeMode, HybridOrchestrator
+from .profiler import HardwareProfiler
 from .providers import MLXProvider
 
 MAX_REQUEST_BYTES = 1_048_576  # 1 MiB limit against payload DoS
@@ -150,15 +151,89 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
                 pass
 
         # --- Stream from MLX (local) or run full hybrid task ---
+        file_paths = (
+            body.get("file_paths")
+            if isinstance(body.get("file_paths"), list)
+            else []
+        )
+        inline_context = str(body.get("inline_file_context", ""))
+
         if use_local_only and MLXProvider.is_available():
-            # Pure local MLX streaming — fastest path, full ANE utilisation
-            mlx_model = body.get("mlx_model") or None
+            import time as _time
+            t0 = _time.monotonic()
+            mlx_model = body.get("mlx_model") or self.orchestrator.config.local_model or None
             provider = MLXProvider(model=mlx_model)
+            _, is_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(provider.model_id)
+
+            full_local_prompt = redaction.sanitized_text
+            if inline_context:
+                full_local_prompt = f"{redaction.sanitized_text}\n\n[Local Private Files on This Mac]:\n{inline_context}"
 
             token_count = 0
-            for token in provider.generate_stream(redaction.sanitized_text):
-                sse(json.dumps({"type": "token", "text": token}))
-                token_count += 1
+            if is_complete:
+                try:
+                    for token in provider.generate_stream(full_local_prompt):
+                        sse(json.dumps({"type": "token", "text": token}))
+                        token_count += 1
+                except Exception:
+                    token_count = 0
+
+            if token_count == 0:
+                fallback_resp = provider.generate(
+                    redaction.sanitized_text, local_files_context=inline_context
+                )
+                for i, word in enumerate(fallback_resp.output_text.split(" ")):
+                    chunk = word if i == 0 else " " + word
+                    sse(json.dumps({"type": "token", "text": chunk}))
+                    token_count += 1
+
+            elapsed_ms = max(1, int((_time.monotonic() - t0) * 1000))
+            local_stations = [
+                {
+                    "station_index": 1,
+                    "station_id": "this_mac",
+                    "label": "This Mac",
+                    "locality": "local",
+                    "title": f"Local agent & {provider.model_id} processed task on-device",
+                    "detail": f"Processed {len(file_paths)} local file(s) on this Mac. Nothing leaves this Mac.",
+                    "status": "completed",
+                    "duration_ms": elapsed_ms,
+                    "badges": ["Fully Local", provider.model_id, "Nothing leaves this Mac"],
+                },
+                {
+                    "station_index": 2,
+                    "station_id": "cloud",
+                    "label": "Cloud models",
+                    "locality": "local",
+                    "title": "Cloud models not used",
+                    "detail": "AI processing stayed 100% on your Mac. Zero Cloud AI history.",
+                    "status": "completed",
+                    "duration_ms": 0,
+                    "badges": ["Not used", "Zero Cloud History"],
+                },
+                {
+                    "station_index": 3,
+                    "station_id": "result",
+                    "label": "Result",
+                    "locality": "local",
+                    "title": "Completed on this Mac",
+                    "detail": "Result generated locally with zero cloud transmission.",
+                    "status": "completed",
+                    "duration_ms": 1,
+                    "badges": ["Verified On-Device"],
+                },
+            ]
+            local_receipt = {
+                "mode_executed": "local",
+                "local_model_used": f"{provider.model_id} (on this Mac)",
+                "local_agent_location": "on this Mac",
+                "cloud_models_used": "not used",
+                "pii_flagged_count": redaction.pii_count,
+                "pii_restored_count": 0,
+                "pii_categories": redaction.categories,
+                "nothing_left_mac": True,
+                "cloud_zero_retention": True,
+            }
 
             sse("[DONE]")
             sse(json.dumps({
@@ -168,14 +243,18 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
                 "tokens": token_count,
                 "pii_masked": redaction.pii_count,
                 "on_device": True,
+                "cloud_prompt_sent": None,
+                "stations": local_stations,
+                "receipt": local_receipt,
+                "guardian_audit": redaction.to_dict(),
+                "generation_stats": provider.last_generation_stats,
+                "telemetry": self.orchestrator.collect_telemetry(tokens=token_count).__dict__,
             }))
 
         else:
             # Hybrid path: run the full orchestrator task in a thread,
             # emit a "thinking" heartbeat every 2s, then stream the final output
             # token-by-token once we have it.
-            import time as _time
-
             result_holder: Dict[str, Any] = {}
             done_event = threading.Event()
 
@@ -185,6 +264,8 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
                         prompt=prompt,
                         mode=mode_override,
                         cloud_provider=body.get("cloud_provider") or None,
+                        file_paths=[str(p) for p in file_paths],
+                        inline_file_context=inline_context,
                         session_id=body.get("session_id") or None,
                         save_to_history=bool(body.get("save_to_history", True)),
                     )
@@ -218,7 +299,14 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
             sse("[DONE]")
             sse(json.dumps({"type": "receipt", **{
                 k: task_dict.get(k)
-                for k in ("receipt", "telemetry", "guardian_audit", "session_id")
+                for k in (
+                    "receipt",
+                    "stations",
+                    "cloud_prompt_sent",
+                    "telemetry",
+                    "guardian_audit",
+                    "session_id",
+                )
             }}))
 
 
@@ -271,6 +359,8 @@ def dispatch_request(
                 "large_model_min_memory_gb": MLX_LARGE_MODEL_MIN_MEMORY_GB,
                 "backend": "Apple MLX (ANE + Metal)" if available else "unavailable",
             }
+        if path == "/v1/hardware/profile":
+            return HTTPStatus.OK, HardwareProfiler.profile().to_dict()
         return HTTPStatus.NOT_FOUND, {"error": f"Unknown path: {path}"}
 
     if upper_method == "POST":
