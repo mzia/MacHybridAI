@@ -303,18 +303,40 @@ def create_server(
     return ThreadingHTTPServer((host, port), BoundHandler)
 
 
+def _find_free_port() -> int:
+    """Binds to port 0 to let the OS pick a free ephemeral port, then returns it."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="MacHybridAI Local Hybrid Compute Daemon")
     parser.add_argument("--host", default="127.0.0.1", help="Loopback bind address (127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8765, help="Port number (default: 8765)")
+    parser.add_argument("--port", type=int, default=0,
+                        help="Port to listen on. 0 = OS-assigned free port (default).")
     parser.add_argument(
         "--cli-json",
         default=None,
         help="Execute a single JSON request payload {'method', 'path', 'body'} and print JSON to stdout",
     )
+    parser.add_argument(
+        "--ready-fd",
+        type=int,
+        default=None,
+        help=(
+            "File descriptor to write a single ready-line to once the server is bound and "
+            "listening. Used by the Swift DaemonManager to avoid polling. "
+            "Format written: '<port>\\n' so the caller learns the actual port."
+        ),
+    )
     args = parser.parse_args()
 
     orchestrator = HybridOrchestrator()
+
+    # ── CLI single-shot mode (legacy subprocess IPC) ──────────────────────────
     if args.cli_json:
         req_obj = json.loads(args.cli_json)
         _, resp_obj = dispatch_request(
@@ -326,8 +348,24 @@ def main() -> None:
         print(json.dumps(resp_obj))
         return
 
-    server = create_server(host=args.host, port=args.port, orchestrator=orchestrator)
-    print(f"MacHybridAI daemon listening on http://{args.host}:{args.port}")
+    # ── Persistent daemon mode ────────────────────────────────────────────────
+    port = args.port if args.port != 0 else _find_free_port()
+    server = create_server(host=args.host, port=port, orchestrator=orchestrator)
+
+    # Signal readiness to the parent process (Swift DaemonManager).
+    # Write "<port>\n" to the ready-fd so Swift knows:
+    #   (a) the server is bound and accepting connections, and
+    #   (b) which ephemeral port it's on when --port 0 was used.
+    if args.ready_fd is not None:
+        try:
+            import os as _os
+            with _os.fdopen(args.ready_fd, "w", closefd=True) as rfd:
+                rfd.write(f"{port}\n")
+                rfd.flush()
+        except OSError:
+            pass  # fd already closed or invalid — caller will fall back to polling
+
+    print(f"MacHybridAI daemon listening on http://{args.host}:{port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
