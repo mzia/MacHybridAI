@@ -213,6 +213,12 @@ final class HybridAppViewModel: ObservableObject {
         loadSavedHistory()
         runInspector()
         updateComposerLiveAudit()
+        // Start the persistent Python daemon eagerly so the first chat send has no cold-start delay.
+        if let backendDir = BackendBridge.shared.resolveBackendDirectory() {
+            let pythonCandidates = ["/opt/homebrew/bin/python3", "/usr/bin/python3"]
+            let py = pythonCandidates.first { FileManager.default.fileExists(atPath: $0) } ?? "/usr/bin/python3"
+            DaemonManager.shared.ensureRunning(backendDir: backendDir, pythonPath: py)
+        }
         if conversations.isEmpty {
             startNewChat()
             sendChatMessage()
@@ -447,6 +453,42 @@ final class HybridAppViewModel: ObservableObject {
     }
 }
 
+// MARK: - Daemon status chip
+
+/// Small inline status chip shown in the sidebar footer.
+struct DaemonStatusView: View {
+    @ObservedObject private var daemon = DaemonManager.shared
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(statusColor)
+                .frame(width: 6, height: 6)
+            Text(statusLabel)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(statusColor)
+        }
+    }
+
+    private var statusColor: Color {
+        switch daemon.state {
+        case .running: return .cyan
+        case .starting: return .yellow
+        case .failed: return .red
+        case .notStarted: return .secondary
+        }
+    }
+
+    private var statusLabel: String {
+        switch daemon.state {
+        case .running(let port): return "Engine: ready (:\(port))"
+        case .starting: return "Engine: starting…"
+        case .failed(let msg): return "Engine: \(msg.prefix(28))"
+        case .notStarted: return "Engine: not started"
+        }
+    }
+}
+
 struct MainDashboardView: View {
     @ObservedObject var vm: HybridAppViewModel
 
@@ -585,6 +627,9 @@ struct MainDashboardView: View {
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(.green)
                     }
+
+                    // Daemon status indicator
+                    DaemonStatusView()
                 }
                 .padding(10)
                 .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.05)))

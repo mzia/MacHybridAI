@@ -1,9 +1,208 @@
 import Foundation
 import NaturalLanguage
 
-/// Pure-Swift on-device fallback PII Guardian & Python Engine Bridge.
-/// Ensures 100% deterministic Privacy Gate protection both via the bundled Python
-/// `machybrid` engine and directly in native Swift.
+// MARK: - DaemonManager
+
+/// Manages the lifecycle of the persistent `machybrid` Python daemon.
+///
+/// On first use the daemon is started once and kept running for the lifetime of the app.
+/// All subsequent requests go through an in-process URLSession HTTP call to
+/// `http://127.0.0.1:<port>` — no Python cold-start per request.
+///
+/// Startup protocol:
+///  1. Swift creates a pipe and passes the write-end fd to the daemon via `--ready-fd`.
+///  2. Once the server socket is bound, the daemon writes `"<port>\n"` to that fd.
+///  3. Swift reads the port from the pipe and stores it.
+///  4. If the pipe read times out (3 s), Swift falls back to polling `/health`.
+///  5. If the process dies, the next `invoke` call restarts it automatically.
+public final class DaemonManager: ObservableObject, @unchecked Sendable {
+    public static let shared = DaemonManager()
+
+    /// Published so the UI can show a "daemon starting…" indicator.
+    @Published public private(set) var state: DaemonState = .notStarted
+
+    public enum DaemonState: Equatable, Sendable {
+        case notStarted
+        case starting
+        case running(port: Int)
+        case failed(String)
+    }
+
+    private let lock = NSLock()
+    private var _process: Process?
+    private var _port: Int = 0
+
+    private var process: Process? {
+        get { lock.withLock { _process } }
+        set { lock.withLock { _process = newValue } }
+    }
+
+    // Maximum seconds to wait for the daemon's ready-fd signal before polling.
+    private let readyTimeoutSeconds: TimeInterval = 5
+
+    private init() {}
+
+    /// Start the daemon if not already running. Safe to call from any context.
+    public func ensureRunning(backendDir: String, pythonPath: String) {
+        lock.withLock {
+            if case .running = state, let p = _process, p.isRunning { return }
+            if case .starting = state { return }
+        }
+        DispatchQueue.main.async { self.state = .starting }
+
+        Task.detached(priority: .userInitiated) {
+            let result = self._launch(backendDir: backendDir, pythonPath: pythonPath)
+            await MainActor.run {
+                switch result {
+                case .success(let p):
+                    self.state = .running(port: p)
+                case .failure(let err):
+                    self.state = .failed(err.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// Block the calling thread until the daemon is ready or timeout elapses.
+    /// Call only from a background (non-MainActor) thread.
+    func waitUntilReady(timeout: TimeInterval = 6) -> Int? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let sema = DispatchSemaphore(value: 0)
+            // nonisolated(unsafe) lets us write from the main-actor closure without
+            // a data-race error; the semaphore provides the necessary synchronisation.
+            nonisolated(unsafe) var snap: DaemonState = .notStarted
+            DispatchQueue.main.async {
+                snap = self.state
+                sema.signal()
+            }
+            sema.wait()
+            if case .running(let p) = snap { return p }
+            if case .failed = snap { return nil }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return nil
+    }
+
+    /// Terminate the daemon process cleanly.
+    public func stop() {
+        process?.terminate()
+        process = nil
+        state = .notStarted
+    }
+
+    // MARK: Private launch
+
+    private func _launch(backendDir: String, pythonPath: String) -> Result<Int, Error> {
+        // Create a pipe: Swift reads from [0], Python writes to [1].
+        var pipeFds: [Int32] = [0, 0]
+        guard Darwin.pipe(&pipeFds) == 0 else {
+            return .failure(NSError(domain: "DaemonManager", code: 1,
+                                   userInfo: [NSLocalizedDescriptionKey: "pipe() failed"]))
+        }
+        let readFd = pipeFds[0]
+        let writeFd = pipeFds[1]
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: pythonPath)
+        proc.arguments = [
+            "-m", "machybrid.server",
+            "--host", "127.0.0.1",
+            "--port", "0",           // OS picks a free port
+            "--ready-fd", "\(writeFd)",
+        ]
+        var env = ProcessInfo.processInfo.environment
+        env["PYTHONPATH"] = backendDir
+        proc.environment = env
+        proc.standardOutput = Pipe()   // suppress stdout noise
+        proc.standardError = Pipe()    // suppress stderr noise
+
+        do {
+            try proc.run()
+        } catch {
+            Darwin.close(readFd)
+            Darwin.close(writeFd)
+            return .failure(error)
+        }
+
+        // Close the write-end in our process so the read below returns EOF if Python closes it.
+        Darwin.close(writeFd)
+
+        // Read the port line from the ready-fd with a timeout.
+        let resolvedPort = _readPortFromPipe(fd: readFd, timeout: readyTimeoutSeconds)
+        Darwin.close(readFd)
+
+        guard let resolvedPort, resolvedPort > 0 else {
+            // Pipe read timed out or failed — fall back to polling /health.
+            if let polled = _pollHealth(proc: proc) {
+                self.process = proc
+                return .success(polled)
+            }
+            proc.terminate()
+            return .failure(NSError(domain: "DaemonManager", code: 2,
+                                    userInfo: [NSLocalizedDescriptionKey: "Daemon did not become ready in time"]))
+        }
+
+        self.process = proc
+        return .success(resolvedPort)
+    }
+
+    /// Reads `"<port>\n"` from the ready-fd with a wall-clock timeout.
+    private nonisolated func _readPortFromPipe(fd: Int32, timeout: TimeInterval) -> Int? {
+        var buf = [UInt8](repeating: 0, count: 32)
+        var totalRead = 0
+        let deadline = Date().addingTimeInterval(timeout)
+
+        while Date() < deadline {
+            // Use withUnsafeMutableBytes to get a valid pointer into the buffer at
+            // the current offset — avoids the "temporary pointer" warning from `&buf + n`.
+            let n = buf.withUnsafeMutableBytes { ptr -> Int in
+                Darwin.read(fd, ptr.baseAddress!.advanced(by: totalRead), 1)
+            }
+            if n <= 0 { break }
+            totalRead += 1
+            if buf[totalRead - 1] == UInt8(ascii: "\n") { break }
+            if totalRead >= buf.count { break }
+        }
+
+        guard totalRead > 0 else { return nil }
+        let line = String(bytes: buf.prefix(totalRead), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return Int(line)
+    }
+
+    /// Poll `GET /health` on sequential ports until a response arrives (fallback path).
+    private nonisolated func _pollHealth(proc: Process, attempts: Int = 40, interval: TimeInterval = 0.15) -> Int? {
+        // Try the default port first, then scan common ephemeral range.
+        let candidates = [8765] + (49152...49200).map { $0 }
+        for _ in 0..<attempts {
+            guard proc.isRunning else { return nil }
+            for port in candidates {
+                if _httpGetOK(port: port, path: "/health") { return port }
+            }
+            Thread.sleep(forTimeInterval: interval)
+        }
+        return nil
+    }
+
+    private nonisolated func _httpGetOK(port: Int, path: String) -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:\(port)\(path)") else { return false }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 0.3
+        // nonisolated(unsafe): written only inside the semaphore-guarded closure,
+        // read only after sema.wait() — the semaphore is the synchronisation barrier.
+        nonisolated(unsafe) var ok = false
+        let sema = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { _, resp, _ in
+            if let http = resp as? HTTPURLResponse, http.statusCode == 200 { ok = true }
+            sema.signal()
+        }.resume()
+        sema.wait()
+        return ok
+    }
+}
+
+// MARK: - SwiftNativeGuardian
 public struct SwiftNativeGuardian: Sendable {
     public init() {}
 
@@ -208,11 +407,18 @@ public final class PromptHistoryStore: @unchecked Sendable {
 }
 
 /// Bridges the SwiftUI macOS App with the Python `machybrid` backend engine.
+///
+/// Request routing priority:
+///  1. HTTP to the persistent daemon (zero cold-start, fastest path).
+///  2. Subprocess `--cli-json` (legacy fallback when daemon hasn't started yet).
+///  3. Native Swift fallback (pure-Swift PII Guardian, no Python required).
 public final class BackendBridge: Sendable {
     public static let shared = BackendBridge()
     private let fallbackGuardian = SwiftNativeGuardian()
 
     public init() {}
+
+    // MARK: – Helpers
 
     /// Resolves the path to the `backend` folder inside the `.app` bundle or repository workspace.
     public func resolveBackendDirectory() -> String? {
@@ -230,28 +436,63 @@ public final class BackendBridge: Sendable {
         return nil
     }
 
-    /// Invokes the Python `machybrid.server --cli-json` bridge or falls back to native Swift execution.
-    public func invokePythonJSON(method: String, path: String, body: [String: Any]) -> Data? {
-        guard let backendDir = resolveBackendDirectory() else {
-            return nil
+    private var pythonPath: String {
+        let candidates = ["/opt/homebrew/bin/python3", "/usr/bin/python3"]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) } ?? "/usr/bin/python3"
+    }
+
+    // MARK: – HTTP transport (persistent daemon)
+
+    /// Send a JSON request to the persistent daemon via HTTP.
+    /// Called from a background thread — blocks until the response arrives.
+    private func invokeHTTP(method: String, path: String, body: [String: Any]) -> Data? {
+        // Ensure the daemon is running. This is a no-op when it's already up.
+        if let backendDir = resolveBackendDirectory() {
+            let py = pythonPath
+            DispatchQueue.main.async {
+                DaemonManager.shared.ensureRunning(backendDir: backendDir, pythonPath: py)
+            }
         }
 
-        let requestDict: [String: Any] = [
-            "method": method,
-            "path": path,
-            "body": body,
-        ]
-        guard let reqData = try? JSONSerialization.data(withJSONObject: requestDict),
-              let reqStr = String(data: reqData, encoding: .utf8) else {
-            return nil
+        // Wait (blocking, called off main thread) until the daemon signals ready.
+        guard let port = DaemonManager.shared.waitUntilReady(timeout: 8) else { return nil }
+
+        guard let url = URL(string: "http://127.0.0.1:\(port)\(path)") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = method.uppercased()
+        req.timeoutInterval = 120
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        if method.uppercased() != "GET",
+           let bodyData = try? JSONSerialization.data(withJSONObject: body) {
+            req.httpBody = bodyData
         }
+
+        // nonisolated(unsafe): semaphore guarantees result is written before it is read.
+        nonisolated(unsafe) var result: Data?
+        let sema = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            result = data
+            sema.signal()
+        }.resume()
+        sema.wait()
+        return result
+    }
+
+    // MARK: – Subprocess transport (legacy / cold-start fallback)
+
+    /// Invokes the Python `machybrid.server --cli-json` bridge via subprocess.
+    /// Used as fallback when the HTTP daemon is not yet ready.
+    public func invokePythonJSON(method: String, path: String, body: [String: Any]) -> Data? {
+        guard let backendDir = resolveBackendDirectory() else { return nil }
+
+        let requestDict: [String: Any] = ["method": method, "path": path, "body": body]
+        guard let reqData = try? JSONSerialization.data(withJSONObject: requestDict),
+              let reqStr = String(data: reqData, encoding: .utf8) else { return nil }
 
         let process = Process()
-        let pythonCandidates = ["/opt/homebrew/bin/python3", "/usr/bin/python3"]
-        let pythonPath = pythonCandidates.first { FileManager.default.isExecutableFile(atPath: $0) } ?? "/usr/bin/python3"
         process.executableURL = URL(fileURLWithPath: pythonPath)
         process.arguments = ["-m", "machybrid.server", "--cli-json", reqStr]
-
         var env = ProcessInfo.processInfo.environment
         env["PYTHONPATH"] = backendDir
         process.environment = env
@@ -269,6 +510,16 @@ public final class BackendBridge: Sendable {
         } catch {
             return nil
         }
+    }
+
+    // MARK: – Unified invoke (HTTP → subprocess → nil)
+
+    /// Routes a request through HTTP daemon first, subprocess second.
+    private func invoke(method: String, path: String, body: [String: Any]) -> Data? {
+        // Fast path: HTTP to persistent daemon (no cold-start)
+        if let data = invokeHTTP(method: method, path: path, body: body) { return data }
+        // Slow path: subprocess (daemon not yet running or crashed)
+        return invokePythonJSON(method: method, path: path, body: body)
     }
 
     public func runTask(
@@ -300,7 +551,7 @@ public final class BackendBridge: Sendable {
             body["session_id"] = sessionId
         }
 
-        if let data = invokePythonJSON(method: "POST", path: "/v1/tasks/run", body: body),
+        if let data = invoke(method: "POST", path: "/v1/tasks/run", body: body),
            let decoded = try? JSONDecoder().decode(TaskResultModel.self, from: data) {
             return decoded
         }
