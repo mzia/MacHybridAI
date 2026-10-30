@@ -607,6 +607,114 @@ public struct ModelRecommendationModel: Identifiable, Codable, Sendable, Equatab
     }
 }
 
+public struct HardwareBenchmarkResultModel: Codable, Sendable, Equatable {
+    public let modelId: String
+    public let backend: String
+    public let ttftMs: Double
+    public let prefillTps: Double
+    public let decodeTps: Double
+    public let peakMemoryGb: Double
+    public let tokensGenerated: Int
+    public let durationMs: Int
+    public let thermalState: String
+    public let memoryPressurePct: Int
+    public let guardrailActive: Bool
+    public let guardrailReason: String
+
+    public init(
+        modelId: String,
+        backend: String,
+        ttftMs: Double,
+        prefillTps: Double,
+        decodeTps: Double,
+        peakMemoryGb: Double,
+        tokensGenerated: Int,
+        durationMs: Int,
+        thermalState: String = "nominal",
+        memoryPressurePct: Int = 40,
+        guardrailActive: Bool = false,
+        guardrailReason: String = ""
+    ) {
+        self.modelId = modelId
+        self.backend = backend
+        self.ttftMs = ttftMs
+        self.prefillTps = prefillTps
+        self.decodeTps = decodeTps
+        self.peakMemoryGb = peakMemoryGb
+        self.tokensGenerated = tokensGenerated
+        self.durationMs = durationMs
+        self.thermalState = thermalState
+        self.memoryPressurePct = memoryPressurePct
+        self.guardrailActive = guardrailActive
+        self.guardrailReason = guardrailReason
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case modelId = "model_id"
+        case backend
+        case ttftMs = "ttft_ms"
+        case prefillTps = "prefill_tps"
+        case decodeTps = "decode_tps"
+        case peakMemoryGb = "peak_memory_gb"
+        case tokensGenerated = "tokens_generated"
+        case durationMs = "duration_ms"
+        case thermalState = "thermal_state"
+        case memoryPressurePct = "memory_pressure_pct"
+        case guardrailActive = "guardrail_active"
+        case guardrailReason = "guardrail_reason"
+    }
+}
+
+public struct ModelPullResultModel: Codable, Sendable, Equatable {
+    public let ok: Bool
+    public let modelId: String
+    public let backend: String
+    public let isCached: Bool
+    public let isComplete: Bool
+    public let sizeGb: Double
+    public let missingShards: Int
+    public let status: String
+    public let message: String
+    public let cliCommand: String
+
+    public init(
+        ok: Bool,
+        modelId: String,
+        backend: String,
+        isCached: Bool,
+        isComplete: Bool,
+        sizeGb: Double,
+        missingShards: Int,
+        status: String,
+        message: String,
+        cliCommand: String
+    ) {
+        self.ok = ok
+        self.modelId = modelId
+        self.backend = backend
+        self.isCached = isCached
+        self.isComplete = isComplete
+        self.sizeGb = sizeGb
+        self.missingShards = missingShards
+        self.status = status
+        self.message = message
+        self.cliCommand = cliCommand
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case modelId = "model_id"
+        case backend
+        case isCached = "is_cached"
+        case isComplete = "is_complete"
+        case sizeGb = "size_gb"
+        case missingShards = "missing_shards"
+        case status
+        case message
+        case cliCommand = "cli_command"
+    }
+}
+
 public struct MacHardwareProfileModel: Codable, Sendable, Equatable {
     public let architecture: String
     public let chipBrand: String
@@ -631,6 +739,10 @@ public struct MacHardwareProfileModel: Codable, Sendable, Equatable {
     public let selectedLocalModel: String
     public let selectedFastModel: String
     public let recommendedKvBits: Int?
+    public let thermalState: String
+    public let memoryPressureLevel: String
+    public let guardrailTriggered: Bool
+    public let guardrailReason: String
     public let cachedModels: [CachedModelStatusModel]
     public let recommendations: [ModelRecommendationModel]
 
@@ -658,6 +770,10 @@ public struct MacHardwareProfileModel: Codable, Sendable, Equatable {
         selectedLocalModel: String,
         selectedFastModel: String,
         recommendedKvBits: Int?,
+        thermalState: String = "nominal",
+        memoryPressureLevel: String = "normal",
+        guardrailTriggered: Bool = false,
+        guardrailReason: String = "",
         cachedModels: [CachedModelStatusModel],
         recommendations: [ModelRecommendationModel]
     ) {
@@ -684,8 +800,45 @@ public struct MacHardwareProfileModel: Codable, Sendable, Equatable {
         self.selectedLocalModel = selectedLocalModel
         self.selectedFastModel = selectedFastModel
         self.recommendedKvBits = recommendedKvBits
+        self.thermalState = thermalState
+        self.memoryPressureLevel = memoryPressureLevel
+        self.guardrailTriggered = guardrailTriggered
+        self.guardrailReason = guardrailReason
         self.cachedModels = cachedModels
         self.recommendations = recommendations
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        architecture = try container.decode(String.self, forKey: .architecture)
+        chipBrand = try container.decode(String.self, forKey: .chipBrand)
+        cpuCoresTotal = try container.decode(Int.self, forKey: .cpuCoresTotal)
+        cpuCoresPerformance = try container.decode(Int.self, forKey: .cpuCoresPerformance)
+        cpuCoresEfficiency = try container.decode(Int.self, forKey: .cpuCoresEfficiency)
+        gpuCores = try container.decode(Int.self, forKey: .gpuCores)
+        gpuArchitecture = try container.decode(String.self, forKey: .gpuArchitecture)
+        metalAvailable = try container.decode(Bool.self, forKey: .metalAvailable)
+        mlxAvailable = try container.decode(Bool.self, forKey: .mlxAvailable)
+        unifiedMemoryGb = try container.decode(Int.self, forKey: .unifiedMemoryGb)
+        metalWorkingSetGb = try container.decode(Double.self, forKey: .metalWorkingSetGb)
+        metalMaxBufferGb = try container.decode(Double.self, forKey: .metalMaxBufferGb)
+        memoryUsedPercent = try container.decode(Int.self, forKey: .memoryUsedPercent)
+        availableMemoryGb = try container.decode(Double.self, forKey: .availableMemoryGb)
+        cpuBusyPercent = try container.decode(Int.self, forKey: .cpuBusyPercent)
+        gpuBusyPercent = try container.decode(Int.self, forKey: .gpuBusyPercent)
+        gpuRendererPercent = try container.decode(Int.self, forKey: .gpuRendererPercent)
+        gpuTilerPercent = try container.decode(Int.self, forKey: .gpuTilerPercent)
+        gpuInUseMemoryGb = try container.decode(Double.self, forKey: .gpuInUseMemoryGb)
+        hardwareTier = try container.decode(String.self, forKey: .hardwareTier)
+        selectedLocalModel = try container.decode(String.self, forKey: .selectedLocalModel)
+        selectedFastModel = try container.decode(String.self, forKey: .selectedFastModel)
+        recommendedKvBits = try container.decodeIfPresent(Int.self, forKey: .recommendedKvBits)
+        thermalState = try container.decodeIfPresent(String.self, forKey: .thermalState) ?? "nominal"
+        memoryPressureLevel = try container.decodeIfPresent(String.self, forKey: .memoryPressureLevel) ?? "normal"
+        guardrailTriggered = try container.decodeIfPresent(Bool.self, forKey: .guardrailTriggered) ?? false
+        guardrailReason = try container.decodeIfPresent(String.self, forKey: .guardrailReason) ?? ""
+        cachedModels = try container.decodeIfPresent([CachedModelStatusModel].self, forKey: .cachedModels) ?? []
+        recommendations = try container.decodeIfPresent([ModelRecommendationModel].self, forKey: .recommendations) ?? []
     }
 
     enum CodingKeys: String, CodingKey {
@@ -712,6 +865,10 @@ public struct MacHardwareProfileModel: Codable, Sendable, Equatable {
         case selectedLocalModel = "selected_local_model"
         case selectedFastModel = "selected_fast_model"
         case recommendedKvBits = "recommended_kv_bits"
+        case thermalState = "thermal_state"
+        case memoryPressureLevel = "memory_pressure_level"
+        case guardrailTriggered = "guardrail_triggered"
+        case guardrailReason = "guardrail_reason"
         case cachedModels = "cached_models"
         case recommendations
     }

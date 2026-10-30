@@ -523,6 +523,30 @@ def dispatch_request(
                 }
             return HTTPStatus.BAD_REQUEST, {"error": f"Unknown action: {action}"}
 
+        if path == "/v1/hardware/benchmark":
+            req_model = (
+                str(payload_in["model_id"])
+                if payload_in.get("model_id")
+                else None
+            )
+            max_tok = int(payload_in.get("max_tokens", 24))
+            bench = HardwareProfiler.run_benchmark(
+                model_id=req_model,
+                max_tokens=max(8, min(max_tok, 64)),
+            )
+            return HTTPStatus.OK, bench.to_dict()
+
+        if path == "/v1/hardware/models/pull":
+            req_model = str(payload_in.get("model_id", "")).strip()
+            if not req_model:
+                return HTTPStatus.BAD_REQUEST, {"error": "model_id is required"}
+            allow_dl = bool(payload_in.get("allow_download", False))
+            pull_res = HardwareProfiler.pull_or_verify_model(
+                model_id=req_model,
+                allow_network_download=allow_dl,
+            )
+            return HTTPStatus.OK, pull_res
+
         return HTTPStatus.NOT_FOUND, {"error": f"Unknown path: {path}"}
 
     return HTTPStatus.METHOD_NOT_ALLOWED, {"error": f"Unsupported method: {upper_method}"}

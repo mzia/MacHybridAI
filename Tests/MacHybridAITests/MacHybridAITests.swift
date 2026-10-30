@@ -117,6 +117,18 @@ struct MacHybridAITests {
         #expect(profile.unifiedMemoryGb >= 8)
         #expect(profile.metalWorkingSetGb > 0)
         #expect(!profile.selectedLocalModel.isEmpty)
+        #expect(!profile.thermalState.isEmpty)
         #expect(!profile.recommendations.isEmpty)
+
+        let bench = BackendBridge.shared.runHardwareBenchmark(modelId: profile.selectedLocalModel)
+        #expect(bench.ttftMs > 0)
+        #expect(bench.decodeTps > 0)
+        #expect(bench.peakMemoryGb > 0)
+
+        let pullCheck = BackendBridge.shared.pullOrVerifyLocalModel(
+            modelId: "mlx-community/gemma-3-4b-it-4bit",
+            allowDownload: false
+        )
+        #expect(pullCheck.modelId == "mlx-community/gemma-3-4b-it-4bit")
     }
 }

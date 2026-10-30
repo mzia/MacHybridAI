@@ -1,6 +1,7 @@
 # macOS & Swift
 .DS_Store
 .build/
+build/
 .swiftpm/
 DerivedData/
 *.app/

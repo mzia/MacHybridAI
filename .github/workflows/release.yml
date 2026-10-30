@@ -1,0 +1,86 @@
+name: "Release macOS Native Installer (.dmg & .pkg)"
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish-macos-installer:
+    name: Build & Publish Native macOS Installer (.dmg, .pkg, .app.zip)
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode 16 (Swift 6)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '^16.0'
+
+      - name: Determine Release Version & Tag
+        id: meta
+        run: |
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG_NAME#v}"
+            IS_ROLLING="false"
+          else
+            TAG_NAME="v${VERSION}"
+            IS_ROLLING="true"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "is_rolling=${IS_ROLLING}" >> "$GITHUB_OUTPUT"
+
+      - name: Run Swift 6 Unit Tests & Build Native Distributables
+        env:
+          MAC_HYBRID_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          swift test -v
+          chmod +x bundle.sh package.sh
+          ./package.sh
+          codesign --verify --deep --strict MacHybridAI.app
+
+      - name: Publish / Update GitHub Release Installers
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag_name }}
+          name: "MacHybridAI ${{ steps.meta.outputs.tag_name }} — Native Apple Silicon macOS Installer"
+          make_latest: true
+          prerelease: false
+          body: |
+            ## MacHybridAI ${{ steps.meta.outputs.tag_name }} — Native macOS Hybrid Compute & Privacy Gate
+
+            Always-up-to-date native Apple Silicon (`arm64` Metal / MLX) & macOS 14+ installation packages built automatically from `main` (${{ github.sha }}).
+
+            ### 1-Click macOS Installers
+            - **Drag-and-Drop Disk Image (Recommended)**: `MacHybridAI-latest.dmg` (`MacHybridAI-${{ steps.meta.outputs.version }}.dmg`)
+            - **macOS `/Applications` Package Installer**: `MacHybridAI-latest.pkg` (`MacHybridAI-${{ steps.meta.outputs.version }}.pkg`)
+            - **Zipped App Bundle**: `MacHybridAI-latest-macos-arm64.app.zip`
+            - **SHA-256 Checksums**: `SHA256SUMS.txt`
+
+            ### First-Launch Note (Ad-Hoc Signed Open-Source Build)
+            After dragging `MacHybridAI.app` to `/Applications` or installing via `.pkg`, if macOS Gatekeeper prompts on first launch:
+            ```bash
+            xattr -cr /Applications/MacHybridAI.app
+            open /Applications/MacHybridAI.app
+            ```
+          files: |
+            dist/MacHybridAI-${{ steps.meta.outputs.version }}.dmg
+            dist/MacHybridAI-${{ steps.meta.outputs.version }}.pkg
+            dist/MacHybridAI-${{ steps.meta.outputs.version }}-macos-arm64.app.zip
+            dist/MacHybridAI-latest.dmg
+            dist/MacHybridAI-latest.pkg
+            dist/MacHybridAI-latest-macos-arm64.app.zip
+            dist/SHA256SUMS.txt

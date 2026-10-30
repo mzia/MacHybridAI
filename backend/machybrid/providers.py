@@ -180,6 +180,7 @@ class MLXProvider:
         self,
         prompt: str,
         token_callback: Optional[Callable[[str], None]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Generator[str, None, None]:
         """Yields token strings from the MLX model one at a time using `mlx_lm.stream_generate`.
 
@@ -204,9 +205,10 @@ class MLXProvider:
         else:
             formatted = prompt
 
+        effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
         sampler = make_sampler(temp=self.temperature, top_p=0.95)
         gen_kwargs: Dict[str, Any] = {
-            "max_tokens": self.max_tokens,
+            "max_tokens": effective_max_tokens,
             "sampler": sampler,
         }
         if self.kv_bits is not None:
@@ -230,7 +232,7 @@ class MLXProvider:
                         token_callback(token_str)
                     yield token_str
                 token_count += 1
-                if token_count >= self.max_tokens:
+                if token_count >= effective_max_tokens:
                     break
 
         if last_resp is not None:
@@ -396,14 +398,26 @@ class MLXProvider:
     @classmethod
     def _resolve_model(cls, requested: Optional[str]) -> str:
         """Resolves requested model or auto-selects the best locally cached model for the Mac's Metal budget."""
+        candidate: Optional[str] = None
         if requested and requested.strip():
             cleaned = requested.strip()
             # Map legacy Ollama-style tag 'gemma4:26b' to HardwareProfiler's optimal MLX model
             if ":" not in cleaned:
                 _, is_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(cleaned)
                 if is_complete:
-                    return cleaned
-        return cls._pick_model()
+                    candidate = cleaned
+        if not candidate:
+            candidate = cls._pick_model()
+        mem_pct, avail_gb = HardwareProfiler.read_memory_stats()
+        thermal, _ = HardwareProfiler.read_thermal_and_pressure_state(mem_used_pct=mem_pct)
+        guarded, _, _ = HardwareProfiler.evaluate_guardrail(
+            requested_model=candidate,
+            fast_fallback_model="mlx-community/gemma-3-4b-it-4bit",
+            mem_used_pct=mem_pct,
+            avail_mem_gb=avail_gb,
+            thermal_state=thermal,
+        )
+        return guarded
 
     @classmethod
     def _pick_model(cls) -> str:
