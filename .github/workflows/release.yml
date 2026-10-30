@@ -16,7 +16,7 @@ concurrency:
 jobs:
   build-and-publish-macos-installer:
     name: Build & Publish Native macOS Installer (.dmg, .pkg, .app.zip)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 25
     steps:
       - name: Checkout Repository

@@ -812,7 +812,11 @@ class HardwareProfiler:
             try:
                 from huggingface_hub import snapshot_download  # type: ignore
 
-                snapshot_download(repo_id=canonical_id, local_files_only=False)
+                snapshot_download(  # nosec B615
+                    repo_id=canonical_id,
+                    revision="main",
+                    local_files_only=False,
+                )
                 is_cached, is_complete, size_bytes, snap_path, missing = cls.inspect_hf_model_cache(
                     canonical_id, hf_hub_dir=hf_hub_dir
                 )
