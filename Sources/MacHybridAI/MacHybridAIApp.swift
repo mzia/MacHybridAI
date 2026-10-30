@@ -205,6 +205,7 @@ final class HybridAppViewModel: ObservableObject {
     @Published var inspectorInput: String = "Prepared for Sam Reyes (sam.reyes@meridian.io), phone (415) 555-2671, SSN 123-45-6789."
     @Published var inspectorAudit: GuardianAuditModel?
     @Published var selectedTab: Int = 0
+    @Published var hardwareProfile: MacHardwareProfileModel?
 
     private let historyStore = PromptHistoryStore()
 
@@ -219,9 +220,29 @@ final class HybridAppViewModel: ObservableObject {
             let py = pythonCandidates.first { FileManager.default.fileExists(atPath: $0) } ?? "/usr/bin/python3"
             DaemonManager.shared.ensureRunning(backendDir: backendDir, pythonPath: py)
         }
+        refreshHardwareProfile()
         if conversations.isEmpty {
             startNewChat()
             sendChatMessage()
+        }
+    }
+
+    func refreshHardwareProfile() {
+        Task.detached(priority: .userInitiated) {
+            let profile = BackendBridge.shared.fetchHardwareProfile()
+            await MainActor.run {
+                self.hardwareProfile = profile
+                if self.localModel == "gemma4:26b" || self.localModel.isEmpty {
+                    self.localModel = profile.selectedLocalModel
+                }
+            }
+        }
+    }
+
+    func selectRecommendedModel(_ modelId: String) {
+        self.localModel = modelId
+        Task.detached(priority: .utility) {
+            BackendBridge.shared.updateBackendConfig(body: ["local_model": modelId])
         }
     }
 
@@ -350,79 +371,147 @@ final class HybridAppViewModel: ObservableObject {
         let provider = cloudProvider
         let policy = guardianPolicy
         let files = attachedFiles
+        let now = Date()
 
-        // Run the blocking Python subprocess on a background thread so the UI
-        // stays responsive (spinner animates, buttons remain interactive).
+        // Add user message immediately so the UI shows it while waiting
+        let userMsg = ChatMessageModel(
+            role: "user",
+            content: trimmed,
+            createdAt: now,
+            computeMode: mode.rawValue,
+            cloudProvider: provider.rawValue,
+            sanitizedCloudPrompt: nil,
+            piiMaskedCount: 0,
+            piiRestoredCount: 0,
+            stations: [],
+            receipt: nil,
+            telemetry: nil,
+            cloudZeroRetention: true
+        )
+
+        // Streaming placeholder — content fills in token by token
+        let streamingId = UUID().uuidString
+        let streamingMsg = ChatMessageModel(
+            id: streamingId,
+            role: "assistant",
+            content: "",
+            createdAt: now,
+            computeMode: mode.rawValue,
+            cloudProvider: provider.rawValue,
+            sanitizedCloudPrompt: nil,
+            piiMaskedCount: 0,
+            piiRestoredCount: 0,
+            stations: [],
+            receipt: nil,
+            telemetry: nil,
+            cloudZeroRetention: true,
+            isStreaming: true
+        )
+
+        if let idx = conversations.firstIndex(where: { $0.id == currentSessionId }) {
+            if conversations[idx].title == "New Hybrid Chat" {
+                let firstLine = trimmed.components(separatedBy: .newlines).first ?? trimmed
+                conversations[idx].title = String(firstLine.prefix(46))
+            }
+            conversations[idx].messages.append(userMsg)
+            conversations[idx].messages.append(streamingMsg)
+        }
+        promptText = ""
+        attachedFiles.removeAll()
+        updateComposerLiveAudit()
+
+        // Stream tokens on a background task, update the placeholder bubble in real time
         Task.detached(priority: .userInitiated) {
-            let result = BackendBridge.shared.runTask(
+            BackendBridge.shared.streamTask(
                 prompt: trimmed,
                 mode: mode,
                 cloudProvider: provider,
-                guardianPolicy: policy,
                 attachedFiles: files,
-                sessionId: currentSessionId
+                sessionId: currentSessionId,
+                onToken: { token in
+                    Task { @MainActor in
+                        guard let convIdx = self.conversations.firstIndex(where: { $0.id == currentSessionId }),
+                              let msgIdx = self.conversations[convIdx].messages.firstIndex(where: { $0.id == streamingId })
+                        else { return }
+                        self.conversations[convIdx].messages[msgIdx].content += token
+                    }
+                },
+                onReceipt: { receiptPayload in
+                    let decodedReceipt: ExecutionReceiptModel? = {
+                        guard let recDict = receiptPayload["receipt"],
+                              let recData = try? JSONSerialization.data(withJSONObject: recDict) else { return nil }
+                        return try? JSONDecoder().decode(ExecutionReceiptModel.self, from: recData)
+                    }()
+                    let decodedStations: [StationStepModel] = {
+                        guard let stList = receiptPayload["stations"],
+                              let stData = try? JSONSerialization.data(withJSONObject: stList),
+                              let list = try? JSONDecoder().decode([StationStepModel].self, from: stData) else { return [] }
+                        return list
+                    }()
+                    let decodedTelemetry: TelemetryModel? = {
+                        guard let telDict = receiptPayload["telemetry"],
+                              let telData = try? JSONSerialization.data(withJSONObject: telDict) else { return nil }
+                        return try? JSONDecoder().decode(TelemetryModel.self, from: telData)
+                    }()
+                    let cloudSent = receiptPayload["cloud_prompt_sent"] as? String
+
+                    Task { @MainActor in
+                        if let convIdx = self.conversations.firstIndex(where: { $0.id == currentSessionId }),
+                           let msgIdx = self.conversations[convIdx].messages.firstIndex(where: { $0.id == streamingId }) {
+                            self.conversations[convIdx].messages[msgIdx].isStreaming = false
+                            if let decodedReceipt {
+                                self.conversations[convIdx].messages[msgIdx].receipt = decodedReceipt
+                            }
+                            if !decodedStations.isEmpty {
+                                self.conversations[convIdx].messages[msgIdx].stations = decodedStations
+                            }
+                            if let decodedTelemetry {
+                                self.conversations[convIdx].messages[msgIdx].telemetry = decodedTelemetry
+                            }
+                            if let cloudSent {
+                                self.conversations[convIdx].messages[msgIdx].sanitizedCloudPrompt = cloudSent
+                            }
+                        }
+                        self.isRunning = false
+                        self.historyStore.saveConversations(self.conversations, to: self.historyStorage)
+                    }
+                }
             )
 
-            // All @Published mutations must happen on MainActor.
+            // Fallback: if streaming returned nothing (daemon not available), use blocking path
             await MainActor.run {
-                self.lastResult = result
+                guard let convIdx = self.conversations.firstIndex(where: { $0.id == currentSessionId }),
+                      let msgIdx = self.conversations[convIdx].messages.firstIndex(where: { $0.id == streamingId }),
+                      self.conversations[convIdx].messages[msgIdx].content.isEmpty
+                else { return }
 
-                let now = Date()
-                let userMsg = ChatMessageModel(
-                    role: "user",
-                    content: trimmed,
-                    createdAt: now,
-                    computeMode: mode.rawValue,
-                    cloudProvider: provider.rawValue,
-                    sanitizedCloudPrompt: result.cloudPromptSent,
-                    piiMaskedCount: result.receipt.piiFlaggedCount,
-                    piiRestoredCount: 0,
-                    stations: [],
-                    receipt: nil,
-                    telemetry: nil,
-                    cloudZeroRetention: true
-                )
-
-                let assistantMsg = ChatMessageModel(
-                    role: "assistant",
-                    content: result.finalOutput,
-                    createdAt: now,
-                    computeMode: mode.rawValue,
-                    cloudProvider: provider.rawValue,
-                    sanitizedCloudPrompt: result.cloudPromptSent,
-                    piiMaskedCount: result.receipt.piiFlaggedCount,
-                    piiRestoredCount: result.receipt.piiRestoredCount,
-                    stations: result.stations,
-                    receipt: result.receipt,
-                    telemetry: result.telemetry,
-                    cloudZeroRetention: true
-                )
-
-                if let idx = self.conversations.firstIndex(where: { $0.id == currentSessionId }) {
-                    if self.conversations[idx].messages.isEmpty || self.conversations[idx].title == "New Hybrid Chat" {
-                        let firstLine = trimmed.components(separatedBy: .newlines).first ?? trimmed
-                        self.conversations[idx].title = String(firstLine.prefix(46))
+                // content is empty — streaming failed, fall back to runTask
+                Task.detached(priority: .userInitiated) {
+                    let result = BackendBridge.shared.runTask(
+                        prompt: trimmed,
+                        mode: mode,
+                        cloudProvider: provider,
+                        guardianPolicy: policy,
+                        attachedFiles: files,
+                        sessionId: currentSessionId
+                    )
+                    await MainActor.run {
+                        self.lastResult = result
+                        if let convIdx = self.conversations.firstIndex(where: { $0.id == currentSessionId }),
+                           let msgIdx = self.conversations[convIdx].messages.firstIndex(where: { $0.id == streamingId }) {
+                            self.conversations[convIdx].messages[msgIdx].content = result.finalOutput
+                            self.conversations[convIdx].messages[msgIdx].isStreaming = false
+                            self.conversations[convIdx].messages[msgIdx].stations = result.stations
+                            self.conversations[convIdx].messages[msgIdx].receipt = result.receipt
+                            self.conversations[convIdx].messages[msgIdx].telemetry = result.telemetry
+                        }
+                        self.isRunning = false
+                        self.historyStore.saveConversations(self.conversations, to: self.historyStorage)
                     }
-                    self.conversations[idx].messages.append(userMsg)
-                    self.conversations[idx].messages.append(assistantMsg)
-                    self.conversations[idx].updatedAt = now
-                    self.conversations[idx].storageLocation = self.historyStorage
-                    self.conversations[idx].retentionPolicy = self.historyRetention
-                    self.conversations[idx].expiresAt = self.historyRetention.computeExpiryDate(from: now)
-
-                    let updatedConv = self.conversations.remove(at: idx)
-                    self.conversations.insert(updatedConv, at: 0)
                 }
-
-                self.historyStore.saveConversations(self.conversations, to: self.historyStorage)
-                self.promptText = ""
-                self.attachedFiles.removeAll()
-                self.updateComposerLiveAudit()
-                self.isRunning = false
             }
         }
     }
-
     func executeTask() {
         if promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            let lastPrompt = activeConversation?.messages.last(where: { $0.role == "user" })?.content {
@@ -835,6 +924,23 @@ struct HybridChatTabView: View {
     }
 }
 
+// MARK: - Streaming cursor
+
+/// Blinking "▋" cursor shown in assistant bubbles while tokens are streaming in.
+/// Uses a TimelineView so no @State macro is required in the SPM build target.
+struct StreamingCursorView: View {
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 0.5)) { context in
+            let phase = context.date.timeIntervalSinceReferenceDate
+            let visible = Int(phase / 0.5) % 2 == 0
+            Text("▋")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(.cyan.opacity(0.9))
+                .opacity(visible ? 1.0 : 0.0)
+        }
+    }
+}
+
 struct ChatBubbleRowView: View {
     let message: ChatMessageModel
 
@@ -895,12 +1001,17 @@ struct ChatBubbleRowView: View {
                                     .font(.system(size: 10, weight: .semibold))
                                     .foregroundStyle(.orange)
                             }
+                            if let tel = message.telemetry {
+                                Text("· \(tel.chipBrand) · CPU \(tel.cpuPercent)% · GPU \(tel.gpuPercent)% · RAM \(tel.memoryPercent)% (\(tel.unifiedMemoryGb) GB)")
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                     Spacer()
                 }
 
-                Text(message.content)
+                Text(message.content.isEmpty && message.isStreaming ? " " : message.content)
                     .font(.body)
                     .textSelection(.enabled)
                     .padding(14)
@@ -909,6 +1020,12 @@ struct ChatBubbleRowView: View {
                         RoundedRectangle(cornerRadius: 12)
                             .fill(Color.white.opacity(0.05))
                     )
+                    .overlay(alignment: .bottomTrailing) {
+                        if message.isStreaming {
+                            StreamingCursorView()
+                                .padding(8)
+                        }
+                    }
 
                 // Expandable 4-Station Relay & Sanitized Cloud Prompt Inspector
                 if !message.stations.isEmpty || message.sanitizedCloudPrompt != nil {
@@ -1190,31 +1307,144 @@ struct ProvidersConfigTabView: View {
     @ObservedObject var vm: HybridAppViewModel
 
     var body: some View {
-        Form {
-            Section("Default Cloud AI — Google Gemini & Antigravity (Stateless store=false)") {
-                TextField("Gemini Model (Interactions API)", text: $vm.geminiModel)
-                TextField("Antigravity Managed Agent ID", text: $vm.antigravityAgent)
-            }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Apple Silicon Hardware Profiler & AI Providers")
+                            .font(.title2.bold())
+                        Text("Live Metal working-set profiler, local model cache validator, and hardware-matched model sizing.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button {
+                        vm.refreshHardwareProfile()
+                    } label: {
+                        Label("Re-Profile Mac Hardware", systemImage: "cpu.fill")
+                    }
+                }
 
-            Section("On-Device Local Model (This Mac — Apple Silicon Metal)") {
-                TextField("Local Model Identifier (LiteRT / Ollama)", text: $vm.localModel)
-                TextField("Local OpenAI-Compatible Endpoint", text: $vm.localEndpoint)
-            }
+                if let hw = vm.hardwareProfile {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 12) {
+                            Image(systemName: "memorychip.fill")
+                                .font(.title2)
+                                .foregroundStyle(.cyan)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(hw.chipBrand) · \(hw.unifiedMemoryGb) GB Unified Memory")
+                                    .font(.headline.bold())
+                                Text("\(hw.cpuCoresTotal) CPU Cores (\(hw.cpuCoresPerformance)P + \(hw.cpuCoresEfficiency)E) · \(hw.gpuCores)-Core GPU (\(hw.gpuArchitecture)) · Tier: \(hw.hardwareTier)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text(String(format: "Metal Working Set: %.1f GB", hw.metalWorkingSetGb))
+                                .font(.caption.bold())
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4)
+                                .background(Capsule().fill(Color.cyan.opacity(0.2)))
+                                .foregroundStyle(.cyan)
+                        }
 
-            Section("Microsoft 365 Copilot Proxy (cramt/m365-copilot-proxy · Temporary Chat Locked)") {
-                TextField("Proxy Loopback Port", text: $vm.m365Port)
-                TextField("M365 Tone / Model (Recommended: gpt-5.5-think-deeper)", text: $vm.m365Model)
-                Toggle("Interactive Browser SSO/MFA Approval (M365_ENABLE_INTERACTIVE_APPROVAL=1)", isOn: $vm.m365InteractiveApproval)
-                Toggle("Avoid PerUserThrottled Reserve Guard (M365_AVOID_THROTTLING=1)", isOn: $vm.m365AvoidThrottling)
-            }
+                        HStack(spacing: 16) {
+                            Label("CPU Busy: \(hw.cpuBusyPercent)%", systemImage: "gauge.medium")
+                                .font(.caption)
+                            Label("GPU Busy: \(hw.gpuBusyPercent)% (Renderer \(hw.gpuRendererPercent)%)", systemImage: "sparkles.tv")
+                                .font(.caption)
+                            Label(String(format: "RAM Used: %d%% (%.1f GB free)", hw.memoryUsedPercent, hw.availableMemoryGb), systemImage: "memorychip")
+                                .font(.caption)
+                            if let kv = hw.recommendedKvBits {
+                                Label("Recommended KV Cache: \(kv)-bit", systemImage: "bolt.horizontal.fill")
+                                    .font(.caption.bold())
+                                    .foregroundStyle(.green)
+                            }
+                        }
 
-            Section("Custom OpenAI Extension Method (store=false, X-No-Store: true)") {
-                TextField("OpenAI-Compatible Base URL", text: $vm.openAIBaseURL)
-                TextField("OpenAI-Compatible Model Name", text: $vm.openAIModel)
+                        Divider()
+
+                        Text("Hardware-Matched Model Sizing & Local Cache Status")
+                            .font(.subheadline.bold())
+
+                        ForEach(hw.recommendations) { rec in
+                            HStack(alignment: .top, spacing: 10) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    HStack(spacing: 6) {
+                                        Text(rec.modelId)
+                                            .font(.system(.caption, design: .monospaced).bold())
+                                        Text("\(rec.parameterCount) · \(rec.quantization)")
+                                            .font(.caption2.bold())
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Capsule().fill(Color.purple.opacity(0.2)))
+                                        Text(String(format: "~%.1f GB · %@", rec.estimatedMemoryGb, rec.expectedTpsRange))
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                        if rec.isReadyLocally {
+                                            Text("Cached & Verified")
+                                                .font(.system(size: 9, weight: .bold))
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(Capsule().fill(Color.green.opacity(0.22)))
+                                                .foregroundStyle(.green)
+                                        } else {
+                                            Text("Weights Not Downloaded")
+                                                .font(.system(size: 9, weight: .semibold))
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(Capsule().fill(Color.orange.opacity(0.2)))
+                                                .foregroundStyle(.orange)
+                                        }
+                                    }
+                                    Text(rec.rationale)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button(vm.localModel == rec.modelId ? "Active" : "Use Model") {
+                                    vm.selectRecommendedModel(rec.modelId)
+                                }
+                                .controlSize(.small)
+                                .disabled(!rec.fitsInMetalBudget)
+                            }
+                            .padding(8)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.03)))
+                        }
+                    }
+                    .padding(14)
+                    .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.05)))
+                }
+
+                Form {
+                    Section("On-Device Local Model (This Mac — Apple Silicon Metal / MLX)") {
+                        TextField("Active Local Model Identifier (MLX / LiteRT / Ollama)", text: $vm.localModel)
+                            .onChange(of: vm.localModel) { _, newValue in
+                                vm.selectRecommendedModel(newValue)
+                            }
+                        TextField("Local OpenAI-Compatible Endpoint", text: $vm.localEndpoint)
+                    }
+
+                    Section("Default Cloud AI — Google Gemini & Antigravity (Stateless store=false)") {
+                        TextField("Gemini Model (Interactions API)", text: $vm.geminiModel)
+                        TextField("Antigravity Managed Agent ID", text: $vm.antigravityAgent)
+                    }
+
+                    Section("Microsoft 365 Copilot Proxy (cramt/m365-copilot-proxy · Temporary Chat Locked)") {
+                        TextField("Proxy Loopback Port", text: $vm.m365Port)
+                        TextField("M365 Tone / Model (Recommended: gpt-5.5-think-deeper)", text: $vm.m365Model)
+                        Toggle("Interactive Browser SSO/MFA Approval (M365_ENABLE_INTERACTIVE_APPROVAL=1)", isOn: $vm.m365InteractiveApproval)
+                        Toggle("Avoid PerUserThrottled Reserve Guard (M365_AVOID_THROTTLING=1)", isOn: $vm.m365AvoidThrottling)
+                    }
+
+                    Section("Custom OpenAI Extension Method (store=false, X-No-Store: true)") {
+                        TextField("OpenAI-Compatible Base URL", text: $vm.openAIBaseURL)
+                        TextField("OpenAI-Compatible Model Name", text: $vm.openAIModel)
+                    }
+                }
+                .formStyle(.grouped)
             }
+            .padding(20)
         }
-        .formStyle(.grouped)
-        .padding(16)
     }
 }
 

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import os
 import platform
-import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -30,6 +29,7 @@ from .history import (
     PromptHistoryManager,
 )
 from .m365_proxy import M365CopilotProxyManager, M365ModelCatalog, M365ProxySettings
+from .profiler import HardwareProfiler
 from .providers import (
     DEFAULT_ANTIGRAVITY_AGENT,
     DEFAULT_GEMINI_MODEL,
@@ -60,8 +60,8 @@ class HybridConfig:
     cloud_provider: str = "gemini"  # "gemini" | "antigravity" | "openai_compatible" | "m365_copilot"
     gemini_model: str = DEFAULT_GEMINI_MODEL
     antigravity_agent: str = DEFAULT_ANTIGRAVITY_AGENT
-    local_backend: str = "ollama"  # "litert" | "ollama" | "lmstudio"
-    local_model: str = "gemma4:26b"
+    local_backend: str = "mlx"       # "mlx" | "litert" | "ollama" | "lmstudio"
+    local_model: str = ""            # empty = auto-select best MLX model by available RAM
     local_base_url: str = "http://127.0.0.1:11434/v1"
     litert_model_path: str = "~/.litert-lm/models/gemma4-26b/model.litertlm"
     openai_base_url: str = "https://api.openai.com/v1"
@@ -669,134 +669,30 @@ class HybridOrchestrator:
 
     @staticmethod
     def _read_cpu_percent_darwin() -> int:
-        """Reads real CPU busy % on macOS using `host_statistics` via `sysctl vm.loadavg`.
-
-        Falls back to a safe placeholder (0) on any error.
-        Uses the 1-minute load average divided by logical CPU count, capped at 100.
-        This avoids any third-party dependency while remaining accurate enough for
-        a UI sparkline.
-        """
-        try:
-            # sysctl -n vm.loadavg returns: "{ 1.23 0.98 0.87 }"
-            raw = subprocess.check_output(
-                ["/usr/sbin/sysctl", "-n", "vm.loadavg"],
-                timeout=1.0,
-            ).decode("utf-8").strip()
-            # Parse "{ 1.23 0.98 0.87 }" → 1.23 (1-minute average)
-            inner = raw.strip("{} ")
-            load_1min = float(inner.split()[0])
-
-            # Logical CPU count
-            ncpu_raw = subprocess.check_output(
-                ["/usr/sbin/sysctl", "-n", "hw.logicalcpu"],
-                timeout=1.0,
-            ).decode("utf-8").strip()
-            ncpu = max(1, int(ncpu_raw))
-
-            # Load average as a fraction of total CPU capacity, capped at 100
-            return min(100, max(0, int((load_1min / ncpu) * 100)))
-        except Exception:
-            return 0
+        """Reads real CPU busy % on macOS using stdlib `os.getloadavg()` normalized by logical CPU count."""
+        return HardwareProfiler.read_cpu_busy_percent()
 
     @staticmethod
     def _read_memory_percent_darwin() -> int:
-        """Reads real memory pressure % on macOS via `vm_stat` + `hw.memsize`.
-
-        Computes: used_pages / total_pages × 100.
-        Falls back to 0 on any error.
-        """
-        try:
-            # Total physical memory in bytes
-            mem_raw = subprocess.check_output(
-                ["/usr/sbin/sysctl", "-n", "hw.memsize"],
-                timeout=1.0,
-            ).decode("utf-8").strip()
-            total_bytes = int(mem_raw)
-
-            # vm_stat output: "Pages free: 123456." etc.
-            vm_raw = subprocess.check_output(
-                ["/usr/bin/vm_stat"],
-                timeout=1.0,
-            ).decode("utf-8")
-
-            page_size = 16384  # Apple Silicon default page size (16 KiB)
-            # Try to extract page size from the header line
-            for line in vm_raw.splitlines():
-                if "page size of" in line:
-                    parts = line.split("page size of")
-                    if len(parts) > 1:
-                        size_part = parts[1].split()[0]
-                        if size_part.isdigit():
-                            page_size = int(size_part)
-                    break
-
-            def _parse_pages(label: str) -> int:
-                for line in vm_raw.splitlines():
-                    if line.startswith(label):
-                        val = line.split(":")[1].strip().rstrip(".")
-                        if val.isdigit():
-                            return int(val)
-                return 0
-
-            free_pages = _parse_pages("Pages free:")
-            speculative = _parse_pages("Pages speculative:")
-            total_pages = total_bytes // page_size
-            if total_pages == 0:
-                return 0
-            available_pages = free_pages + speculative
-            used_pages = max(0, total_pages - available_pages)
-            return min(100, max(0, int(used_pages / total_pages * 100)))
-        except Exception:
-            return 0
+        """Reads real memory pressure % on macOS via `vm_stat` + `hw.memsize`."""
+        used_pct, _ = HardwareProfiler.read_memory_stats()
+        return used_pct
 
     @staticmethod
     def _read_gpu_percent_darwin(arch: str) -> int:
-        """Reads GPU engine busy % from `powermetrics` on Apple Silicon (arm64).
-
-        Runs a single 200 ms sample — fast enough for a UI refresh.
-        Falls back gracefully on Intel, non-Darwin, or permission errors.
-        """
+        """Reads GPU engine busy % from IOKit `IOAccelerator` (`ioreg`) on Apple Silicon without requiring root."""
         if arch != "arm64" or platform.system() != "Darwin":
             return 0
-        try:
-            raw = subprocess.check_output(
-                [
-                    "/usr/bin/powermetrics",
-                    "--samplers", "gpu_power",
-                    "-n", "1",
-                    "--sample-rate", "200",
-                ],
-                timeout=3.0,
-                stderr=subprocess.DEVNULL,
-            ).decode("utf-8", errors="replace")
-            # Look for "GPU HW active residency:  76.34%" or similar
-            import re as _re
-            match = _re.search(r"GPU HW active residency:\s+([\d.]+)%", raw)
-            if match:
-                return min(100, max(0, int(float(match.group(1)))))
-        except Exception:
-            pass
-        return 0
+        io_stats = HardwareProfiler.read_ioaccelerator_stats()
+        return int(io_stats.get("device_utilization", 0))
 
     @staticmethod
     def collect_telemetry(tokens: int = 0) -> MacTelemetry:
-        """Collects real Apple Silicon hardware metrics for the UI telemetry sparklines.
-
-        All reads use stdlib subprocess calls to macOS system utilities only —
-        no third-party dependencies required.
-        """
-        arch = platform.machine() or "arm64"
-        chip = "Apple Silicon (Metal)" if arch == "arm64" else arch
-        mem_gb = 8
-        if platform.system() == "Darwin":
-            try:
-                out = subprocess.check_output(
-                    ["/usr/sbin/sysctl", "-n", "hw.memsize"],
-                    timeout=1.0,
-                ).decode("utf-8").strip()
-                mem_gb = max(8, int(out) // (1024**3))
-            except Exception:
-                pass
+        """Collects real Apple Silicon hardware metrics for the UI telemetry sparklines."""
+        static = HardwareProfiler.get_static_hardware_info()
+        arch = str(static["architecture"])
+        chip = str(static["chip_brand"])
+        mem_gb = int(static["unified_memory_gb"])
 
         cpu_pct = HybridOrchestrator._read_cpu_percent_darwin()
         mem_pct = HybridOrchestrator._read_memory_percent_darwin()

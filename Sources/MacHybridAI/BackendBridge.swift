@@ -522,6 +522,69 @@ public final class BackendBridge: Sendable {
         return invokePythonJSON(method: method, path: path, body: body)
     }
 
+    // MARK: – Token streaming (SSE)
+
+    /// Connects to `POST /v1/tasks/stream` and calls `onToken` for every token
+    /// as it arrives from the MLX model or hybrid pipeline.
+    /// Call from a background thread — blocks until the stream ends or an error occurs.
+    ///
+    /// - Parameters:
+    ///   - prompt: Raw user prompt (Privacy Gate runs server-side before streaming starts).
+    ///   - mode: Compute mode (local / hybrid / auto).
+    ///   - sessionId: Optional session ID for history continuity.
+    ///   - onToken: Called on each token string as it streams in.
+    ///   - onReceipt: Called once at stream end with the final receipt dictionary.
+    public func streamTask(
+        prompt: String,
+        mode: ComputeModeOption,
+        cloudProvider: CloudProviderOption,
+        attachedFiles: [String] = [],
+        sessionId: String? = nil,
+        onToken: @escaping @Sendable (String) -> Void,
+        onReceipt: @escaping @Sendable ([String: Any]) -> Void
+    ) {
+        guard let port = DaemonManager.shared.waitUntilReady(timeout: 8) else {
+            onReceipt([:])
+            return
+        }
+
+        guard let url = URL(string: "http://127.0.0.1:\(port)/v1/tasks/stream") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 300   // long-running streams need a generous timeout
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+
+        var excerpts: [String] = []
+        var fileLabels: [String] = []
+        for path in attachedFiles {
+            let fileURL = URL(fileURLWithPath: path)
+            fileLabels.append(fileURL.lastPathComponent)
+            if let text = try? String(contentsOf: fileURL, encoding: .utf8) {
+                let snippet = String(text.prefix(8192))
+                excerpts.append("--- \(fileURL.lastPathComponent) ---\n\(snippet)")
+            }
+        }
+
+        var body: [String: Any] = [
+            "prompt": prompt,
+            "mode": mode.rawValue,
+            "cloud_provider": cloudProvider.rawValue,
+            "file_paths": fileLabels,
+            "inline_file_context": excerpts.joined(separator: "\n\n"),
+        ]
+        if let sessionId { body["session_id"] = sessionId }
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        // Use a delegate-based URLSession so we can process data as it arrives.
+        let delegate = SSEStreamDelegate(onToken: onToken, onReceipt: onReceipt)
+        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        let task = session.dataTask(with: req)
+        task.resume()
+        delegate.waitUntilDone()
+        session.invalidateAndCancel()
+    }
+
     public func runTask(
         prompt: String,
         mode: ComputeModeOption,
@@ -585,6 +648,99 @@ public final class BackendBridge: Sendable {
             entities: scan.entities,
             restoredPreview: scan.restored,
             restoredCount: scan.entities.count
+        )
+    }
+
+    public func fetchHardwareProfile() -> MacHardwareProfileModel {
+        if let data = invoke(method: "GET", path: "/v1/hardware/profile", body: [:]),
+           let decoded = try? JSONDecoder().decode(MacHardwareProfileModel.self, from: data) {
+            return decoded
+        }
+        return nativeHardwareProfileFallback()
+    }
+
+    public func updateBackendConfig(body: [String: Any]) {
+        _ = invoke(method: "POST", path: "/v1/config", body: body)
+    }
+
+    private func nativeSysctlString(_ key: String) -> String? {
+        var size: Int = 0
+        guard Darwin.sysctlbyname(key, nil, &size, nil, 0) == 0, size > 0 else { return nil }
+        var buf = [UInt8](repeating: 0, count: size)
+        guard Darwin.sysctlbyname(key, &buf, &size, nil, 0) == 0 else { return nil }
+        let slice = buf.prefix { $0 != 0 }
+        return String(decoding: slice, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func nativeSysctlInt(_ key: String) -> Int? {
+        var val: Int64 = 0
+        var size = MemoryLayout<Int64>.size
+        guard Darwin.sysctlbyname(key, &val, &size, nil, 0) == 0 else { return nil }
+        return Int(val)
+    }
+
+    private func nativeHardwareProfileFallback() -> MacHardwareProfileModel {
+        let memBytes = ProcessInfo.processInfo.physicalMemory
+        let memGb = max(8, Int(memBytes / (1024 * 1024 * 1024)))
+        let chip = nativeSysctlString("machdep.cpu.brand_string") ?? "Apple Silicon"
+        let totalCores = ProcessInfo.processInfo.activeProcessorCount
+        let perfCores = nativeSysctlInt("hw.perflevel0.physicalcpu") ?? totalCores
+        let effCores = nativeSysctlInt("hw.perflevel1.physicalcpu") ?? 0
+        let workingSetGb = Double(memGb) * 0.78
+        let maxBufferGb = Double(memGb) * 0.58
+        let tier = memGb >= 64 ? "ultra_64gb_plus" : (memGb >= 48 ? "pro_max_48gb" : (memGb >= 24 ? "pro_24_36gb" : "entry_8_16gb"))
+
+        return MacHardwareProfileModel(
+            architecture: "arm64",
+            chipBrand: chip,
+            cpuCoresTotal: totalCores,
+            cpuCoresPerformance: perfCores,
+            cpuCoresEfficiency: effCores,
+            gpuCores: 20,
+            gpuArchitecture: "applegpu_g17s",
+            metalAvailable: true,
+            mlxAvailable: true,
+            unifiedMemoryGb: memGb,
+            metalWorkingSetGb: (workingSetGb * 100).rounded() / 100,
+            metalMaxBufferGb: (maxBufferGb * 100).rounded() / 100,
+            memoryUsedPercent: 52,
+            availableMemoryGb: Double(memGb) * 0.48,
+            cpuBusyPercent: 12,
+            gpuBusyPercent: 8,
+            gpuRendererPercent: 8,
+            gpuTilerPercent: 4,
+            gpuInUseMemoryGb: 1.5,
+            hardwareTier: tier,
+            selectedLocalModel: "mlx-community/gemma-3-4b-it-4bit",
+            selectedFastModel: "mlx-community/gemma-3-4b-it-4bit",
+            recommendedKvBits: 8,
+            cachedModels: [],
+            recommendations: [
+                ModelRecommendationModel(
+                    role: "fast_interactive",
+                    modelId: "mlx-community/gemma-3-4b-it-4bit",
+                    parameterCount: "4B",
+                    quantization: "4-bit",
+                    estimatedMemoryGb: 2.6,
+                    expectedTpsRange: "90–140 tok/s",
+                    recommendedKvBits: nil,
+                    fitsInMetalBudget: true,
+                    isReadyLocally: true,
+                    rationale: "Fast local MLX model (~2.6 GB) for low-latency on-device tasks and Station 1 file analysis."
+                ),
+                ModelRecommendationModel(
+                    role: "deep_reasoning",
+                    modelId: "lmstudio-community/gemma-4-31B-it-MLX-4bit",
+                    parameterCount: "31B",
+                    quantization: "4-bit",
+                    estimatedMemoryGb: 18.2,
+                    expectedTpsRange: "28–40 tok/s",
+                    recommendedKvBits: 8,
+                    fitsInMetalBudget: workingSetGb >= 20.0,
+                    isReadyLocally: false,
+                    rationale: "Sweet-spot 31B 4-bit model (~18.2 GB) leaving ample Metal working-set headroom for KV cache."
+                ),
+            ]
         )
     }
 
@@ -655,12 +811,12 @@ public final class BackendBridge: Sendable {
                 ),
                 telemetry: TelemetryModel(
                     architecture: "arm64",
-                    chipBrand: "Apple Silicon (Metal)",
-                    cpuPercent: 28,
-                    memoryPercent: 64,
-                    gpuPercent: 78,
+                    chipBrand: nativeSysctlString("machdep.cpu.brand_string") ?? "Apple Silicon (Metal)",
+                    cpuPercent: 18,
+                    memoryPercent: 52,
+                    gpuPercent: 24,
                     tokensProcessed: max(32, prompt.split(separator: " ").count * 3),
-                    unifiedMemoryGb: 36
+                    unifiedMemoryGb: max(8, Int(ProcessInfo.processInfo.physicalMemory / (1024 * 1024 * 1024)))
                 ),
                 guardianAudit: GuardianAuditModel(
                     sanitizedText: scan.sanitized,
@@ -752,12 +908,12 @@ public final class BackendBridge: Sendable {
             ),
             telemetry: TelemetryModel(
                 architecture: "arm64",
-                chipBrand: "Apple Silicon (Metal)",
-                cpuPercent: 30,
-                memoryPercent: 68,
-                gpuPercent: 81,
+                chipBrand: nativeSysctlString("machdep.cpu.brand_string") ?? "Apple Silicon (Metal)",
+                cpuPercent: 20,
+                memoryPercent: 54,
+                gpuPercent: 28,
                 tokensProcessed: max(48, prompt.split(separator: " ").count * 4),
-                unifiedMemoryGb: 36
+                unifiedMemoryGb: max(8, Int(ProcessInfo.processInfo.physicalMemory / (1024 * 1024 * 1024)))
             ),
             guardianAudit: GuardianAuditModel(
                 sanitizedText: scan.sanitized,
@@ -771,5 +927,86 @@ public final class BackendBridge: Sendable {
                 restoredCount: scan.entities.count
             )
         )
+    }
+}
+
+// MARK: - SSEStreamDelegate
+
+/// URLSession delegate that parses a Server-Sent Events stream from
+/// `POST /v1/tasks/stream` and forwards tokens and receipts to callbacks.
+///
+/// SSE format expected from the daemon:
+///   data: {"type":"token","text":"Hello"}\n\n
+///   data: {"type":"heartbeat"}\n\n
+///   data: [DONE]\n\n
+///   data: {"type":"receipt", ...}\n\n
+final class SSEStreamDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let onToken: @Sendable (String) -> Void
+    private let onReceipt: @Sendable ([String: Any]) -> Void
+    private let doneSignal = DispatchSemaphore(value: 0)
+    private var buffer = ""
+
+    init(
+        onToken: @escaping @Sendable (String) -> Void,
+        onReceipt: @escaping @Sendable ([String: Any]) -> Void
+    ) {
+        self.onToken = onToken
+        self.onReceipt = onReceipt
+    }
+
+    /// Block the calling thread until the stream ends.
+    func waitUntilDone() { doneSignal.wait() }
+
+    // MARK: URLSessionDataDelegate
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard let chunk = String(data: data, encoding: .utf8) else { return }
+        buffer += chunk
+        processBuffer()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        // Drain any remaining buffer content
+        if !buffer.isEmpty { processBuffer() }
+        doneSignal.signal()
+    }
+
+    // MARK: Private
+
+    private func processBuffer() {
+        // SSE events are delimited by double newlines.
+        while let range = buffer.range(of: "\n\n") {
+            let event = String(buffer[buffer.startIndex..<range.lowerBound])
+            buffer.removeSubrange(buffer.startIndex..<range.upperBound)
+            handle(event: event)
+        }
+    }
+
+    private func handle(event: String) {
+        for line in event.split(separator: "\n", omittingEmptySubsequences: false) {
+            let str = String(line)
+            guard str.hasPrefix("data: ") else { continue }
+            let payload = String(str.dropFirst(6))
+
+            if payload == "[DONE]" { continue }
+
+            guard let data = payload.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+
+            let type_ = json["type"] as? String ?? ""
+            switch type_ {
+            case "token":
+                if let text = json["text"] as? String {
+                    onToken(text)
+                }
+            case "receipt":
+                onReceipt(json)
+            case "heartbeat", "error":
+                break   // heartbeat is expected; errors surface in receipt
+            default:
+                break
+            }
+        }
     }
 }

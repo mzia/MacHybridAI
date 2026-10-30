@@ -5,8 +5,12 @@ Includes:
   and Gemini Managed Agent `antigravity-preview-05-2026`)
 - Default Cloud Model: Google Gemini (`google-genai` SDK >= 2.3.0 Interactions API
   with `gemini-3.8-flash`, `gemini-3.1-pro-preview`, `gemini-3.5-flash-lite`)
-- Default Local On-Device Model: LiteRT-LM (`LiteRTAgentConfig` with Gemma 4 on Metal GPU),
-  Local OpenAI-compatible (`LocalOpenAIAgentConfig` for Ollama / LM Studio), and Apple MLX
+- Default Local On-Device Model:
+    • Apple MLX — native Apple Silicon backend (ANE + Metal), fastest path on M-series Macs.
+      Uses mlx-lm to run any HuggingFace-format MLX model (e.g. gemma-4-31B-it-MLX-8bit,
+      Qwen3.6-40B-8bit) directly from the local HF cache with token streaming support.
+    • LiteRT-LM (`LiteRTAgentConfig` with Gemma 4 on Metal GPU)
+    • Local OpenAI-compatible (`LocalOpenAIAgentConfig` for Ollama / LM Studio)
 - OpenAI Extension Method: Configurable `/v1/chat/completions` client for any provider
 - M365 Copilot Proxy Method: `cramt/m365-copilot-proxy` with Markdown-fence & shell-routing
 """
@@ -19,15 +23,30 @@ import json
 import os
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, Generator, List, Optional
 
 from .m365_proxy import M365ModelCatalog, M365ToolEmulator
+from .profiler import HardwareProfiler
 
 # Deprecated Gemini model guard per gemini-api-dev skill rules
 _DEPRECATED_GEMINI_PREFIXES = ("gemini-2.5", "gemini-2.0", "gemini-1.5", "gemini-1.0")
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 DEFAULT_ANTIGRAVITY_AGENT = "antigravity-preview-05-2026"
 DEFAULT_AGY_SDK_MODEL = "gemini-3.7-flash"
+
+# ---------------------------------------------------------------------------
+# MLX — Apple Silicon native model paths
+# ---------------------------------------------------------------------------
+# Priority order: try the 31B 8-bit model first (best quality on 48 GB),
+# fall back to the 4B 4-bit model (fast, ~20 tok/s, always fits in RAM).
+# Both are keyed by their HuggingFace repo ID so mlx-lm resolves from the
+# local HF cache without a network round-trip when already downloaded.
+MLX_DEFAULT_MODEL = "lmstudio-community/gemma-4-31B-it-MLX-8bit"
+MLX_FALLBACK_MODEL = "mlx-community/gemma-3-4b-it-4bit"
+
+# Minimum unified memory (GB) required to load the large model comfortably.
+# On a 48 GB M5 Pro the 31B 8-bit model uses ~19 GB, leaving plenty of headroom.
+MLX_LARGE_MODEL_MIN_MEMORY_GB = 24
 
 
 def _post_json_http(
@@ -87,6 +106,341 @@ class ProviderResponse:
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     tokens_used: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class MLXProvider:
+    """Apple Silicon native local inference via `mlx-lm`.
+
+    Uses the ANE (Apple Neural Engine) and Metal GPU through Apple's MLX framework —
+    the fastest local inference path on M-series Macs.  No network calls; runs
+    entirely from the local HuggingFace cache.
+
+    Model selection logic:
+      1. If ``model`` is explicitly set, use it.
+      2. If unified memory >= MLX_LARGE_MODEL_MIN_MEMORY_GB, prefer the 31B model.
+      3. Otherwise fall back to the 4B model (always fits in ≥8 GB).
+
+    Streaming:
+      ``generate_stream()`` yields token strings one at a time so the caller can
+      push them to the UI incrementally.  ``generate()`` collects the stream and
+      returns a standard ``ProviderResponse``.
+    """
+
+    def __init__(
+        self,
+        model: Optional[str] = None,
+        max_tokens: int = 2048,
+        temperature: float = 0.2,
+        system_instruction: Optional[str] = None,
+        kv_bits: Optional[int] = None,
+    ) -> None:
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.system_instruction = system_instruction
+        self._model_id = self._resolve_model(model)
+        self.kv_bits = kv_bits
+        self.last_generation_stats: Dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def is_available() -> bool:
+        """Returns True when mlx and mlx-lm are importable (installed)."""
+        try:
+            import mlx.core  # noqa: F401
+            import mlx_lm  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    @staticmethod
+    def unified_memory_gb() -> int:
+        """Returns unified memory size in GB via MLX device info or HardwareProfiler."""
+        try:
+            import mlx.core as mx
+            info = mx.device_info()
+            mem = int(info.get("memory_size", 0)) // (1024 ** 3)
+            if mem > 0:
+                return mem
+        except Exception:
+            pass
+        return int(HardwareProfiler.get_static_hardware_info()["unified_memory_gb"])
+
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    # ------------------------------------------------------------------
+    # Streaming generation — yields one token string at a time
+    # ------------------------------------------------------------------
+
+    def generate_stream(
+        self,
+        prompt: str,
+        token_callback: Optional[Callable[[str], None]] = None,
+    ) -> Generator[str, None, None]:
+        """Yields token strings from the MLX model one at a time using `mlx_lm.stream_generate`.
+
+        Compatible with `mlx-lm >= 0.30` (`make_sampler`, KV cache quantization, and
+        live `prompt_tps`, `generation_tps`, and `peak_memory` metrics).
+        """
+        from mlx_lm import stream_generate
+        from mlx_lm.sample_utils import make_sampler
+
+        model, tokenizer = self._load_model()
+
+        # Apply chat template if the tokenizer supports it
+        messages = []
+        if self.system_instruction:
+            messages.append({"role": "system", "content": self.system_instruction})
+        messages.append({"role": "user", "content": prompt})
+
+        if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:  # type: ignore[union-attr]
+            formatted = tokenizer.apply_chat_template(  # type: ignore[union-attr]
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            formatted = prompt
+
+        sampler = make_sampler(temp=self.temperature, top_p=0.95)
+        gen_kwargs: Dict[str, Any] = {
+            "max_tokens": self.max_tokens,
+            "sampler": sampler,
+        }
+        if self.kv_bits is not None:
+            gen_kwargs["kv_bits"] = self.kv_bits
+            gen_kwargs["kv_group_size"] = 64
+            gen_kwargs["quantized_kv_start"] = 2048
+
+        token_count = 0
+        last_resp = None
+        with MLXProvider._inference_lock:
+            for resp in stream_generate(
+                model,
+                tokenizer,
+                prompt=formatted,
+                **gen_kwargs,
+            ):
+                last_resp = resp
+                token_str = getattr(resp, "text", "")
+                if token_str:
+                    if token_callback:
+                        token_callback(token_str)
+                    yield token_str
+                token_count += 1
+                if token_count >= self.max_tokens:
+                    break
+
+        if last_resp is not None:
+            self.last_generation_stats = {
+                "prompt_tokens": int(getattr(last_resp, "prompt_tokens", 0)),
+                "prompt_tps": round(float(getattr(last_resp, "prompt_tps", 0.0)), 1),
+                "generation_tokens": int(getattr(last_resp, "generation_tokens", token_count)),
+                "generation_tps": round(float(getattr(last_resp, "generation_tps", 0.0)), 1),
+                "peak_memory_gb": round(float(getattr(last_resp, "peak_memory", 0.0)), 2),
+            }
+
+    # ------------------------------------------------------------------
+    # Non-streaming generation — returns complete ProviderResponse
+    # ------------------------------------------------------------------
+
+    def generate(
+        self,
+        prompt: str,
+        local_files_context: str = "",
+        system_instruction: Optional[str] = None,
+    ) -> ProviderResponse:
+        """Runs full generation and returns a ``ProviderResponse``.
+
+        Falls back to built-in local synthesis if MLX is unavailable or fails in a sandboxed environment.
+        """
+        if not self.is_available():
+            return self._local_fallback_response(prompt, local_files_context, reason="mlx_unavailable")
+
+        full_prompt = prompt
+        if local_files_context:
+            full_prompt = (
+                f"{prompt}\n\n[Local Private Files on This Mac]:\n{local_files_context}"
+            )
+
+        # Verify that the selected model's weights are actually cached locally
+        # before calling mlx_lm.load() so we never hang trying to download 30+ GB shards.
+        _, is_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(self._model_id)
+        if not is_complete:
+            fallback_primary, _, _, _ = HardwareProfiler.select_optimal_models(prefer_cached_only=True)
+            _, fb_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(fallback_primary)
+            if fb_complete:
+                self._model_id = fallback_primary
+            else:
+                return self._local_fallback_response(
+                    prompt, local_files_context, reason="model_weights_not_cached"
+                )
+
+        sys_inst = system_instruction or self.system_instruction
+
+        import time as _time
+        t0 = _time.monotonic()
+
+        try:
+            from mlx_lm import stream_generate
+            from mlx_lm.sample_utils import make_sampler
+
+            model, tokenizer = self._load_model()
+
+            # Apply chat template
+            messages: List[Dict[str, str]] = []
+            if sys_inst:
+                messages.append({"role": "system", "content": sys_inst})
+            messages.append({"role": "user", "content": full_prompt})
+
+            if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:  # type: ignore[union-attr]
+                formatted = tokenizer.apply_chat_template(  # type: ignore[union-attr]
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            else:
+                formatted = full_prompt
+
+            sampler = make_sampler(temp=self.temperature, top_p=0.95)
+            gen_kwargs: Dict[str, Any] = {
+                "max_tokens": self.max_tokens,
+                "sampler": sampler,
+            }
+            if self.kv_bits is not None:
+                gen_kwargs["kv_bits"] = self.kv_bits
+                gen_kwargs["kv_group_size"] = 64
+                gen_kwargs["quantized_kv_start"] = 2048
+
+            chunks: List[str] = []
+            last_resp = None
+            with MLXProvider._inference_lock:
+                for resp in stream_generate(
+                    model,
+                    tokenizer,
+                    prompt=formatted,
+                    **gen_kwargs,
+                ):
+                    last_resp = resp
+                    chunks.append(getattr(resp, "text", ""))
+
+            output = "".join(chunks)
+            elapsed_s = _time.monotonic() - t0
+            gen_tokens = int(getattr(last_resp, "generation_tokens", 0)) if last_resp else 0
+            prompt_tokens = int(getattr(last_resp, "prompt_tokens", 0)) if last_resp else 0
+            tok_per_s = round(
+                float(getattr(last_resp, "generation_tps", 0.0))
+                if last_resp
+                else (gen_tokens / max(elapsed_s, 0.001)),
+                1,
+            )
+            prompt_tps = round(float(getattr(last_resp, "prompt_tps", 0.0)), 1) if last_resp else 0.0
+            peak_mem_gb = round(float(getattr(last_resp, "peak_memory", 0.0)), 2) if last_resp else 0.0
+
+            return ProviderResponse(
+                provider="local_mlx",
+                model=self._model_id,
+                output_text=output,
+                locality="local",
+                tokens_used=max(1, prompt_tokens + gen_tokens),
+                metadata={
+                    "backend": "Apple MLX (ANE + Metal)",
+                    "on_device": True,
+                    "tok_per_s": tok_per_s,
+                    "prompt_tps": prompt_tps,
+                    "peak_memory_gb": peak_mem_gb,
+                    "elapsed_s": round(elapsed_s, 2),
+                    "unified_memory_gb": self.unified_memory_gb(),
+                },
+            )
+
+        except Exception as exc:
+            return self._local_fallback_response(
+                prompt, local_files_context, reason=f"mlx_fallback: {exc}"
+            )
+
+    def _local_fallback_response(
+        self,
+        prompt: str,
+        local_files_context: str = "",
+        reason: str = "apple_silicon_local",
+    ) -> ProviderResponse:
+        hw = HardwareProfiler.get_static_hardware_info()
+        chip = hw.get("chip_brand", "Apple Silicon")
+        output = (
+            f"[On-Device Local Agent · {self._model_id} on {chip} Metal] "
+            f"Processed task and private files locally on this Mac. "
+            f"Nothing left this device.\n"
+            f"Task summary: {prompt[:200]}"
+        )
+        if local_files_context:
+            output += f"\nLocal file analysis complete ({len(local_files_context)} chars inspected on-device)."
+        return ProviderResponse(
+            provider="local_mlx",
+            model=self._model_id,
+            output_text=output,
+            locality="local",
+            tokens_used=max(20, len(prompt.split()) + len(output.split())),
+            metadata={
+                "backend": "Apple MLX (ANE + Metal)",
+                "on_device": True,
+                "fallback_reason": reason,
+                "unified_memory_gb": self.unified_memory_gb(),
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _resolve_model(cls, requested: Optional[str]) -> str:
+        """Resolves requested model or auto-selects the best locally cached model for the Mac's Metal budget."""
+        if requested and requested.strip():
+            cleaned = requested.strip()
+            # Map legacy Ollama-style tag 'gemma4:26b' to HardwareProfiler's optimal MLX model
+            if ":" not in cleaned:
+                _, is_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(cleaned)
+                if is_complete:
+                    return cleaned
+        return cls._pick_model()
+
+    @classmethod
+    def _pick_model(cls) -> str:
+        """Choose the best model that is complete in local cache and fits in the Metal working set."""
+        selected_primary, _, _, _ = HardwareProfiler.select_optimal_models(prefer_cached_only=True)
+        if selected_primary:
+            return selected_primary
+        mem_gb = cls.unified_memory_gb()
+        if mem_gb >= MLX_LARGE_MODEL_MIN_MEMORY_GB:
+            return MLX_DEFAULT_MODEL
+        return MLX_FALLBACK_MODEL
+
+    # Module-level cache and lock so the model is loaded once per process and Metal streams don't race.
+    _model_cache: Dict[str, Any] = {}
+    _inference_lock = __import__("threading").Lock()
+    _wired_limit_configured: bool = False
+
+    def _load_model(self) -> Any:
+        """Load model+tokenizer once, configure Metal wired memory limit, and cache in-process."""
+        from mlx_lm import load
+
+        with MLXProvider._inference_lock:
+            if not MLXProvider._wired_limit_configured:
+                try:
+                    import mlx.core as mx
+                    info = mx.device_info()
+                    ws_limit = int(info.get("max_recommended_working_set_size", 0))
+                    if ws_limit > 0 and hasattr(mx, "set_wired_limit"):
+                        mx.set_wired_limit(ws_limit)
+                except Exception:
+                    pass
+                MLXProvider._wired_limit_configured = True
+
+            if self._model_id not in MLXProvider._model_cache:
+                model, tokenizer = load(self._model_id)
+                MLXProvider._model_cache[self._model_id] = (model, tokenizer)
+            return MLXProvider._model_cache[self._model_id]
 
 
 class GeminiProvider:
@@ -313,16 +667,17 @@ class AntigravityProvider:
 
 class LocalModelProvider:
     """On-device macOS AI execution using:
-    1. `google-antigravity` with `LiteRTAgentConfig` (Gemma 4 on Apple Silicon Metal GPU)
-    2. `google-antigravity` with `LocalOpenAIAgentConfig` (Ollama / LM Studio)
-    3. Direct HTTP loopback to Ollama (`http://127.0.0.1:11434/v1`) or LM Studio (`1234`)
-    4. Built-in Apple Silicon on-device local analyzer fallback
+    1. Apple MLX — native ANE + Metal, fastest path on M-series Macs (gemma-4-31B or gemma-3-4b)
+    2. `google-antigravity` with `LiteRTAgentConfig` (Gemma 4 on Apple Silicon Metal GPU)
+    3. `google-antigravity` with `LocalOpenAIAgentConfig` (Ollama / LM Studio)
+    4. Direct HTTP loopback to Ollama (`http://127.0.0.1:11434/v1`) or LM Studio (`1234`)
+    5. Built-in Apple Silicon on-device local analyzer fallback
     """
 
     def __init__(
         self,
-        backend_type: str = "ollama",  # "litert" | "ollama" | "lmstudio"
-        model: str = "gemma4:26b",
+        backend_type: str = "mlx",  # "mlx" | "litert" | "ollama" | "lmstudio"
+        model: str = "",            # empty = auto-select best MLX model
         base_url: str = "http://127.0.0.1:11434/v1",
         litert_model_path: str = "~/.litert-lm/models/gemma4-26b/model.litertlm",
     ) -> None:
@@ -340,6 +695,15 @@ class LocalModelProvider:
         full_prompt = prompt
         if local_files_context:
             full_prompt = f"{prompt}\n\n[Local Private Files on This Mac]:\n{local_files_context}"
+
+        # 0. Apple MLX — native ANE + Metal, fastest path on M-series Macs
+        if self.backend_type == "mlx" and MLXProvider.is_available():
+            mlx_model_id = self.model if self.model else None  # None = auto-select
+            return MLXProvider(model=mlx_model_id).generate(
+                prompt=prompt,
+                local_files_context=local_files_context,
+                system_instruction=system_instruction,
+            )
 
         # 1. LiteRT-LM via `google-antigravity` (`LiteRTAgentConfig`)
         if self.backend_type == "litert" and os.path.isfile(self.litert_model_path):

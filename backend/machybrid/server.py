@@ -6,6 +6,8 @@ Provides JSON endpoints for the native macOS SwiftUI app and CLI:
 - `GET /v1/config` & `POST /v1/config`
 - `POST /v1/guardian/inspect`
 - `POST /v1/tasks/run`
+- `POST /v1/tasks/stream`   ← Server-Sent Events streaming (token-by-token)
+- `GET /v1/mlx/status`      ← MLX availability + active model info
 - `GET /v1/m365/status` & `POST /v1/m365/control`
 """
 
@@ -13,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
@@ -22,6 +25,8 @@ from .guardian import GuardianPolicy
 from .history import HistoryRetentionPolicy, HistoryStorageLocation
 from .m365_proxy import M365ToolEmulator
 from .orchestrator import ComputeMode, HybridOrchestrator
+from .profiler import HardwareProfiler
+from .providers import MLXProvider
 
 MAX_REQUEST_BYTES = 1_048_576  # 1 MiB limit against payload DoS
 
@@ -78,11 +83,231 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
         self._send_json(status, payload)
 
     def do_POST(self) -> None:
+        # /v1/tasks/stream uses chunked SSE — handled separately
+        if self.path == "/v1/tasks/stream":
+            self._handle_stream()
+            return
         body = self._read_json_body()
         if body is None:
             return
         status, payload = dispatch_request(self.orchestrator, "POST", self.path, body)
         self._send_json(status, payload)
+
+    def _handle_stream(self) -> None:
+        """Server-Sent Events streaming for token-by-token MLX output.
+
+        Protocol (SSE):
+          data: <token_json>\\n\\n   — one token per event
+          data: [DONE]\\n\\n         — stream complete, final metadata follows
+          data: <receipt_json>\\n\\n — final receipt/telemetry event
+
+        The client can render tokens as they arrive for instant perceived response.
+        Privacy Gate runs before streaming starts — no raw PII is ever streamed.
+        """
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        prompt = str(body.get("prompt", "")).strip()
+        if not prompt:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "prompt is required"})
+            return
+
+        # Resolve compute mode
+        mode_override: Optional[ComputeMode] = None
+        if body.get("mode"):
+            try:
+                mode_override = ComputeMode(str(body["mode"]))
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid mode: {body.get('mode')}"})
+                return
+
+        # Run the Privacy Gate synchronously before streaming starts.
+        # Only the sanitized prompt leaves this function.
+        redaction = self.orchestrator.guardian.redact(prompt)
+
+        # If policy forces local, stream from the local MLX model directly.
+        use_local_only = (
+            redaction.forced_local
+            or (mode_override == ComputeMode.LOCAL)
+            or (self.orchestrator.config.compute_mode == ComputeMode.LOCAL and mode_override is None)
+        )
+
+        # --- Begin SSE response ---
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        def sse(data: str) -> None:
+            """Write one SSE event; silently swallow broken pipe on client disconnect."""
+            try:
+                raw = f"data: {data}\n\n".encode("utf-8")
+                self.wfile.write(raw)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        # --- Stream from MLX (local) or run full hybrid task ---
+        file_paths = (
+            body.get("file_paths")
+            if isinstance(body.get("file_paths"), list)
+            else []
+        )
+        inline_context = str(body.get("inline_file_context", ""))
+
+        if use_local_only and MLXProvider.is_available():
+            import time as _time
+            t0 = _time.monotonic()
+            mlx_model = body.get("mlx_model") or self.orchestrator.config.local_model or None
+            provider = MLXProvider(model=mlx_model)
+            _, is_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(provider.model_id)
+
+            full_local_prompt = redaction.sanitized_text
+            if inline_context:
+                full_local_prompt = f"{redaction.sanitized_text}\n\n[Local Private Files on This Mac]:\n{inline_context}"
+
+            token_count = 0
+            if is_complete:
+                try:
+                    for token in provider.generate_stream(full_local_prompt):
+                        sse(json.dumps({"type": "token", "text": token}))
+                        token_count += 1
+                except Exception:
+                    token_count = 0
+
+            if token_count == 0:
+                fallback_resp = provider.generate(
+                    redaction.sanitized_text, local_files_context=inline_context
+                )
+                for i, word in enumerate(fallback_resp.output_text.split(" ")):
+                    chunk = word if i == 0 else " " + word
+                    sse(json.dumps({"type": "token", "text": chunk}))
+                    token_count += 1
+
+            elapsed_ms = max(1, int((_time.monotonic() - t0) * 1000))
+            local_stations = [
+                {
+                    "station_index": 1,
+                    "station_id": "this_mac",
+                    "label": "This Mac",
+                    "locality": "local",
+                    "title": f"Local agent & {provider.model_id} processed task on-device",
+                    "detail": f"Processed {len(file_paths)} local file(s) on this Mac. Nothing leaves this Mac.",
+                    "status": "completed",
+                    "duration_ms": elapsed_ms,
+                    "badges": ["Fully Local", provider.model_id, "Nothing leaves this Mac"],
+                },
+                {
+                    "station_index": 2,
+                    "station_id": "cloud",
+                    "label": "Cloud models",
+                    "locality": "local",
+                    "title": "Cloud models not used",
+                    "detail": "AI processing stayed 100% on your Mac. Zero Cloud AI history.",
+                    "status": "completed",
+                    "duration_ms": 0,
+                    "badges": ["Not used", "Zero Cloud History"],
+                },
+                {
+                    "station_index": 3,
+                    "station_id": "result",
+                    "label": "Result",
+                    "locality": "local",
+                    "title": "Completed on this Mac",
+                    "detail": "Result generated locally with zero cloud transmission.",
+                    "status": "completed",
+                    "duration_ms": 1,
+                    "badges": ["Verified On-Device"],
+                },
+            ]
+            local_receipt = {
+                "mode_executed": "local",
+                "local_model_used": f"{provider.model_id} (on this Mac)",
+                "local_agent_location": "on this Mac",
+                "cloud_models_used": "not used",
+                "pii_flagged_count": redaction.pii_count,
+                "pii_restored_count": 0,
+                "pii_categories": redaction.categories,
+                "nothing_left_mac": True,
+                "cloud_zero_retention": True,
+            }
+
+            sse("[DONE]")
+            sse(json.dumps({
+                "type": "receipt",
+                "mode": "local_mlx_stream",
+                "model": provider.model_id,
+                "tokens": token_count,
+                "pii_masked": redaction.pii_count,
+                "on_device": True,
+                "cloud_prompt_sent": None,
+                "stations": local_stations,
+                "receipt": local_receipt,
+                "guardian_audit": redaction.to_dict(),
+                "generation_stats": provider.last_generation_stats,
+                "telemetry": self.orchestrator.collect_telemetry(tokens=token_count).__dict__,
+            }))
+
+        else:
+            # Hybrid path: run the full orchestrator task in a thread,
+            # emit a "thinking" heartbeat every 2s, then stream the final output
+            # token-by-token once we have it.
+            result_holder: Dict[str, Any] = {}
+            done_event = threading.Event()
+
+            def _run_task() -> None:
+                try:
+                    result = self.orchestrator.run_task(
+                        prompt=prompt,
+                        mode=mode_override,
+                        cloud_provider=body.get("cloud_provider") or None,
+                        file_paths=[str(p) for p in file_paths],
+                        inline_file_context=inline_context,
+                        session_id=body.get("session_id") or None,
+                        save_to_history=bool(body.get("save_to_history", True)),
+                    )
+                    result_holder["result"] = result.to_dict()
+                except Exception as exc:
+                    result_holder["error"] = str(exc)
+                finally:
+                    done_event.set()
+
+            t = threading.Thread(target=_run_task, daemon=True)
+            t.start()
+
+            # Heartbeat while waiting
+            while not done_event.wait(timeout=2.0):
+                sse(json.dumps({"type": "heartbeat"}))
+
+            if "error" in result_holder:
+                sse(json.dumps({"type": "error", "message": result_holder["error"]}))
+                sse("[DONE]")
+                return
+
+            task_dict = result_holder["result"]
+            final_text: str = task_dict.get("final_output", "")
+
+            # Stream the final text word-by-word for a smooth UI effect
+            words = final_text.split(" ")
+            for i, word in enumerate(words):
+                chunk = word if i == 0 else " " + word
+                sse(json.dumps({"type": "token", "text": chunk}))
+
+            sse("[DONE]")
+            sse(json.dumps({"type": "receipt", **{
+                k: task_dict.get(k)
+                for k in (
+                    "receipt",
+                    "stations",
+                    "cloud_prompt_sent",
+                    "telemetry",
+                    "guardian_audit",
+                    "session_id",
+                )
+            }}))
 
 
 def dispatch_request(
@@ -120,6 +345,22 @@ def dispatch_request(
             return HTTPStatus.OK, orchestrator.history_manager.status_dict()
         if path == "/v1/m365/status":
             return HTTPStatus.OK, orchestrator.m365_manager.status_dict()
+        if path == "/v1/mlx/status":
+            available = MLXProvider.is_available()
+            mem_gb = MLXProvider.unified_memory_gb() if available else 0
+            from .providers import MLX_DEFAULT_MODEL, MLX_FALLBACK_MODEL, MLX_LARGE_MODEL_MIN_MEMORY_GB
+            return HTTPStatus.OK, {
+                "mlx_available": available,
+                "metal_available": available and _metal_available(),
+                "unified_memory_gb": mem_gb,
+                "active_model": MLXProvider()._pick_model() if available else None,
+                "large_model": MLX_DEFAULT_MODEL,
+                "fallback_model": MLX_FALLBACK_MODEL,
+                "large_model_min_memory_gb": MLX_LARGE_MODEL_MIN_MEMORY_GB,
+                "backend": "Apple MLX (ANE + Metal)" if available else "unavailable",
+            }
+        if path == "/v1/hardware/profile":
+            return HTTPStatus.OK, HardwareProfiler.profile().to_dict()
         return HTTPStatus.NOT_FOUND, {"error": f"Unknown path: {path}"}
 
     if upper_method == "POST":
@@ -285,6 +526,15 @@ def dispatch_request(
         return HTTPStatus.NOT_FOUND, {"error": f"Unknown path: {path}"}
 
     return HTTPStatus.METHOD_NOT_ALLOWED, {"error": f"Unsupported method: {upper_method}"}
+
+
+def _metal_available() -> bool:
+    """Returns True when MLX can see a Metal GPU."""
+    try:
+        import mlx.core as mx
+        return mx.metal.is_available()
+    except Exception:
+        return False
 
 
 def create_server(

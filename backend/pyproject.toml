@@ -26,6 +26,10 @@ cloud = [
 local = [
     "litert-lm>=0.15.0",
 ]
+local-mlx = [
+    "mlx>=0.22.0",
+    "mlx-lm>=0.22.0",
+]
 dev = [
     "pytest==8.3.5",
     "pytest-cov==6.1.0",
