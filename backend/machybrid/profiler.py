@@ -372,6 +372,16 @@ class HardwareProfiler:
         except Exception:
             return 50, round(total_gb * 0.5, 2)
 
+    @staticmethod
+    def _is_safe_repo_id(repo_id: str) -> bool:
+        """Validates that a model identifier contains no path traversal or unsafe characters."""
+        if not repo_id or ".." in repo_id or "\\" in repo_id or "\x00" in repo_id:
+            return False
+        if repo_id.startswith("/") or repo_id.endswith("/"):
+            return False
+        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:")
+        return all(ch in allowed for ch in repo_id)
+
     @classmethod
     def inspect_hf_model_cache(
         cls,
@@ -380,22 +390,50 @@ class HardwareProfiler:
     ) -> Tuple[bool, bool, int, str, int]:
         """Inspects whether a HuggingFace model is cached locally and whether all `.safetensors` weight shards exist.
 
+        Uses directory enumeration (`iterdir()`) rather than user-derived path concatenation
+        to prevent CWE-22 path injection.
+
         Returns:
             `(is_cached, is_complete, size_bytes, snapshot_path, missing_shards)`
         """
+        if not cls._is_safe_repo_id(repo_id):
+            return False, False, 0, "", 0
+
         hub_root = hf_hub_dir or Path(
             os.environ.get(
                 "HF_HUB_CACHE",
                 os.path.expanduser("~/.cache/huggingface/hub"),
             )
         )
+        try:
+            if not hub_root.is_dir():
+                return False, False, 0, "", 0
+        except OSError:
+            return False, False, 0, "", 0
+
         folder_name = "models--" + repo_id.replace("/", "--")
-        model_dir = hub_root / folder_name
-        if not model_dir.is_dir():
+        model_dir: Optional[Path] = None
+        try:
+            for child in hub_root.iterdir():
+                if child.name == folder_name and child.is_dir():
+                    model_dir = child
+                    break
+        except OSError:
+            return False, False, 0, "", 0
+
+        if model_dir is None:
             return False, False, 0, "", 0
 
         snapshots_dir = model_dir / "snapshots"
         if not snapshots_dir.is_dir():
+            return True, False, 0, str(model_dir), 1
+
+        try:
+            snap_dirs = [p for p in snapshots_dir.iterdir() if p.is_dir()]
+        except OSError:
+            snap_dirs = []
+
+        if not snap_dirs:
             return True, False, 0, str(model_dir), 1
 
         # Prefer snapshot pointed to by refs/main if present
@@ -404,41 +442,42 @@ class HardwareProfiler:
         if ref_main.is_file():
             try:
                 commit_hash = ref_main.read_text(encoding="utf-8").strip()
-                candidate = snapshots_dir / commit_hash
-                if candidate.is_dir():
-                    target_snap = candidate
+                for snap in snap_dirs:
+                    if snap.name == commit_hash:
+                        target_snap = snap
+                        break
             except OSError:
                 pass
 
         if target_snap is None:
             snaps = sorted(
-                [p for p in snapshots_dir.iterdir() if p.is_dir()],
+                snap_dirs,
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             )
-            if snaps:
-                target_snap = snaps[0]
+            target_snap = snaps[0]
 
-        if target_snap is None:
-            return True, False, 0, str(model_dir), 1
+        try:
+            snap_files = {p.name: p for p in target_snap.iterdir() if p.is_file()}
+        except OSError:
+            return True, False, 0, str(target_snap), 1
 
         # Check config.json
-        config_file = target_snap / "config.json"
-        if not config_file.exists():
+        if "config.json" not in snap_files:
             return True, False, 0, str(target_snap), 1
 
         # Verify weight shards via single model.safetensors OR model.safetensors.index.json
-        index_file = target_snap / "model.safetensors.index.json"
-        single_weight = target_snap / "model.safetensors"
+        single_weight = snap_files.get("model.safetensors")
+        index_file = snap_files.get("model.safetensors.index.json")
         missing_shards = 0
         total_bytes = 0
 
-        if single_weight.exists() and single_weight.is_file():
+        if single_weight is not None:
             try:
                 total_bytes += single_weight.stat().st_size
             except OSError:
                 pass
-        elif index_file.is_file():
+        elif index_file is not None:
             try:
                 idx_data = json.loads(index_file.read_text(encoding="utf-8"))
                 weight_map = idx_data.get("weight_map", {})
@@ -446,8 +485,8 @@ class HardwareProfiler:
                 if not shard_files:
                     missing_shards = 1
                 for shard_name in shard_files:
-                    shard_path = target_snap / shard_name
-                    if shard_path.exists() and shard_path.is_file():
+                    shard_path = snap_files.get(str(shard_name))
+                    if shard_path is not None:
                         try:
                             total_bytes += shard_path.stat().st_size
                         except OSError:
@@ -458,18 +497,15 @@ class HardwareProfiler:
                 missing_shards = 1
         else:
             # Check for any *.safetensors shard if no index file
-            shards = list(target_snap.glob("*.safetensors"))
+            shards = [p for name, p in snap_files.items() if name.endswith(".safetensors")]
             if not shards:
                 missing_shards = 1
             else:
                 for s in shards:
-                    if s.is_file():
-                        try:
-                            total_bytes += s.stat().st_size
-                        except OSError:
-                            pass
-                    else:
-                        missing_shards += 1
+                    try:
+                        total_bytes += s.stat().st_size
+                    except OSError:
+                        pass
 
         is_complete = missing_shards == 0 and total_bytes > 0
         return True, is_complete, total_bytes, str(target_snap), missing_shards
