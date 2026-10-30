@@ -214,6 +214,14 @@ class TestRealTelemetry(unittest.TestCase):
             self.assertFalse(complete_bad)
             self.assertGreaterEqual(missing_bad, 1)
 
+            # 3. Verify path-traversal model IDs are strictly rejected
+            for bad_id in ("../../etc/passwd", "/etc/hosts", "org/../../secret", "org\\model"):
+                cached_p, complete_p, _, _, _ = HardwareProfiler.inspect_hf_model_cache(
+                    bad_id, hf_hub_dir=hub
+                )
+                self.assertFalse(cached_p)
+                self.assertFalse(complete_p)
+
             profile = HardwareProfiler.profile(hf_hub_dir=hub)
             # Because 31B is incomplete in cache, profiler must select the complete 4B model
             self.assertEqual(profile.selected_local_model, "mlx-community/gemma-3-4b-it-4bit")
