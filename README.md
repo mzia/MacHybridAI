@@ -6,9 +6,29 @@
 
 ---
 
+## Native macOS Installation Package (`.dmg` & `.pkg`)
+
+Always-up-to-date native Apple Silicon (`arm64` Metal / MLX) & macOS 14+ installers are built and published automatically on [GitHub Releases](https://github.com/mzia/MacHybridAI/releases):
+
+| Package Format | Download Link | Description |
+| :--- | :--- | :--- |
+| **macOS Disk Image (`.dmg`)** | [**`MacHybridAI-latest.dmg`**](https://github.com/mzia/MacHybridAI/releases/latest/download/MacHybridAI-latest.dmg) | Drag-and-drop `MacHybridAI.app` into `/Applications` |
+| **macOS Package Installer (`.pkg`)** | [**`MacHybridAI-latest.pkg`**](https://github.com/mzia/MacHybridAI/releases/latest/download/MacHybridAI-latest.pkg) | Standard macOS Installer package targeting `/Applications/MacHybridAI.app` |
+| **Zipped App Archive (`.app.zip`)** | [**`MacHybridAI-latest-macos-arm64.app.zip`**](https://github.com/mzia/MacHybridAI/releases/latest/download/MacHybridAI-latest-macos-arm64.app.zip) | Self-contained app bundle with embedded Python Hybrid Engine |
+| **SHA-256 Checksums** | [**`SHA256SUMS.txt`**](https://github.com/mzia/MacHybridAI/releases/latest/download/SHA256SUMS.txt) | Cryptographic SHA-256 digests for all release artifacts |
+
+---
+
 ## Key Features
 
-### 1. Two Ways to Run Computer: Fully Local or Hybrid
+### 1. Apple Silicon Hardware Profiler, Metal Benchmark & Thermal/RAM Guardrail
+- **Hardware-Aware Model Sizing (`HardwareProfiler`)**: Automatically detects Apple Silicon SoC topology (Performance + Efficiency CPU cores, GPU cores via `IOAccelerator` `ioreg`, Unified Memory, and Metal `max_recommended_working_set_size`).
+- **Local Cache Shard Validator**: Verifies HuggingFace cache completeness (`model.safetensors` / `model.safetensors.index.json` shards) before calling `mlx_lm.load()` so uncached multi-GB models never hang inference.
+- **1-Click Apple Silicon Benchmark (`/v1/hardware/benchmark`)**: Measures live **Time-to-First-Token (TTFT ms)**, **Prefill tok/s**, **Decode tok/s**, and **Peak Metal Memory (GB)** directly from the SwiftUI Hardware Optimizer panel or Menu Bar popover.
+- **Thermal & Unified Memory Pressure Guardrail**: Monitors thermal state (`nominal`, `fair`, `serious`, `critical`) and unified memory pressure, automatically stepping down to a compact 4-bit model (`mlx-community/gemma-3-4b-it-4bit`) if memory usage exceeds 85% or thermal pressure spikes.
+- **Native `MenuBarExtra` Quick-Prompt HUD**: Always-accessible macOS menu bar item (`M⇄AI`) with live GPU/RAM/Thermal badges, PII mask counter, 1-click Metal benchmark, and instant Local/Hybrid chat.
+
+### 2. Two Ways to Run Computer: Fully Local or Hybrid
 - **Fully Local Mode (`local`)**: Both the model and the agent directing the task run on your Mac (via `google-antigravity` `LiteRTAgentConfig` on Apple Silicon Metal GPU, `LocalOpenAIAgentConfig` with Ollama/LM Studio, or native on-device processing). **Nothing leaves your Mac.**
 - **Hybrid Mode (`hybrid`)**:
   1. **This Mac**: Local agent processes private files on your Mac.

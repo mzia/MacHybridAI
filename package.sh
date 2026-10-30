@@ -2,18 +2,20 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+PROJECT_DIR="$(pwd)"
 
 APP_NAME="MacHybridAI"
-VERSION="1.0.0"
+VERSION="${MAC_HYBRID_VERSION:-$(tr -d '[:space:]' < "${PROJECT_DIR}/VERSION" 2>/dev/null || echo "1.1.0")}"
 DIST_DIR="dist"
 APP_BUNDLE="${APP_NAME}.app"
 
-echo "==> [1/3] Building & Bundling ${APP_NAME}..."
+echo "==> [1/4] Building & Bundling ${APP_NAME} v${VERSION}..."
 ./bundle.sh
 
+rm -rf "${DIST_DIR}"
 mkdir -p "${DIST_DIR}"
 
-echo "==> [2/3] Generating macOS Installer Package (.pkg)..."
+echo "==> [2/4] Generating macOS Installer Package (.pkg)..."
 PKG_FILE="${DIST_DIR}/${APP_NAME}-${VERSION}.pkg"
 pkgbuild --install-location "/Applications" \
          --component "${APP_BUNDLE}" \
@@ -21,9 +23,13 @@ pkgbuild --install-location "/Applications" \
          --version "${VERSION}" \
          "${PKG_FILE}"
 
-echo "    Created: ${PKG_FILE}"
+cp "${PKG_FILE}" "${DIST_DIR}/${APP_NAME}-latest.pkg"
+if [ "${VERSION}" != "1.0.0" ]; then
+    cp "${PKG_FILE}" "${DIST_DIR}/${APP_NAME}-1.0.0.pkg"
+fi
+echo "    Created: ${PKG_FILE} & ${DIST_DIR}/${APP_NAME}-latest.pkg"
 
-echo "==> [3/3] Generating Drag-and-Drop Disk Image (.dmg)..."
+echo "==> [3/4] Generating Drag-and-Drop Disk Image (.dmg)..."
 DMG_FILE="${DIST_DIR}/${APP_NAME}-${VERSION}.dmg"
 DMG_STAGE="dmg_stage"
 
@@ -40,5 +46,21 @@ hdiutil create -volname "${APP_NAME}" \
                "${DMG_FILE}"
 
 rm -rf "${DMG_STAGE}"
-echo "    Created: ${DMG_FILE}"
+cp "${DMG_FILE}" "${DIST_DIR}/${APP_NAME}-latest.dmg"
+if [ "${VERSION}" != "1.0.0" ]; then
+    cp "${DMG_FILE}" "${DIST_DIR}/${APP_NAME}-1.0.0.dmg"
+fi
+echo "    Created: ${DMG_FILE} & ${DIST_DIR}/${APP_NAME}-latest.dmg"
+
+echo "==> [4/4] Generating Zipped App Archive (.app.zip) & SHA-256 Checksums..."
+ZIP_FILE="${DIST_DIR}/${APP_NAME}-${VERSION}-macos-arm64.app.zip"
+ditto -c -k --sequesterRsrc --keepParent "${APP_BUNDLE}" "${ZIP_FILE}"
+cp "${ZIP_FILE}" "${DIST_DIR}/${APP_NAME}-latest-macos-arm64.app.zip"
+
+(
+    cd "${DIST_DIR}"
+    shasum -a 256 *.pkg *.dmg *.zip > SHA256SUMS.txt
+)
+
+echo "    Created: ${ZIP_FILE} & ${DIST_DIR}/SHA256SUMS.txt"
 ls -lh "${DIST_DIR}"

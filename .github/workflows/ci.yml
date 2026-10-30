@@ -90,11 +90,13 @@ jobs:
           test -f "MacHybridAI.app/Contents/MacOS/MacHybridAI"
           test -f "MacHybridAI.app/Contents/Resources/backend/machybrid/server.py"
 
-      - name: Build macOS Distributables (.pkg & .dmg)
+      - name: Build macOS Distributables (.pkg, .dmg, .app.zip & SHA256SUMS)
         run: |
           ./package.sh
-          test -f dist/MacHybridAI-1.0.0.pkg
-          test -f dist/MacHybridAI-1.0.0.dmg
+          test -f dist/MacHybridAI-latest.pkg
+          test -f dist/MacHybridAI-latest.dmg
+          test -f dist/MacHybridAI-latest-macos-arm64.app.zip
+          test -f dist/SHA256SUMS.txt
 
       - name: Upload macOS Installer Artifacts
         uses: actions/upload-artifact@v7

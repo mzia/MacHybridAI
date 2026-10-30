@@ -206,6 +206,10 @@ final class HybridAppViewModel: ObservableObject {
     @Published var inspectorAudit: GuardianAuditModel?
     @Published var selectedTab: Int = 0
     @Published var hardwareProfile: MacHardwareProfileModel?
+    @Published var latestBenchmark: HardwareBenchmarkResultModel?
+    @Published var isBenchmarking: Bool = false
+    @Published var lastPullResult: ModelPullResultModel?
+    @Published var isPullingModelId: String?
 
     private let historyStore = PromptHistoryStore()
 
@@ -243,6 +247,38 @@ final class HybridAppViewModel: ObservableObject {
         self.localModel = modelId
         Task.detached(priority: .utility) {
             BackendBridge.shared.updateBackendConfig(body: ["local_model": modelId])
+        }
+    }
+
+    func runBenchmark(for modelId: String? = nil) {
+        guard !isBenchmarking else { return }
+        isBenchmarking = true
+        let target = modelId ?? localModel
+        Task.detached(priority: .userInitiated) {
+            let bench = BackendBridge.shared.runHardwareBenchmark(modelId: target)
+            let updatedProfile = BackendBridge.shared.fetchHardwareProfile()
+            await MainActor.run {
+                self.latestBenchmark = bench
+                self.hardwareProfile = updatedProfile
+                self.isBenchmarking = false
+            }
+        }
+    }
+
+    func verifyOrPullModel(_ modelId: String, allowDownload: Bool = false) {
+        guard isPullingModelId == nil else { return }
+        isPullingModelId = modelId
+        Task.detached(priority: .userInitiated) {
+            let res = BackendBridge.shared.pullOrVerifyLocalModel(modelId: modelId, allowDownload: allowDownload)
+            let updatedProfile = BackendBridge.shared.fetchHardwareProfile()
+            await MainActor.run {
+                self.lastPullResult = res
+                self.hardwareProfile = updatedProfile
+                self.isPullingModelId = nil
+                if res.isComplete {
+                    self.selectRecommendedModel(res.modelId)
+                }
+            }
         }
     }
 
@@ -1354,6 +1390,9 @@ struct ProvidersConfigTabView: View {
                                 .font(.caption)
                             Label(String(format: "RAM Used: %d%% (%.1f GB free)", hw.memoryUsedPercent, hw.availableMemoryGb), systemImage: "memorychip")
                                 .font(.caption)
+                            Label("Thermal: \(hw.thermalState.capitalized)", systemImage: "thermometer.medium")
+                                .font(.caption)
+                                .foregroundStyle(hw.thermalState == "nominal" ? .green : .orange)
                             if let kv = hw.recommendedKvBits {
                                 Label("Recommended KV Cache: \(kv)-bit", systemImage: "bolt.horizontal.fill")
                                     .font(.caption.bold())
@@ -1361,10 +1400,86 @@ struct ProvidersConfigTabView: View {
                             }
                         }
 
+                        if hw.guardrailTriggered {
+                            HStack(spacing: 8) {
+                                Image(systemName: "exclamationmark.shield.fill")
+                                    .foregroundStyle(.orange)
+                                Text(hw.guardrailReason)
+                                    .font(.caption2.bold())
+                                    .foregroundStyle(.orange)
+                                Spacer()
+                            }
+                            .padding(8)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.15)))
+                        }
+
+                        // 1-Click Apple Silicon Hardware Benchmark Card
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Label("Apple Silicon Metal Benchmark (TTFT · Prefill · Decode · Peak Memory)", systemImage: "speedometer")
+                                    .font(.caption.bold())
+                                Spacer()
+                                Button(vm.isBenchmarking ? "Benchmarking..." : "Run 1-Click Benchmark") {
+                                    vm.runBenchmark(for: vm.localModel)
+                                }
+                                .controlSize(.small)
+                                .buttonStyle(.borderedProminent)
+                                .disabled(vm.isBenchmarking)
+                            }
+
+                            if let bench = vm.latestBenchmark {
+                                HStack(spacing: 16) {
+                                    Label(String(format: "TTFT: %.1f ms", bench.ttftMs), systemImage: "timer")
+                                        .font(.caption2.bold())
+                                    Label(String(format: "Prefill: %.1f tok/s", bench.prefillTps), systemImage: "bolt.fill")
+                                        .font(.caption2.bold())
+                                        .foregroundStyle(.cyan)
+                                    Label(String(format: "Decode: %.1f tok/s", bench.decodeTps), systemImage: "gauge.with.dots.needle.67percent")
+                                        .font(.caption2.bold())
+                                        .foregroundStyle(.green)
+                                    Label(String(format: "Peak Metal: %.2f GB", bench.peakMemoryGb), systemImage: "memorychip.fill")
+                                        .font(.caption2.bold())
+                                    Text(bench.backend)
+                                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Capsule().fill(Color.blue.opacity(0.2)))
+                                }
+                            }
+                        }
+                        .padding(10)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.22)))
+
                         Divider()
 
-                        Text("Hardware-Matched Model Sizing & Local Cache Status")
-                            .font(.subheadline.bold())
+                        HStack {
+                            Text("Hardware-Matched Model Sizing & Local Cache Status")
+                                .font(.subheadline.bold())
+                            Spacer()
+                            Button("Refresh Cache") {
+                                vm.refreshHardwareProfile()
+                            }
+                            .controlSize(.mini)
+                        }
+
+                        if let pullRes = vm.lastPullResult {
+                            HStack(spacing: 8) {
+                                Image(systemName: pullRes.isComplete ? "checkmark.circle.fill" : "arrow.down.circle.fill")
+                                    .foregroundStyle(pullRes.isComplete ? .green : .cyan)
+                                Text(pullRes.message)
+                                    .font(.caption2)
+                                Spacer()
+                                if !pullRes.cliCommand.isEmpty {
+                                    Button("Copy CLI Command") {
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(pullRes.cliCommand, forType: .string)
+                                    }
+                                    .controlSize(.mini)
+                                }
+                            }
+                            .padding(8)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.cyan.opacity(0.12)))
+                        }
 
                         ForEach(hw.recommendations) { rec in
                             HStack(alignment: .top, spacing: 10) {
@@ -1401,6 +1516,13 @@ struct ProvidersConfigTabView: View {
                                         .foregroundStyle(.secondary)
                                 }
                                 Spacer()
+                                if !rec.isReadyLocally {
+                                    Button(vm.isPullingModelId == rec.modelId ? "Pulling..." : "Download / Verify") {
+                                        vm.verifyOrPullModel(rec.modelId, allowDownload: true)
+                                    }
+                                    .controlSize(.small)
+                                    .disabled(vm.isPullingModelId != nil)
+                                }
                                 Button(vm.localModel == rec.modelId ? "Active" : "Use Model") {
                                     vm.selectRecommendedModel(rec.modelId)
                                 }
@@ -1464,6 +1586,42 @@ struct MenuBarHybridPanelView: View {
                         .foregroundStyle(.green)
                 }
                 Spacer()
+                if let hw = vm.hardwareProfile {
+                    Text("\(hw.chipBrand) · \(hw.unifiedMemoryGb)GB")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(Color.cyan.opacity(0.2)))
+                        .foregroundStyle(.cyan)
+                }
+            }
+
+            if let hw = vm.hardwareProfile {
+                HStack(spacing: 8) {
+                    Label("GPU \(hw.gpuBusyPercent)%", systemImage: "sparkles.tv")
+                        .font(.system(size: 10))
+                    Label("RAM \(hw.memoryUsedPercent)%", systemImage: "memorychip")
+                        .font(.system(size: 10))
+                    Label(hw.guardrailTriggered ? "Guardrail" : hw.thermalState.capitalized, systemImage: "thermometer.medium")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(hw.guardrailTriggered ? .orange : .green)
+                    Spacer()
+                    Button(vm.isBenchmarking ? "..." : "Benchmark") {
+                        vm.runBenchmark(for: vm.localModel)
+                    }
+                    .controlSize(.mini)
+                }
+                if let bench = vm.latestBenchmark {
+                    Text(String(format: "Active: %@ · %.1f tok/s · TTFT %.0fms", vm.localModel, bench.decodeTps, bench.ttftMs))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    Text("Local Model: \(vm.localModel)")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
 
             Picker("Compute Mode", selection: $vm.computeMode) {
@@ -1495,11 +1653,22 @@ struct MenuBarHybridPanelView: View {
 
             Divider()
 
-            Text("Quick Hybrid Chat:")
-                .font(.caption.bold())
+            HStack {
+                Text("Quick Hybrid Chat:")
+                    .font(.caption.bold())
+                Spacer()
+                if let audit = vm.composerLiveAudit, audit.piiCount > 0 {
+                    Label("\(audit.piiCount) PII Masked", systemImage: "lock.shield.fill")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.green)
+                }
+            }
             HStack {
                 TextField("Ask Local Mac or Hybrid Cloud...", text: $vm.promptText)
                     .textFieldStyle(.roundedBorder)
+                    .onChange(of: vm.promptText) { _, _ in
+                        vm.updateComposerLiveAudit()
+                    }
                 Button("Send") {
                     vm.sendChatMessage()
                 }
@@ -1522,6 +1691,10 @@ struct MenuBarHybridPanelView: View {
                     vm.startNewChat()
                 }
                 Spacer()
+                Button("Open Studio") {
+                    NSApplication.shared.activate(ignoringOtherApps: true)
+                }
+                Spacer()
                 Button("Quit MacHybridAI") {
                     NSApplication.shared.terminate(nil)
                 }
@@ -1529,7 +1702,7 @@ struct MenuBarHybridPanelView: View {
             .font(.caption)
         }
         .padding(12)
-        .frame(width: 320)
+        .frame(width: 340)
     }
 }
 

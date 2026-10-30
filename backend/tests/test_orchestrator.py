@@ -234,7 +234,56 @@ class TestRealTelemetry(unittest.TestCase):
         self.assertIn("chip_brand", payload)
         self.assertIn("metal_working_set_gb", payload)
         self.assertIn("selected_local_model", payload)
+        self.assertIn("thermal_state", payload)
+        self.assertIn("memory_pressure_level", payload)
         self.assertIn("recommendations", payload)
+
+    def test_thermal_and_memory_guardrail_and_benchmark_endpoints(self) -> None:
+        # 1. Verify memory pressure (>=85%) & thermal ('serious') guardrails step down 31B -> 4B
+        resolved, triggered, reason = HardwareProfiler.evaluate_guardrail(
+            requested_model="lmstudio-community/gemma-4-31B-it-MLX-4bit",
+            fast_fallback_model="mlx-community/gemma-3-4b-it-4bit",
+            mem_used_pct=90,
+            avail_mem_gb=4.0,
+            thermal_state="nominal",
+        )
+        self.assertTrue(triggered)
+        self.assertEqual(resolved, "mlx-community/gemma-3-4b-it-4bit")
+        self.assertIn("Memory pressure guardrail", reason)
+
+        resolved_therm, triggered_therm, reason_therm = HardwareProfiler.evaluate_guardrail(
+            requested_model="mlx-community/gemma-4-26b-it-4bit",
+            fast_fallback_model="mlx-community/gemma-3-4b-it-4bit",
+            mem_used_pct=50,
+            avail_mem_gb=24.0,
+            thermal_state="serious",
+        )
+        self.assertTrue(triggered_therm)
+        self.assertEqual(resolved_therm, "mlx-community/gemma-3-4b-it-4bit")
+        self.assertIn("Thermal guardrail", reason_therm)
+
+        # 2. Verify /v1/hardware/benchmark and /v1/hardware/models/pull endpoints
+        orchestrator = HybridOrchestrator()
+        status_b, bench = dispatch_request(
+            orchestrator,
+            "POST",
+            "/v1/hardware/benchmark",
+            {"model_id": "mlx-community/gemma-3-4b-it-4bit", "max_tokens": 12},
+        )
+        self.assertEqual(status_b, 200)
+        self.assertGreater(bench["ttft_ms"], 0)
+        self.assertGreater(bench["decode_tps"], 0)
+        self.assertGreater(bench["peak_memory_gb"], 0)
+
+        status_p, pull_bad = dispatch_request(
+            orchestrator,
+            "POST",
+            "/v1/hardware/models/pull",
+            {"model_id": "../../etc/passwd", "allow_download": False},
+        )
+        self.assertEqual(status_p, 200)
+        self.assertFalse(pull_bad["ok"])
+        self.assertEqual(pull_bad["status"], "invalid_model_id")
 
 
 if __name__ == "__main__":
