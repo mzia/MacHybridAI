@@ -19,17 +19,17 @@ Always-up-to-date native Apple Silicon (`arm64` Metal / MLX) & macOS 14+ install
 
 ---
 
-## Documentation & Wiki
+## Documentation, Manual (`man`) & Wiki
 
-Full setup and usage documentation is available in the [**MacHybridAI Wiki**](wiki/Home.md):
+Full setup and usage documentation is available in the [**MacHybridAI Wiki**](wiki/Home.md) and the UNIX manual page ([`man/MacHybridAI.1`](man/MacHybridAI.1) — view via `man ./man/MacHybridAI.1`):
 
-| Wiki Guide | Topics Covered |
+| Main Wiki Section | Topics Covered |
 | :--- | :--- |
-| [**Home & Architecture Overview**](wiki/Home.md) | System architecture, Desktop & Menu Bar Quick-Prompt HUD, and REST API reference |
-| [**Installation & Setup Guide**](wiki/Installation-and-Setup.md) | `.dmg` / `.pkg` installation, source builds, and environment variables |
-| [**M365 Copilot Proxy Setup & Usage (`cramt/m365-copilot-proxy`)**](wiki/M365-Copilot-Proxy-Setup-and-Usage.md) | Step-by-step setup for `m365-proxy`, Entra MFA sign-in, model IDs (`gpt-5.5-think-deeper`, `claude-sonnet-4.6`), and `<tools>` markdown-fence tool calling |
-| [**Apple Silicon Hardware Profiler & Local Models**](wiki/Apple-Silicon-Hardware-Profiler-and-Local-Models.md) | Metal GPU sizing, 1-Click Metal Benchmark (`TTFT`, `Prefill/Decode tok/s`), HuggingFace shard verification, and Thermal/RAM guardrails |
-| [**Privacy Gate & Zero-Cloud History**](wiki/Privacy-Gate-and-Zero-Cloud-History.md) | On-device PII masking (`[PERSON_1]`, `[EMAIL_1]`, etc.), local `PIIVault` restoration, and execution receipts |
+| [**1. MacHybridAI User Manual & Architecture (`wiki/Home.md`)**](wiki/Home.md) | 4-Station Split-Compute pipeline, Desktop Studio, `M⇄AI` Menu Bar HUD, Compute Modes (`Fully Local`, `Hybrid`, `Auto`), and `MacHybridAI(1)` `man` reference |
+| [**2. Installation & Setup Guide (`wiki/Installation-and-Setup.md`)**](wiki/Installation-and-Setup.md) | Native `.dmg` / `.pkg` installation, building from source (`./bundle.sh` / `./package.sh`), and environment configuration |
+| [**3. Apple Silicon Hardware Profiler & Local Models (`wiki/Apple-Silicon-Hardware-Profiler-and-Local-Models.md`)**](wiki/Apple-Silicon-Hardware-Profiler-and-Local-Models.md) | Metal GPU working-set sizing, 1-Click Metal Benchmark (`TTFT`, `Prefill/Decode tok/s`), HuggingFace shard verification, and Thermal/RAM guardrails |
+| [**4. Privacy Gate & Zero-Cloud History (`wiki/Privacy-Gate-and-Zero-Cloud-History.md`)**](wiki/Privacy-Gate-and-Zero-Cloud-History.md) | On-device PII masking (`[PERSON_1]`, `[EMAIL_1]`, etc.), local `PIIVault` restoration, encrypted Local/iCloud history, and Execution Receipts |
+| [**5. Optional Cloud Provider: M365 Copilot Proxy (`wiki/M365-Copilot-Proxy-Setup-and-Usage.md`)**](wiki/M365-Copilot-Proxy-Setup-and-Usage.md) | Optional integration with [`cramt/m365-copilot-proxy`](https://github.com/mzia/MacHybridAI/blob/main/wiki/M365-Copilot-Proxy-Setup-and-Usage.md) (`m365-proxy`), Entra MFA sign-in, and `<tools>` markdown-fence tool calling |
 
 ---
 

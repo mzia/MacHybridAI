@@ -1,0 +1,67 @@
+.TH MACHYBRIDAI 1 "October 2026" "MacHybridAI 1.1.0" "macOS Hybrid Compute User Manual"
+.SH NAME
+MacHybridAI, machybrid.server \- macOS Apple Silicon Local & Hybrid Split-Compute AI Studio
+.SH SYNOPSIS
+.B open /Applications/MacHybridAI.app
+.br
+.B python3 \-m machybrid.server
+[\fB\-\-host\fR \fI127.0.0.1\fR]
+[\fB\-\-port\fR \fI8765\fR]
+.SH DESCRIPTION
+.B MacHybridAI
+is a native macOS Apple Silicon (\fBarm64\fR Metal / MLX) and Hybrid Split-Compute AI application. It combines a Swift 6 / SwiftUI desktop studio and persistent menu bar HUD (\fBM\(⇄AI\fR) with a loopback-only Python Hybrid Compute engine (\fBmachybrid.server\fR).
+.PP
+Tasks execute across a 4-Station pipeline:
+.TP
+.B Station 1: This Mac (Local Compute & File Analysis)
+Processes private local files and runs on-device Apple Silicon MLX inference (\fBmlx_lm\fR on Metal GPU). In \fBFully Local\fR mode, execution completes on this Mac with zero network calls.
+.TP
+.B Station 2: On-Device Privacy Gate (PIIGuardian)
+Scans prompts and file context on-device using macOS \fBNaturalLanguage\fR (\fBNLTagger\fR) and checksum/regex detectors, replacing sensitive values with reversible stand-in tokens (\fB[PERSON_1]\fR, \fB[EMAIL_1]\fR, \fB[PHONE_1]\fR, \fB[SSN_1]\fR, \fB[CREDIT_CARD_1]\fR, \fB[SECRET_1]\fR).
+.TP
+.B Station 3: Stateless Cloud Reasoning
+Sends only sanitized stand-in tokens to the configured cloud provider with zero-retention flags (\fBstore=False\fR, \fBX-No-Store: true\fR).
+.TP
+.B Station 4: Local PIIVault Restoration & Execution Receipt
+Restores stand-in tokens back to their real values on your Mac from the in-memory \fBPIIVault\fR and generates an auditable Execution Receipt.
+.SH COMPUTE MODES
+.TP
+.B local (Fully Local Mode)
+100% on-device execution on Apple Silicon Metal GPU / ANE. Nothing leaves your Mac.
+.TP
+.B hybrid (Hybrid Split-Compute Mode)
+Combines Station 1 local file processing and Station 2 PII masking with Station 3 cloud reasoning and Station 4 local restoration.
+.TP
+.B auto (Automatic Routing Mode)
+Routes tasks dynamically based on prompt complexity and active Privacy Gate policy (\fBreversible_mask\fR, \fBstrict_redact\fR, or \fBforce_local_on_pii\fR).
+.SH ENVIRONMENT
+.TP
+.B MAC_HYBRID_PORT
+Loopback TCP port for \fBmachybrid.server\fR (default: \fB8765\fR).
+.TP
+.B MAC_HYBRID_LOCAL_PROVIDER
+On-device provider (\fBmlx\fR, \fBlitert\fR, \fBollama\fR, \fBmock\fR).
+.TP
+.B MAC_HYBRID_LOCAL_MODEL
+HuggingFace MLX repository ID (auto-selected by \fBHardwareProfiler\fR based on Metal working-set memory and cached shards).
+.TP
+.B MAC_HYBRID_CLOUD_PROVIDER
+Cloud provider for Station 3 (\fBgemini\fR, \fBantigravity\fR, \fBm365_copilot\fR, \fBopenai_compatible\fR).
+.TP
+.B GEMINI_API_KEY, ANTIGRAVITY_API_KEY, OPENAI_API_KEY
+Optional API keys for stateless cloud reasoning in Hybrid mode.
+.SH FILES
+.TP
+.I /Applications/MacHybridAI.app
+Self-contained macOS application bundle with embedded Python Hybrid Engine.
+.TP
+.I ~/.machybrid/history/
+Encrypted Local Mac prompt history directory.
+.TP
+.I ~/Library/Mobile Documents/com~apple~CloudDocs/MacHybridAI/
+Optional iCloud Drive prompt history sync directory.
+.TP
+.I ~/.cache/huggingface/hub/
+Local HuggingFace \fB.safetensors\fR model cache verified by \fBHardwareProfiler\fR.
+.SH SEE ALSO
+Full documentation in \fBwiki/Home.md\fR and \fBhttps://github.com/mzia/MacHybridAI\fR.
