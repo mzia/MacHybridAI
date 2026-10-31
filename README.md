@@ -19,6 +19,20 @@ Always-up-to-date native Apple Silicon (`arm64` Metal / MLX) & macOS 14+ install
 
 ---
 
+## Documentation & Wiki
+
+Full setup and usage documentation is available in the [**MacHybridAI Wiki**](wiki/Home.md):
+
+| Wiki Guide | Topics Covered |
+| :--- | :--- |
+| [**Home & Architecture Overview**](wiki/Home.md) | System architecture, Desktop & Menu Bar Quick-Prompt HUD, and REST API reference |
+| [**Installation & Setup Guide**](wiki/Installation-and-Setup.md) | `.dmg` / `.pkg` installation, source builds, and environment variables |
+| [**M365 Copilot Proxy Setup & Usage (`cramt/m365-copilot-proxy`)**](wiki/M365-Copilot-Proxy-Setup-and-Usage.md) | Step-by-step setup for `m365-proxy`, Entra MFA sign-in, model IDs (`gpt-5.5-think-deeper`, `claude-sonnet-4.6`), and `<tools>` markdown-fence tool calling |
+| [**Apple Silicon Hardware Profiler & Local Models**](wiki/Apple-Silicon-Hardware-Profiler-and-Local-Models.md) | Metal GPU sizing, 1-Click Metal Benchmark (`TTFT`, `Prefill/Decode tok/s`), HuggingFace shard verification, and Thermal/RAM guardrails |
+| [**Privacy Gate & Zero-Cloud History**](wiki/Privacy-Gate-and-Zero-Cloud-History.md) | On-device PII masking (`[PERSON_1]`, `[EMAIL_1]`, etc.), local `PIIVault` restoration, and execution receipts |
+
+---
+
 ## Key Features
 
 ### 1. Apple Silicon Hardware Profiler, Metal Benchmark & Thermal/RAM Guardrail
