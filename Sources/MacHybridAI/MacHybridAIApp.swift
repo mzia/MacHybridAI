@@ -131,12 +131,56 @@ public enum HybridBrandIconGenerator {
     }
 }
 
+/// Apple HIG Liquid Glass surface modifier using native macOS vibrancy materials,
+/// continuous squircle geometry, and a 1pt specular highlight rim.
+extension View {
+    func appleLiquidGlassCard(
+        cornerRadius: CGFloat = 14,
+        tint: Color = .cyan,
+        tintOpacity: Double = 0.06,
+        borderOpacity: Double = 0.16
+    ) -> some View {
+        self
+            .background(
+                ZStack {
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .fill(.ultraThinMaterial)
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    tint.opacity(tintOpacity),
+                                    Color.white.opacity(0.02),
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                }
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(borderOpacity + 0.08),
+                                tint.opacity(borderOpacity),
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 1
+                    )
+            )
+    }
+}
+
 /// Custom SwiftUI Brand Emblem showing the Split-Compute Silicon Chip + Privacy Gate + Cloud AI.
 struct HybridBrandEmblemView: View {
     var body: some View {
         HStack(spacing: 4) {
             ZStack {
-                RoundedRectangle(cornerRadius: 6)
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(
                         LinearGradient(
                             colors: [
@@ -149,19 +193,21 @@ struct HybridBrandEmblemView: View {
                     )
                     .frame(width: 36, height: 32)
                     .overlay(
-                        RoundedRectangle(cornerRadius: 6)
-                            .stroke(Color.cyan.opacity(0.6), lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(Color.cyan.opacity(0.6), lineWidth: 1)
                     )
 
                 HStack(spacing: 3) {
                     Image(systemName: "memorychip.fill")
                         .font(.system(size: 11, weight: .bold))
+                        .symbolRenderingMode(.hierarchical)
                         .foregroundStyle(.cyan)
                     Image(systemName: "arrow.left.and.right")
                         .font(.system(size: 8, weight: .black))
                         .foregroundStyle(.yellow)
                     Image(systemName: "sparkles")
                         .font(.system(size: 11, weight: .bold))
+                        .symbolRenderingMode(.hierarchical)
                         .foregroundStyle(.purple)
                 }
             }
@@ -638,10 +684,14 @@ struct MainDashboardView: View {
                     vm.selectedTab = 0
                 } label: {
                     Label("New Hybrid Chat", systemImage: "plus.bubble.fill")
+                        .symbolRenderingMode(.hierarchical)
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
+                .controlSize(.large)
                 .tint(Color(red: 0.18, green: 0.62, blue: 0.74))
+                .keyboardShortcut("n", modifiers: .command)
+                .help("Start a new Local or Hybrid conversation (⌘N)")
 
                 Picker("View", selection: $vm.selectedTab) {
                     Label("Hybrid Chat", systemImage: "bubble.left.and.text.bubble.right.fill").tag(0)
@@ -650,6 +700,7 @@ struct MainDashboardView: View {
                     Label("AI Providers & M365", systemImage: "memorychip").tag(3)
                 }
                 .pickerStyle(.radioGroup)
+                .symbolRenderingMode(.hierarchical)
 
                 Divider()
 
@@ -757,10 +808,10 @@ struct MainDashboardView: View {
                     DaemonStatusView()
                 }
                 .padding(10)
-                .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.05)))
+                .appleLiquidGlassCard(cornerRadius: 12, tint: .cyan, tintOpacity: 0.05, borderOpacity: 0.14)
             }
             .padding(12)
-            .frame(minWidth: 255)
+            .frame(minWidth: 260)
         } detail: {
             Group {
                 if vm.selectedTab == 0 {
@@ -944,6 +995,7 @@ struct HybridChatTabView: View {
                     } label: {
                         HStack(spacing: 6) {
                             Image(systemName: "paperplane.fill")
+                                .symbolRenderingMode(.hierarchical)
                             Text(vm.computeMode == .local ? "Send Local" : "Send Hybrid")
                                 .font(.subheadline.bold())
                         }
@@ -952,10 +1004,12 @@ struct HybridChatTabView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(Color(red: 0.20, green: 0.65, blue: 0.75))
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .help("Send prompt (⌘Return)")
                 }
             }
             .padding(16)
-            .background(Color.white.opacity(0.03))
+            .background(.ultraThinMaterial)
         }
     }
 }
@@ -1112,15 +1166,8 @@ struct ChatBubbleRowView: View {
                     .padding(.horizontal, 4)
                 }
             }
-            .padding(12)
-            .background(
-                RoundedRectangle(cornerRadius: 14)
-                    .fill(Color.white.opacity(0.02))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 14)
-                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
-                    )
-            )
+            .padding(14)
+            .appleLiquidGlassCard(cornerRadius: 16, tint: .cyan, tintOpacity: 0.04, borderOpacity: 0.14)
         }
     }
 }

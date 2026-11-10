@@ -24,6 +24,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-15]
         python-version: ["3.11", "3.12", "3.13"]
+        exclude:
+          - os: macos-15
+            python-version: "3.11"
+          - os: macos-15
+            python-version: "3.13"
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
