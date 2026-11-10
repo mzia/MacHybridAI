@@ -10,7 +10,7 @@ Welcome to the official **MacHybridAI** documentation.
 
 1. **[How MacHybridAI Works (4-Station Split-Compute Architecture)](#1-how-machybridai-works-4-station-split-compute-architecture)**
 2. **[Installing & Launching MacHybridAI on macOS](#2-installing--launching-machybridai-on-macos)**
-3. **[Using MacHybridAI: Desktop Studio & `M⇄AI` Menu Bar HUD](#3-using-machybridai-desktop-studio--mai-menu-bar-hud)**
+3. **[Using MacHybridAI: Desktop Studio, `M⇄AI` Menu Bar HUD & Apple HIG UX](#3-using-machybridai-desktop-studio-mai-menu-bar-hud--apple-hig-ux)**
 4. **[MacHybridAI Compute Modes (`Fully Local`, `Hybrid`, `Auto`)](#4-machybridai-compute-modes-fully-local-hybrid-auto)**
 5. **[MacHybridAI Apple Silicon Hardware Profiler & Metal Benchmark](#5-machybridai-apple-silicon-hardware-profiler--metal-benchmark)**
 6. **[MacHybridAI Privacy Gate (`PIIGuardian`) & Zero Cloud History](#6-machybridai-privacy-gate-piiguardian--zero-cloud-history)**
@@ -20,6 +20,8 @@ Welcome to the official **MacHybridAI** documentation.
 ---
 
 ## 1. How MacHybridAI Works (4-Station Split-Compute Architecture)
+
+![MacHybridAI 4-Station Local & Hybrid Split-Compute Architecture](assets/machybridai-architecture.png)
 
 `MacHybridAI` executes every task through an auditable 4-station pipeline modeled on on-device + cloud split compute:
 
@@ -64,7 +66,7 @@ open /Applications/MacHybridAI.app
 
 ---
 
-## 3. Using MacHybridAI: Desktop Studio & `M⇄AI` Menu Bar HUD
+## 3. Using MacHybridAI: Desktop Studio, `M⇄AI` Menu Bar HUD & Apple HIG UX
 
 When `MacHybridAI.app` is running, it provides two native macOS interfaces backed by the embedded Python Hybrid Engine on `http://127.0.0.1:8765`:
 
@@ -89,6 +91,15 @@ Click the persistent **`M⇄AI`** icon in the top-right macOS menu bar from any 
 - Switch between **Fully Local**, **Hybrid**, and **Auto** compute modes on the fly.
 - Send a quick prompt with real-time on-device PII detection badges (`N PII masked` or `No PII detected`).
 - Trigger a **1-Click Metal Benchmark** (`Decode tok/s` & `TTFT ms`) or open the main studio window.
+
+### C. Apple macOS Human Interface Guidelines (HIG) & Liquid Glass UX Principles
+`MacHybridAI` is crafted around the latest Apple macOS Human Interface Guidelines:
+- **Liquid Glass Vibrancy Surfaces (`appleLiquidGlassCard`)**: Layered `.ultraThinMaterial` surfaces with continuous squircle geometry (`RoundedRectangle(cornerRadius: ..., style: .continuous)`), subtle vertical tint gradients, and `1pt` top-leading specular highlights.
+- **Hierarchical SF Symbols & Semantic Color Tokens**: Uses `.symbolRenderingMode(.hierarchical)` with semantic macOS system colors (`cyan` for local Apple Silicon compute, `orange` for Privacy Gate PII shielding, `purple` for stateless cloud reasoning, and `green` for zero-cloud-retention verification).
+- **Native macOS Keyboard Shortcuts**:
+  - `⌘N` — Start a new Local or Hybrid conversation
+  - `⌘Return` (`⌘↩`) — Send prompt in the active compute mode (`Send Local` or `Send Hybrid`)
+  - **`M⇄AI` Menu Bar Extra** — Always-available global popover without leaving your active app
 
 ---
 

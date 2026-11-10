@@ -65,6 +65,8 @@ Full setup and usage documentation is available in the [**MacHybridAI Wiki**](wi
 
 ## Architecture Diagram
 
+![MacHybridAI 4-Station Local & Hybrid Split-Compute Architecture](wiki/assets/machybridai-architecture.png)
+
 ```mermaid
 flowchart LR
     Task["User Task & Private Mac Files"] --> Mode{"Compute Mode"}
