@@ -1031,6 +1031,201 @@ struct StreamingCursorView: View {
     }
 }
 
+// MARK: - Rich Markdown Message Renderer
+
+/// Renders structured Markdown blocks (headings, fenced code blocks with 1-click Copy,
+/// bullet/numbered/task lists, tables, blockquotes, and inline bold/italic/code/links)
+/// following Apple macOS Human Interface Guidelines.
+struct MarkdownMessageView: View {
+    let markdown: String
+    var isCompact: Bool = false
+
+    var body: some View {
+        let blocks = MarkdownBlockParser.parse(markdown)
+        if blocks.isEmpty {
+            Text(" ")
+                .font(isCompact ? .caption2 : .body)
+        } else {
+            VStack(alignment: .leading, spacing: isCompact ? 6 : 10) {
+                ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                    renderBlock(block)
+                }
+            }
+            .textSelection(.enabled)
+        }
+    }
+
+    @ViewBuilder
+    private func renderBlock(_ block: MarkdownBlock) -> some View {
+        switch block {
+        case .heading(let level, let text):
+            Text(MarkdownBlockParser.inlineAttributedString(text))
+                .font(headingFont(for: level))
+                .foregroundStyle(.primary)
+                .padding(.top, level <= 2 ? 4 : 2)
+
+        case .paragraph(let text):
+            Text(MarkdownBlockParser.inlineAttributedString(text))
+                .font(isCompact ? .caption : .body)
+                .fixedSize(horizontal: false, vertical: true)
+
+        case .codeBlock(let language, let code):
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Label(language.isEmpty ? "code" : language, systemImage: "terminal.fill")
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.cyan)
+                    Spacer()
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(code, forType: .string)
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Copy code block to clipboard")
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Color.white.opacity(0.05))
+
+                Divider()
+
+                ScrollView(.horizontal, showsIndicators: true) {
+                    Text(code)
+                        .font(.system(isCompact ? .caption2 : .callout, design: .monospaced))
+                        .foregroundStyle(Color(red: 0.90, green: 0.95, blue: 1.0))
+                        .textSelection(.enabled)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.black.opacity(0.38))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(Color.cyan.opacity(0.24), lineWidth: 1)
+            )
+
+        case .bulletList(let items):
+            VStack(alignment: .leading, spacing: 5) {
+                ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        if item.hasPrefix("[x] ") || item.hasPrefix("[X] ") {
+                            Image(systemName: "checkmark.square.fill")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.green)
+                            Text(MarkdownBlockParser.inlineAttributedString(String(item.dropFirst(4))))
+                                .font(isCompact ? .caption : .body)
+                        } else if item.hasPrefix("[ ] ") {
+                            Image(systemName: "square")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                            Text(MarkdownBlockParser.inlineAttributedString(String(item.dropFirst(4))))
+                                .font(isCompact ? .caption : .body)
+                        } else {
+                            Text("•")
+                                .font(.system(size: isCompact ? 11 : 14, weight: .bold))
+                                .foregroundStyle(.cyan)
+                            Text(MarkdownBlockParser.inlineAttributedString(item))
+                                .font(isCompact ? .caption : .body)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+            .padding(.leading, 4)
+
+        case .orderedList(let items):
+            VStack(alignment: .leading, spacing: 5) {
+                ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(item.marker)
+                            .font(.system(size: isCompact ? 11 : 13, weight: .bold, design: .monospaced))
+                            .foregroundStyle(.cyan)
+                            .frame(minWidth: 20, alignment: .trailing)
+                        Text(MarkdownBlockParser.inlineAttributedString(item.text))
+                            .font(isCompact ? .caption : .body)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            .padding(.leading, 4)
+
+        case .blockquote(let text):
+            HStack(spacing: 10) {
+                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                    .fill(Color.cyan.opacity(0.8))
+                    .frame(width: 3)
+                Text(MarkdownBlockParser.inlineAttributedString(text))
+                    .font(isCompact ? .caption : .body)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.vertical, 4)
+            .padding(.horizontal, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.white.opacity(0.03))
+            )
+
+        case .table(let headers, let rows):
+            ScrollView(.horizontal, showsIndicators: false) {
+                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
+                    GridRow {
+                        ForEach(Array(headers.enumerated()), id: \.offset) { _, header in
+                            Text(MarkdownBlockParser.inlineAttributedString(header))
+                                .font(.caption.bold())
+                                .foregroundStyle(.cyan)
+                                .padding(.vertical, 4)
+                        }
+                    }
+                    Divider()
+                    ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                        GridRow {
+                            ForEach(0..<headers.count, id: \.self) { colIdx in
+                                let cell = colIdx < row.count ? row[colIdx] : ""
+                                Text(MarkdownBlockParser.inlineAttributedString(cell))
+                                    .font(.caption)
+                                    .padding(.vertical, 2)
+                            }
+                        }
+                    }
+                }
+                .padding(10)
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.white.opacity(0.04))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.10), lineWidth: 1)
+            )
+
+        case .divider:
+            Divider()
+                .padding(.vertical, 2)
+        }
+    }
+
+    private func headingFont(for level: Int) -> Font {
+        if isCompact {
+            return .caption.bold()
+        }
+        switch level {
+        case 1: return .title2.bold()
+        case 2: return .title3.bold()
+        case 3: return .headline.bold()
+        default: return .subheadline.bold()
+        }
+    }
+}
+
 struct ChatBubbleRowView: View {
     let message: ChatMessageModel
 
@@ -1053,12 +1248,10 @@ struct ChatBubbleRowView: View {
                             .foregroundStyle(.secondary)
                     }
 
-                    Text(message.content)
-                        .font(.body)
-                        .textSelection(.enabled)
+                    MarkdownMessageView(markdown: message.content)
                         .padding(12)
                         .background(
-                            RoundedRectangle(cornerRadius: 12)
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
                                 .fill(Color(red: 0.12, green: 0.32, blue: 0.42))
                         )
                 }
@@ -1101,13 +1294,11 @@ struct ChatBubbleRowView: View {
                     Spacer()
                 }
 
-                Text(message.content.isEmpty && message.isStreaming ? " " : message.content)
-                    .font(.body)
-                    .textSelection(.enabled)
+                MarkdownMessageView(markdown: message.content)
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(
-                        RoundedRectangle(cornerRadius: 12)
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
                             .fill(Color.white.opacity(0.05))
                     )
                     .overlay(alignment: .bottomTrailing) {
@@ -1723,12 +1914,13 @@ struct MenuBarHybridPanelView: View {
             }
 
             if let lastMsg = vm.activeConversation?.messages.last(where: { $0.role == "assistant" }) {
-                Text(lastMsg.content)
-                    .font(.caption2)
-                    .lineLimit(3)
-                    .padding(6)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.06)))
+                ScrollView {
+                    MarkdownMessageView(markdown: lastMsg.content, isCompact: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 96)
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.white.opacity(0.06)))
             }
 
             Divider()

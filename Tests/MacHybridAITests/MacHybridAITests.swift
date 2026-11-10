@@ -131,4 +131,45 @@ struct MacHybridAITests {
         )
         #expect(pullCheck.modelId == "mlx-community/gemma-3-4b-it-4bit")
     }
+
+    @Test("MarkdownBlockParser parses headings, code blocks, lists, tables, blockquotes, and inline Markdown")
+    func testMarkdownBlockParserRendersStructuredBlocks() {
+        let sample = """
+        # Executive Summary
+        Prepared for **Sam Reyes** (`sam.reyes@meridian.io`).
+
+        - [x] Verify **local** Metal working set
+        - Benchmark `gemma-3-4b-it-4bit`
+
+        1. First step
+        2. Second step
+
+        > Privacy Gate masked 2 entities on this Mac.
+
+        | Metric | Value |
+        | --- | --- |
+        | Decode | **112 tok/s** |
+
+        ```swift
+        let mode = ComputeModeOption.hybrid
+        ```
+        """
+
+        let blocks = MarkdownBlockParser.parse(sample)
+        #expect(blocks.count == 7)
+        #expect(blocks[0] == .heading(level: 1, text: "Executive Summary"))
+        #expect(blocks[1] == .paragraph(text: "Prepared for **Sam Reyes** (`sam.reyes@meridian.io`)."))
+        #expect(blocks[2] == .bulletList(items: ["[x] Verify **local** Metal working set", "Benchmark `gemma-3-4b-it-4bit`"]))
+        #expect(blocks[3] == .orderedList(items: [
+            OrderedListItem(marker: "1.", text: "First step"),
+            OrderedListItem(marker: "2.", text: "Second step"),
+        ]))
+        #expect(blocks[4] == .blockquote(text: "Privacy Gate masked 2 entities on this Mac."))
+        #expect(blocks[5] == .table(headers: ["Metric", "Value"], rows: [["Decode", "**112 tok/s**"]]))
+        #expect(blocks[6] == .codeBlock(language: "swift", code: "let mode = ComputeModeOption.hybrid"))
+
+        let inline = MarkdownBlockParser.inlineAttributedString("Prepared for **Sam Reyes** (`sam.reyes@meridian.io`)")
+        let renderedPlain = String(inline.characters)
+        #expect(renderedPlain == "Prepared for Sam Reyes (sam.reyes@meridian.io)")
+    }
 }
