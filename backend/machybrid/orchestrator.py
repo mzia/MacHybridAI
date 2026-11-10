@@ -707,3 +707,52 @@ class HybridOrchestrator:
             tokens_processed=tokens,
             unified_memory_gb=mem_gb,
         )
+
+    def shutdown_all_local_resources(self) -> Dict[str, Any]:
+        """Unloads all local models (MLX Metal cache & local Ollama models), stops child proxies, and clears PIIVault."""
+        import http.client
+        import json
+
+        from .providers import MLXProvider
+
+        unloaded_mlx = MLXProvider.unload_all()
+        unloaded_ollama: List[str] = []
+
+        # If Ollama is running locally on 127.0.0.1:11434, unload any loaded models (keep_alive=0)
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", 11434, timeout=0.35)
+            conn.request("GET", "/api/ps")
+            resp = conn.getresponse()
+            raw = resp.read()
+            conn.close()
+            if resp.status == 200:
+                ps_data = json.loads(raw.decode("utf-8"))
+                models = ps_data.get("models", []) if isinstance(ps_data, dict) else []
+                for m in models:
+                    m_name = m.get("name") if isinstance(m, dict) else None
+                    if m_name:
+                        c2 = http.client.HTTPConnection("127.0.0.1", 11434, timeout=0.35)
+                        payload = json.dumps({"model": m_name, "keep_alive": 0}).encode("utf-8")
+                        c2.request(
+                            "POST",
+                            "/api/generate",
+                            body=payload,
+                            headers={"Content-Type": "application/json"},
+                        )
+                        _ = c2.getresponse().read()
+                        c2.close()
+                        unloaded_ollama.append(str(m_name))
+        except Exception:
+            pass
+
+        m365_ok, m365_msg = self.m365_manager.stop()
+        self.guardian.vault.clear()
+
+        return {
+            "status": "shutting_down",
+            "unloaded_mlx_models": unloaded_mlx,
+            "unloaded_ollama_models": unloaded_ollama,
+            "m365_proxy_stopped": m365_ok,
+            "m365_message": m365_msg,
+            "pii_vault_cleared": True,
+        }

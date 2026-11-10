@@ -92,6 +92,8 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
             return
         status, payload = dispatch_request(self.orchestrator, "POST", self.path, body)
         self._send_json(status, payload)
+        if self.path == "/v1/shutdown" and status == HTTPStatus.OK:
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     def _handle_stream(self) -> None:
         """Server-Sent Events streaming for token-by-token MLX output.
@@ -547,6 +549,9 @@ def dispatch_request(
             )
             return HTTPStatus.OK, pull_res
 
+        if path == "/v1/shutdown":
+            return HTTPStatus.OK, orchestrator.shutdown_all_local_resources()
+
         return HTTPStatus.NOT_FOUND, {"error": f"Unknown path: {path}"}
 
     return HTTPStatus.METHOD_NOT_ALLOWED, {"error": f"Unsupported method: {upper_method}"}
@@ -606,6 +611,12 @@ def main() -> None:
             "Format written: '<port>\\n' so the caller learns the actual port."
         ),
     )
+    parser.add_argument(
+        "--parent-pid",
+        type=int,
+        default=None,
+        help="Optional parent process PID to watch; if parent exits, unload models and quit.",
+    )
     args = parser.parse_args()
 
     orchestrator = HybridOrchestrator()
@@ -626,13 +637,43 @@ def main() -> None:
     port = args.port if args.port != 0 else _find_free_port()
     server = create_server(host=args.host, port=port, orchestrator=orchestrator)
 
+    import atexit as _atexit
+    import os as _os
+    import signal as _signal
+    import time as _time
+
+    _atexit.register(orchestrator.shutdown_all_local_resources)
+
+    def _handle_termination_signal(signum: int, frame: Any) -> None:
+        orchestrator.shutdown_all_local_resources()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    _signal.signal(_signal.SIGTERM, _handle_termination_signal)
+    _signal.signal(_signal.SIGINT, _handle_termination_signal)
+
+    if args.parent_pid and args.parent_pid > 1:
+        parent_pid = int(args.parent_pid)
+
+        def _watch_parent() -> None:
+            while True:
+                _time.sleep(1.5)
+                try:
+                    _os.kill(parent_pid, 0)
+                except ProcessLookupError:
+                    orchestrator.shutdown_all_local_resources()
+                    server.shutdown()
+                    break
+                except PermissionError:
+                    pass
+
+        threading.Thread(target=_watch_parent, daemon=True).start()
+
     # Signal readiness to the parent process (Swift DaemonManager).
     # Write "<port>\n" to the ready-fd so Swift knows:
     #   (a) the server is bound and accepting connections, and
     #   (b) which ephemeral port it's on when --port 0 was used.
     if args.ready_fd is not None:
         try:
-            import os as _os
             with _os.fdopen(args.ready_fd, "w", closefd=True) as rfd:
                 rfd.write(f"{port}\n")
                 rfd.flush()
@@ -645,6 +686,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        orchestrator.shutdown_all_local_resources()
         server.server_close()
 
 

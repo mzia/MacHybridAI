@@ -1935,6 +1935,7 @@ struct MenuBarHybridPanelView: View {
                 }
                 Spacer()
                 Button("Quit MacHybridAI") {
+                    DaemonManager.shared.stop()
                     NSApplication.shared.terminate(nil)
                 }
             }
@@ -1945,8 +1946,16 @@ struct MenuBarHybridPanelView: View {
     }
 }
 
+final class MacHybridAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_ notification: Notification) {
+        // Ensure all local MLX / Ollama models, Metal caches, m365-proxy, and the Python daemon quit with the app
+        DaemonManager.shared.stop()
+    }
+}
+
 @main
 struct MacHybridAIApp: App {
+    @NSApplicationDelegateAdaptor(MacHybridAppDelegate.self) private var appDelegate
     @StateObject private var viewModel = HybridAppViewModel()
 
     var body: some Scene {

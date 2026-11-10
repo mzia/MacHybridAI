@@ -55,8 +55,10 @@ public final class DaemonManager: ObservableObject, @unchecked Sendable {
             await MainActor.run {
                 switch result {
                 case .success(let p):
+                    self.lock.withLock { self._port = p }
                     self.state = .running(port: p)
                 case .failure(let err):
+                    self.lock.withLock { self._port = 0 }
                     self.state = .failed(err.localizedDescription)
                 }
             }
@@ -84,11 +86,51 @@ public final class DaemonManager: ObservableObject, @unchecked Sendable {
         return nil
     }
 
-    /// Terminate the daemon process cleanly.
+    /// Unloads all local models (MLX Metal cache & local Ollama models), stops child proxies,
+    /// and terminates the daemon process cleanly when MacHybridAI quits.
     public func stop() {
-        process?.terminate()
-        process = nil
-        state = .notStarted
+        let (proc, activePort): (Process?, Int) = lock.withLock {
+            let p = _process
+            let port = _port
+            _process = nil
+            _port = 0
+            return (p, port)
+        }
+
+        // 1. Instruct the Python daemon to unload all local MLX & Ollama models and stop m365-proxy
+        if activePort > 0, let url = URL(string: "http://127.0.0.1:\(activePort)/v1/shutdown") {
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 0.8
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = Data("{}".utf8)
+            let sema = DispatchSemaphore(value: 0)
+            URLSession.shared.dataTask(with: req) { _, _, _ in
+                sema.signal()
+            }.resume()
+            _ = sema.wait(timeout: .now() + 0.85)
+        }
+
+        // 2. Terminate the daemon process and ensure it does not linger
+        if let proc {
+            let pid = proc.processIdentifier
+            if proc.isRunning {
+                proc.terminate()
+                let deadline = Date().addingTimeInterval(0.4)
+                while proc.isRunning && Date() < deadline {
+                    Thread.sleep(forTimeInterval: 0.04)
+                }
+                if proc.isRunning && pid > 1 {
+                    Darwin.kill(pid, SIGKILL)
+                }
+            }
+        }
+
+        if Thread.isMainThread {
+            state = .notStarted
+        } else {
+            DispatchQueue.main.async { self.state = .notStarted }
+        }
     }
 
     // MARK: Private launch
@@ -110,6 +152,7 @@ public final class DaemonManager: ObservableObject, @unchecked Sendable {
             "--host", "127.0.0.1",
             "--port", "0",           // OS picks a free port
             "--ready-fd", "\(writeFd)",
+            "--parent-pid", "\(ProcessInfo.processInfo.processIdentifier)",
         ]
         var env = ProcessInfo.processInfo.environment
         env["PYTHONPATH"] = backendDir

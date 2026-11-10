@@ -285,6 +285,18 @@ class TestRealTelemetry(unittest.TestCase):
         self.assertFalse(pull_bad["ok"])
         self.assertEqual(pull_bad["status"], "invalid_model_id")
 
+        # 3. Verify /v1/shutdown unloads cached local models, stops proxies, and clears PIIVault
+        from machybrid.providers import MLXProvider
+
+        MLXProvider._model_cache["mlx-community/gemma-3-4b-it-4bit"] = ("dummy_model", "dummy_tok")
+        orchestrator.guardian.redact("Contact Sam Reyes at sam.reyes@meridian.io")
+        status_s, shutdown_res = dispatch_request(orchestrator, "POST", "/v1/shutdown", {})
+        self.assertEqual(status_s, 200)
+        self.assertEqual(shutdown_res["status"], "shutting_down")
+        self.assertIn("mlx-community/gemma-3-4b-it-4bit", shutdown_res["unloaded_mlx_models"])
+        self.assertEqual(len(MLXProvider._model_cache), 0)
+        self.assertTrue(shutdown_res["pii_vault_cleared"])
+
 
 if __name__ == "__main__":
     unittest.main()
