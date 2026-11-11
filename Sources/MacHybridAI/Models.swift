@@ -2,11 +2,13 @@ import Foundation
 
 public enum ComputeModeOption: String, CaseIterable, Codable, Sendable {
     case local = "local"
+    case auto = "auto"
     case hybrid = "hybrid"
 
     public var title: String {
         switch self {
         case .local: return "Fully local"
+        case .auto: return "Smart Auto"
         case .hybrid: return "Hybrid"
         }
     }
@@ -15,6 +17,8 @@ public enum ComputeModeOption: String, CaseIterable, Codable, Sendable {
         switch self {
         case .local:
             return "Model and agent run on this Mac. Nothing leaves this Mac."
+        case .auto:
+            return "Adaptive router keeps high-sensitivity or simple queries 100% local, and routes complex reasoning via 4-Station Hybrid."
         case .hybrid:
             return "Privacy Gate masks PII on your Mac before stateless cloud research, then restores real values."
         }
@@ -26,6 +30,7 @@ public enum CloudProviderOption: String, CaseIterable, Codable, Sendable {
     case antigravity = "antigravity"
     case m365Copilot = "m365_copilot"
     case openAICompatible = "openai_compatible"
+    case consensus = "consensus"
 
     public var displayName: String {
         switch self {
@@ -33,6 +38,7 @@ public enum CloudProviderOption: String, CaseIterable, Codable, Sendable {
         case .antigravity: return "Google Antigravity Agent"
         case .m365Copilot: return "M365 Copilot Proxy (gpt-5.5-think-deeper)"
         case .openAICompatible: return "OpenAI Extension API"
+        case .consensus: return "Multi-Cloud Consensus Arena (Gemini + M365)"
         }
     }
 }
@@ -179,6 +185,8 @@ public struct ExecutionReceiptModel: Codable, Sendable, Equatable {
     public let piiCategories: [String]
     public let nothingLeftMac: Bool
     public let cloudZeroRetention: Bool
+    public let outboundPayloadSha256: String
+    public let receiptSignatureSha256: String
 
     public init(
         modeExecuted: String,
@@ -189,7 +197,9 @@ public struct ExecutionReceiptModel: Codable, Sendable, Equatable {
         piiRestoredCount: Int,
         piiCategories: [String],
         nothingLeftMac: Bool,
-        cloudZeroRetention: Bool = true
+        cloudZeroRetention: Bool = true,
+        outboundPayloadSha256: String = "local_only_no_outbound_payload",
+        receiptSignatureSha256: String = "verified_on_device"
     ) {
         self.modeExecuted = modeExecuted
         self.localModelUsed = localModelUsed
@@ -200,6 +210,8 @@ public struct ExecutionReceiptModel: Codable, Sendable, Equatable {
         self.piiCategories = piiCategories
         self.nothingLeftMac = nothingLeftMac
         self.cloudZeroRetention = cloudZeroRetention
+        self.outboundPayloadSha256 = outboundPayloadSha256
+        self.receiptSignatureSha256 = receiptSignatureSha256
     }
 
     public init(from decoder: Decoder) throws {
@@ -213,6 +225,8 @@ public struct ExecutionReceiptModel: Codable, Sendable, Equatable {
         piiCategories = try container.decode([String].self, forKey: .piiCategories)
         nothingLeftMac = try container.decode(Bool.self, forKey: .nothingLeftMac)
         cloudZeroRetention = try container.decodeIfPresent(Bool.self, forKey: .cloudZeroRetention) ?? true
+        outboundPayloadSha256 = try container.decodeIfPresent(String.self, forKey: .outboundPayloadSha256) ?? "local_only_no_outbound_payload"
+        receiptSignatureSha256 = try container.decodeIfPresent(String.self, forKey: .receiptSignatureSha256) ?? "verified_on_device"
     }
 
     enum CodingKeys: String, CodingKey {
@@ -225,6 +239,8 @@ public struct ExecutionReceiptModel: Codable, Sendable, Equatable {
         case piiCategories = "pii_categories"
         case nothingLeftMac = "nothing_left_mac"
         case cloudZeroRetention = "cloud_zero_retention"
+        case outboundPayloadSha256 = "outbound_payload_sha256"
+        case receiptSignatureSha256 = "receipt_signature_sha256"
     }
 }
 
@@ -871,5 +887,253 @@ public struct MacHardwareProfileModel: Codable, Sendable, Equatable {
         case guardrailReason = "guardrail_reason"
         case cachedModels = "cached_models"
         case recommendations
+    }
+}
+
+// MARK: - Rich Markdown Parser for Chat Responses
+
+public struct OrderedListItem: Sendable, Equatable {
+    public let marker: String
+    public let text: String
+
+    public init(marker: String, text: String) {
+        self.marker = marker
+        self.text = text
+    }
+}
+
+public enum MarkdownBlock: Sendable, Equatable {
+    case heading(level: Int, text: String)
+    case paragraph(text: String)
+    case codeBlock(language: String, code: String)
+    case bulletList(items: [String])
+    case orderedList(items: [OrderedListItem])
+    case blockquote(text: String)
+    case table(headers: [String], rows: [[String]])
+    case divider
+}
+
+public enum MarkdownBlockParser {
+    /// Parses a raw Markdown string (including in-flight streaming responses) into structured blocks.
+    public static func parse(_ markdown: String) -> [MarkdownBlock] {
+        let normalized = markdown.replacingOccurrences(of: "\r\n", with: "\n")
+        let lines = normalized.components(separatedBy: "\n")
+        var blocks: [MarkdownBlock] = []
+
+        var i = 0
+        while i < lines.count {
+            let line = lines[i]
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            // 1. Blank line
+            if trimmed.isEmpty {
+                i += 1
+                continue
+            }
+
+            // 2. Fenced Code Block (```lang ... ```)
+            if trimmed.hasPrefix("```") {
+                let lang = String(trimmed.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+                var codeLines: [String] = []
+                i += 1
+                while i < lines.count {
+                    let candidate = lines[i]
+                    if candidate.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                        i += 1
+                        break
+                    }
+                    codeLines.append(candidate)
+                    i += 1
+                }
+                blocks.append(.codeBlock(language: lang.isEmpty ? "code" : lang, code: codeLines.joined(separator: "\n")))
+                continue
+            }
+
+            // 3. Horizontal Rule (---, ***, ___)
+            if isHorizontalRule(trimmed) {
+                blocks.append(.divider)
+                i += 1
+                continue
+            }
+
+            // 4. ATX Heading (# H1 ... ###### H6)
+            if let (level, headingText) = parseHeading(trimmed) {
+                blocks.append(.heading(level: level, text: headingText))
+                i += 1
+                continue
+            }
+
+            // 5. Markdown Table (| col1 | col2 | followed by | --- | --- |)
+            if trimmed.contains("|"),
+               i + 1 < lines.count,
+               isTableSeparatorLine(lines[i + 1].trimmingCharacters(in: .whitespaces)) {
+                let headers = parseTableRow(trimmed)
+                i += 2 // skip header + separator
+                var rows: [[String]] = []
+                while i < lines.count {
+                    let rowTrimmed = lines[i].trimmingCharacters(in: .whitespaces)
+                    if rowTrimmed.isEmpty || !rowTrimmed.contains("|") {
+                        break
+                    }
+                    if !isTableSeparatorLine(rowTrimmed) {
+                        rows.append(parseTableRow(rowTrimmed))
+                    }
+                    i += 1
+                }
+                if !headers.isEmpty {
+                    blocks.append(.table(headers: headers, rows: rows))
+                    continue
+                }
+            }
+
+            // 6. Blockquote (> quote)
+            if trimmed.hasPrefix(">") {
+                var quoteLines: [String] = []
+                while i < lines.count {
+                    let qTrim = lines[i].trimmingCharacters(in: .whitespaces)
+                    guard qTrim.hasPrefix(">") else { break }
+                    let stripped = String(qTrim.dropFirst()).trimmingCharacters(in: .whitespaces)
+                    quoteLines.append(stripped)
+                    i += 1
+                }
+                blocks.append(.blockquote(text: quoteLines.joined(separator: "\n")))
+                continue
+            }
+
+            // 7. Bullet List (- item, * item, + item, • item)
+            if let firstBullet = parseBulletItem(trimmed) {
+                var items: [String] = [firstBullet]
+                i += 1
+                while i < lines.count {
+                    let nextTrim = lines[i].trimmingCharacters(in: .whitespaces)
+                    if let nextBullet = parseBulletItem(nextTrim) {
+                        items.append(nextBullet)
+                        i += 1
+                    } else {
+                        break
+                    }
+                }
+                blocks.append(.bulletList(items: items))
+                continue
+            }
+
+            // 8. Ordered List (1. item, 2) item)
+            if let firstOrdered = parseOrderedItem(trimmed) {
+                var items: [OrderedListItem] = [firstOrdered]
+                i += 1
+                while i < lines.count {
+                    let nextTrim = lines[i].trimmingCharacters(in: .whitespaces)
+                    if let nextOrdered = parseOrderedItem(nextTrim) {
+                        items.append(nextOrdered)
+                        i += 1
+                    } else {
+                        break
+                    }
+                }
+                blocks.append(.orderedList(items: items))
+                continue
+            }
+
+            // 9. Standard Paragraph (accumulate contiguous non-special lines)
+            var paraLines: [String] = [line]
+            i += 1
+            while i < lines.count {
+                let nextLine = lines[i]
+                let nextTrim = nextLine.trimmingCharacters(in: .whitespaces)
+                if nextTrim.isEmpty
+                    || nextTrim.hasPrefix("```")
+                    || isHorizontalRule(nextTrim)
+                    || parseHeading(nextTrim) != nil
+                    || nextTrim.hasPrefix(">")
+                    || parseBulletItem(nextTrim) != nil
+                    || parseOrderedItem(nextTrim) != nil
+                    || (nextTrim.contains("|") && i + 1 < lines.count && isTableSeparatorLine(lines[i + 1].trimmingCharacters(in: .whitespaces))) {
+                    break
+                }
+                paraLines.append(nextLine)
+                i += 1
+            }
+            blocks.append(.paragraph(text: paraLines.joined(separator: "\n")))
+        }
+
+        return blocks
+    }
+
+    /// Parses inline Markdown (**bold**, *italic*, `code`, ~~strike~~, [link](url)) into an AttributedString.
+    public static func inlineAttributedString(_ text: String) -> AttributedString {
+        let options = AttributedString.MarkdownParsingOptions(
+            allowsExtendedAttributes: true,
+            interpretedSyntax: .inlineOnlyPreservingWhitespace,
+            failurePolicy: .returnPartiallyParsedIfPossible
+        )
+        if let parsed = try? AttributedString(markdown: text, options: options) {
+            return parsed
+        }
+        return AttributedString(text)
+    }
+
+    private static func isHorizontalRule(_ trimmed: String) -> Bool {
+        guard trimmed.count >= 3 else { return false }
+        let compact = trimmed.replacingOccurrences(of: " ", with: "")
+        guard compact.count >= 3 else { return false }
+        return compact.allSatisfy({ $0 == "-" })
+            || compact.allSatisfy({ $0 == "*" })
+            || compact.allSatisfy({ $0 == "_" })
+    }
+
+    private static func parseHeading(_ trimmed: String) -> (Int, String)? {
+        var count = 0
+        for ch in trimmed {
+            if ch == "#" {
+                count += 1
+            } else {
+                break
+            }
+        }
+        guard (1...6).contains(count), trimmed.count > count else { return nil }
+        let idx = trimmed.index(trimmed.startIndex, offsetBy: count)
+        guard trimmed[idx] == " " else { return nil }
+        let content = String(trimmed[trimmed.index(after: idx)...]).trimmingCharacters(in: .whitespaces)
+        return content.isEmpty ? nil : (count, content)
+    }
+
+    private static func parseBulletItem(_ trimmed: String) -> String? {
+        for prefix in ["- ", "* ", "+ ", "• "] {
+            if trimmed.hasPrefix(prefix) {
+                return String(trimmed.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return nil
+    }
+
+    private static func parseOrderedItem(_ trimmed: String) -> OrderedListItem? {
+        var digits = ""
+        var idx = trimmed.startIndex
+        while idx < trimmed.endIndex, trimmed[idx].isNumber {
+            digits.append(trimmed[idx])
+            idx = trimmed.index(after: idx)
+        }
+        guard !digits.isEmpty, idx < trimmed.endIndex else { return nil }
+        let punct = trimmed[idx]
+        guard punct == "." || punct == ")" else { return nil }
+        let afterPunct = trimmed.index(after: idx)
+        guard afterPunct < trimmed.endIndex, trimmed[afterPunct] == " " else { return nil }
+        let content = String(trimmed[trimmed.index(after: afterPunct)...]).trimmingCharacters(in: .whitespaces)
+        return OrderedListItem(marker: "\(digits)\(punct)", text: content)
+    }
+
+    private static func isTableSeparatorLine(_ trimmed: String) -> Bool {
+        guard trimmed.contains("|") && trimmed.contains("-") else { return false }
+        let allowed = CharacterSet(charactersIn: "|-: ")
+        return trimmed.unicodeScalars.allSatisfy { allowed.contains($0) }
+    }
+
+    private static func parseTableRow(_ trimmed: String) -> [String] {
+        var working = trimmed
+        if working.hasPrefix("|") { working.removeFirst() }
+        if working.hasSuffix("|") { working.removeLast() }
+        return working
+            .components(separatedBy: "|")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
     }
 }

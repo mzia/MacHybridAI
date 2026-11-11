@@ -456,6 +456,25 @@ class MLXProvider:
                 MLXProvider._model_cache[self._model_id] = (model, tokenizer)
             return MLXProvider._model_cache[self._model_id]
 
+    @classmethod
+    def unload_all(cls) -> List[str]:
+        """Unloads all cached MLX models, runs garbage collection, and clears Metal GPU cache."""
+        import gc
+
+        with cls._inference_lock:
+            unloaded = list(cls._model_cache.keys())
+            cls._model_cache.clear()
+        gc.collect()
+        try:
+            import mlx.core as mx
+            if hasattr(mx, "clear_cache"):
+                mx.clear_cache()
+            elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
+                mx.metal.clear_cache()
+        except Exception:
+            pass
+        return unloaded
+
 
 class GeminiProvider:
     """Google Gemini provider using the `google-genai` Interactions API."""

@@ -1,5 +1,7 @@
 import Foundation
 import NaturalLanguage
+import PDFKit
+import Vision
 
 // MARK: - DaemonManager
 
@@ -55,8 +57,10 @@ public final class DaemonManager: ObservableObject, @unchecked Sendable {
             await MainActor.run {
                 switch result {
                 case .success(let p):
+                    self.lock.withLock { self._port = p }
                     self.state = .running(port: p)
                 case .failure(let err):
+                    self.lock.withLock { self._port = 0 }
                     self.state = .failed(err.localizedDescription)
                 }
             }
@@ -84,11 +88,51 @@ public final class DaemonManager: ObservableObject, @unchecked Sendable {
         return nil
     }
 
-    /// Terminate the daemon process cleanly.
+    /// Unloads all local models (MLX Metal cache & local Ollama models), stops child proxies,
+    /// and terminates the daemon process cleanly when MacHybridAI quits.
     public func stop() {
-        process?.terminate()
-        process = nil
-        state = .notStarted
+        let (proc, activePort): (Process?, Int) = lock.withLock {
+            let p = _process
+            let port = _port
+            _process = nil
+            _port = 0
+            return (p, port)
+        }
+
+        // 1. Instruct the Python daemon to unload all local MLX & Ollama models and stop m365-proxy
+        if activePort > 0, let url = URL(string: "http://127.0.0.1:\(activePort)/v1/shutdown") {
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 0.8
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = Data("{}".utf8)
+            let sema = DispatchSemaphore(value: 0)
+            URLSession.shared.dataTask(with: req) { _, _, _ in
+                sema.signal()
+            }.resume()
+            _ = sema.wait(timeout: .now() + 0.85)
+        }
+
+        // 2. Terminate the daemon process and ensure it does not linger
+        if let proc {
+            let pid = proc.processIdentifier
+            if proc.isRunning {
+                proc.terminate()
+                let deadline = Date().addingTimeInterval(0.4)
+                while proc.isRunning && Date() < deadline {
+                    Thread.sleep(forTimeInterval: 0.04)
+                }
+                if proc.isRunning && pid > 1 {
+                    Darwin.kill(pid, SIGKILL)
+                }
+            }
+        }
+
+        if Thread.isMainThread {
+            state = .notStarted
+        } else {
+            DispatchQueue.main.async { self.state = .notStarted }
+        }
     }
 
     // MARK: Private launch
@@ -110,6 +154,7 @@ public final class DaemonManager: ObservableObject, @unchecked Sendable {
             "--host", "127.0.0.1",
             "--port", "0",           // OS picks a free port
             "--ready-fd", "\(writeFd)",
+            "--parent-pid", "\(ProcessInfo.processInfo.processIdentifier)",
         ]
         var env = ProcessInfo.processInfo.environment
         env["PYTHONPATH"] = backendDir
@@ -315,6 +360,73 @@ public struct SwiftNativeGuardian: Sendable {
             restored = restored.replacingOccurrences(of: token, with: original)
         }
         return (result, restored, entities, vault)
+    }
+}
+
+// MARK: - LocalVisionOCRScrubber
+
+/// Extracts text from images (`.png`, `.jpg`, `.jpeg`, `.heic`, `.tiff`, `.bmp`) and `.pdf` documents
+/// 100% on-device using Apple's `Vision.framework` (`VNRecognizeTextRequest`) and `PDFKit`,
+/// then runs the extracted text through `SwiftNativeGuardian` so screen captures, invoices,
+/// and scanned PDFs have PII scrubbed locally before any cloud call.
+public struct LocalVisionOCRScrubber: Sendable {
+    private static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "heic", "tiff", "tif", "bmp", "webp"]
+
+    public init() {}
+
+    /// Extracts text from a local file URL (via UTF-8, `PDFDocument`, or `VNRecognizeTextRequest`).
+    public static func extractFileContentOnDevice(from fileURL: URL) -> String? {
+        let ext = fileURL.pathExtension.lowercased()
+        if ext == "pdf", let pdfDoc = PDFDocument(url: fileURL) {
+            var pages: [String] = []
+            let maxPages = min(pdfDoc.pageCount, 25)
+            for idx in 0..<maxPages {
+                if let pageText = pdfDoc.page(at: idx)?.string, !pageText.isEmpty {
+                    pages.append(pageText)
+                }
+            }
+            let combined = pages.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !combined.isEmpty {
+                return combined
+            }
+        }
+
+        if imageExtensions.contains(ext) {
+            let recognized = recognizeTextInImage(at: fileURL)
+            if !recognized.isEmpty {
+                return "[On-Device Vision OCR from \(fileURL.lastPathComponent)]:\n\(recognized)"
+            }
+        }
+
+        if let utf8Text = try? String(contentsOf: fileURL, encoding: .utf8) {
+            return utf8Text
+        }
+        return nil
+    }
+
+    /// Runs macOS native `VNRecognizeTextRequest` on an image URL completely on-device.
+    public static func recognizeTextInImage(at imageURL: URL) -> String {
+        nonisolated(unsafe) var lines: [String] = []
+        let request = VNRecognizeTextRequest { req, _ in
+            guard let observations = req.results as? [VNRecognizedTextObservation] else { return }
+            lines = observations.compactMap { $0.topCandidates(1).first?.string }
+        }
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+
+        let handler = VNImageRequestHandler(url: imageURL, options: [:])
+        try? handler.perform([request])
+        return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Extracts text from an image or PDF and immediately audits/scrubs PII on-device.
+    public static func extractAndAuditFile(
+        at fileURL: URL,
+        policy: GuardianPolicyOption = .reversibleMask
+    ) -> (extractedText: String, audit: GuardianAuditModel) {
+        let rawText = extractFileContentOnDevice(from: fileURL) ?? ""
+        let audit = BackendBridge.shared.inspectPII(text: rawText, policy: policy)
+        return (rawText, audit)
     }
 }
 
@@ -540,6 +652,7 @@ public final class BackendBridge: Sendable {
         cloudProvider: CloudProviderOption,
         attachedFiles: [String] = [],
         sessionId: String? = nil,
+        approvedSanitizedPrompt: String? = nil,
         onToken: @escaping @Sendable (String) -> Void,
         onReceipt: @escaping @Sendable ([String: Any]) -> Void
     ) {
@@ -560,8 +673,8 @@ public final class BackendBridge: Sendable {
         for path in attachedFiles {
             let fileURL = URL(fileURLWithPath: path)
             fileLabels.append(fileURL.lastPathComponent)
-            if let text = try? String(contentsOf: fileURL, encoding: .utf8) {
-                let snippet = String(text.prefix(8192))
+            if let text = LocalVisionOCRScrubber.extractFileContentOnDevice(from: fileURL) {
+                let snippet = String(text.prefix(12288))
                 excerpts.append("--- \(fileURL.lastPathComponent) ---\n\(snippet)")
             }
         }
@@ -574,6 +687,9 @@ public final class BackendBridge: Sendable {
             "inline_file_context": excerpts.joined(separator: "\n\n"),
         ]
         if let sessionId { body["session_id"] = sessionId }
+        if let approvedSanitizedPrompt, !approvedSanitizedPrompt.isEmpty {
+            body["approved_sanitized_prompt"] = approvedSanitizedPrompt
+        }
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         // Use a delegate-based URLSession so we can process data as it arrives.
@@ -591,15 +707,16 @@ public final class BackendBridge: Sendable {
         cloudProvider: CloudProviderOption,
         guardianPolicy: GuardianPolicyOption,
         attachedFiles: [String],
-        sessionId: String? = nil
+        sessionId: String? = nil,
+        approvedSanitizedPrompt: String? = nil
     ) -> TaskResultModel {
         var excerpts: [String] = []
         var fileLabels: [String] = []
         for path in attachedFiles {
             let url = URL(fileURLWithPath: path)
             fileLabels.append(url.lastPathComponent)
-            if let text = try? String(contentsOf: url, encoding: .utf8) {
-                let snippet = String(text.prefix(8192))
+            if let text = LocalVisionOCRScrubber.extractFileContentOnDevice(from: url) {
+                let snippet = String(text.prefix(12288))
                 excerpts.append("--- \(url.lastPathComponent) ---\n\(snippet)")
             }
         }
@@ -612,6 +729,9 @@ public final class BackendBridge: Sendable {
         ]
         if let sessionId {
             body["session_id"] = sessionId
+        }
+        if let approvedSanitizedPrompt, !approvedSanitizedPrompt.isEmpty {
+            body["approved_sanitized_prompt"] = approvedSanitizedPrompt
         }
 
         if let data = invoke(method: "POST", path: "/v1/tasks/run", body: body),
