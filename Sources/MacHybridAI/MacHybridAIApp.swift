@@ -247,9 +247,19 @@ final class HybridAppViewModel: ObservableObject {
     @Published var lastResult: TaskResultModel?
     @Published var composerLiveAudit: GuardianAuditModel?
 
-    // Privacy Gate live inspector
+    // Privacy Gate live inspector & Interactive Approval Gate
     @Published var inspectorInput: String = "Prepared for Sam Reyes (sam.reyes@meridian.io), phone (415) 555-2671, SSN 123-45-6789."
     @Published var inspectorAudit: GuardianAuditModel?
+    @Published var approveBeforeCloudDispatch: Bool = false
+    @Published var isShowingSanitizationApproval: Bool = false
+    @Published var pendingSanitizedDraft: String = ""
+    @Published var lastVisionOCRSourceFile: String = ""
+
+    // Quick Ask Spotlight HUD & On-Device Voice Dictation
+    @Published var isShowingQuickAskSpotlight: Bool = false
+    @Published var quickAskPrompt: String = ""
+    @Published var isVoiceDictating: Bool = false
+
     @Published var selectedTab: Int = 0
     @Published var hardwareProfile: MacHardwareProfileModel?
     @Published var latestBenchmark: HardwareBenchmarkResultModel?
@@ -439,9 +449,22 @@ final class HybridAppViewModel: ObservableObject {
         )
     }
 
-    func sendChatMessage() {
+    func requestSendChatMessage() {
         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        if approveBeforeCloudDispatch && computeMode != .local {
+            updateComposerLiveAudit()
+            pendingSanitizedDraft = composerLiveAudit?.sanitizedText ?? trimmed
+            isShowingSanitizationApproval = true
+        } else {
+            sendChatMessage(approvedSanitizedPrompt: nil)
+        }
+    }
+
+    func sendChatMessage(approvedSanitizedPrompt: String? = nil) {
+        let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        isShowingSanitizationApproval = false
         isRunning = true
 
         if conversations.isEmpty || !conversations.contains(where: { $0.id == activeConversationId }) {
@@ -453,6 +476,7 @@ final class HybridAppViewModel: ObservableObject {
         let provider = cloudProvider
         let policy = guardianPolicy
         let files = attachedFiles
+        let approvedPrompt = approvedSanitizedPrompt
         let now = Date()
 
         // Add user message immediately so the UI shows it while waiting
@@ -510,6 +534,7 @@ final class HybridAppViewModel: ObservableObject {
                 cloudProvider: provider,
                 attachedFiles: files,
                 sessionId: currentSessionId,
+                approvedSanitizedPrompt: approvedPrompt,
                 onToken: { token in
                     Task { @MainActor in
                         guard let convIdx = self.conversations.firstIndex(where: { $0.id == currentSessionId }),
@@ -575,7 +600,8 @@ final class HybridAppViewModel: ObservableObject {
                         cloudProvider: provider,
                         guardianPolicy: policy,
                         attachedFiles: files,
-                        sessionId: currentSessionId
+                        sessionId: currentSessionId,
+                        approvedSanitizedPrompt: approvedPrompt
                     )
                     await MainActor.run {
                         self.lastResult = result
@@ -594,6 +620,7 @@ final class HybridAppViewModel: ObservableObject {
             }
         }
     }
+
     func executeTask() {
         if promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            let lastPrompt = activeConversation?.messages.last(where: { $0.role == "user" })?.content {
@@ -621,6 +648,60 @@ final class HybridAppViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Runs macOS native Vision OCR (`VNRecognizeTextRequest`) or PDFKit extraction on a user-selected
+    /// screenshot, invoice, or PDF, and populates the Privacy Gate inspector with the scrubbed text.
+    func importAndScrubFileViaVisionOCR() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.message = "Select an Image (.png, .jpg, .heic) or PDF to extract & scrub PII on-device via Apple Vision"
+        if panel.runModal() == .OK, let url = panel.url {
+            let (extracted, audit) = LocalVisionOCRScrubber.extractAndAuditFile(
+                at: url,
+                policy: guardianPolicy
+            )
+            lastVisionOCRSourceFile = url.lastPathComponent
+            if !extracted.isEmpty {
+                inspectorInput = extracted
+                inspectorAudit = audit
+            }
+        }
+    }
+
+    /// Toggles on-device voice dictation using macOS native Speech / Dictation services.
+    func toggleVoiceDictation() {
+        isVoiceDictating.toggle()
+        if isVoiceDictating {
+            _ = NSApplication.shared.sendAction(Selector(("startDictation:")), to: nil, from: nil)
+            updateComposerLiveAudit()
+        }
+    }
+
+    /// Runs a 1-click Spotlight Quick Ask action on either `quickAskPrompt` or the current macOS Clipboard.
+    func runQuickAskAction(instructionPrefix: String, mode: ComputeModeOption, provider: CloudProviderOption? = nil) {
+        let baseText: String
+        let trimmedQuick = quickAskPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedQuick.isEmpty {
+            baseText = trimmedQuick
+        } else if let clip = NSPasteboard.general.string(forType: .string), !clip.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            baseText = clip.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            baseText = promptText
+        }
+        guard !baseText.isEmpty else { return }
+
+        computeMode = mode
+        if let provider {
+            cloudProvider = provider
+        }
+        promptText = "\(instructionPrefix)\n\n\(baseText)"
+        quickAskPrompt = ""
+        isShowingQuickAskSpotlight = false
+        selectedTab = 0
+        sendChatMessage()
     }
 }
 
@@ -692,6 +773,18 @@ struct MainDashboardView: View {
                 .tint(Color(red: 0.18, green: 0.62, blue: 0.74))
                 .keyboardShortcut("n", modifiers: .command)
                 .help("Start a new Local or Hybrid conversation (⌘N)")
+
+                Button {
+                    vm.isShowingQuickAskSpotlight = true
+                } label: {
+                    Label("Quick Ask Spotlight (⌘K)", systemImage: "sparkle.magnifyingglass")
+                        .symbolRenderingMode(.hierarchical)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+                .keyboardShortcut("k", modifiers: .command)
+                .help("Open Floating Spotlight Quick Ask HUD (⌘K)")
 
                 Picker("View", selection: $vm.selectedTab) {
                     Label("Hybrid Chat", systemImage: "bubble.left.and.text.bubble.right.fill").tag(0)
@@ -826,6 +919,188 @@ struct MainDashboardView: View {
             }
             .frame(minWidth: 780, minHeight: 620)
         }
+        .sheet(isPresented: $vm.isShowingSanitizationApproval) {
+            SanitizationApprovalSheetView(vm: vm)
+        }
+        .sheet(isPresented: $vm.isShowingQuickAskSpotlight) {
+            QuickAskSpotlightModalView(vm: vm)
+        }
+    }
+}
+
+/// Interactive Sanitization Diff Preview Sheet ("Approve Before Cloud Dispatch")
+struct SanitizationApprovalSheetView: View {
+    @ObservedObject var vm: HybridAppViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                HybridBrandEmblemView()
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Inspect & Approve Sanitized Cloud Payload")
+                        .font(.headline.bold())
+                    Text("Station 2 Privacy Gate has masked sensitive tokens on this Mac. Review or edit the payload before Station 3 cloud dispatch.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text("Zero Cloud History (store=false)")
+                    .font(.caption2.bold())
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(Color.green.opacity(0.18)))
+                    .foregroundStyle(.green)
+            }
+
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Original Local Draft (Stays on This Mac)", systemImage: "lock.laptopcomputer")
+                        .font(.caption.bold())
+                        .foregroundStyle(.cyan)
+                    ScrollView {
+                        Text(vm.promptText)
+                            .font(.system(.caption, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                    }
+                    .frame(height: 130)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.28)))
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Editable Sanitized Payload (Sent to \(vm.cloudProvider.displayName))", systemImage: "key.viewfinder")
+                        .font(.caption.bold())
+                        .foregroundStyle(.orange)
+                    TextEditor(text: $vm.pendingSanitizedDraft)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(height: 130)
+                        .padding(4)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.10)))
+                }
+            }
+
+            if let audit = vm.composerLiveAudit, !audit.entities.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Redacted Stand-In Tokens (\(audit.entities.count)) — Restored Locally at Station 4:")
+                        .font(.caption2.bold())
+                        .foregroundStyle(.secondary)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(audit.entities) { entity in
+                                HStack(spacing: 4) {
+                                    Text(entity.category)
+                                        .font(.system(size: 9, weight: .bold))
+                                    Text(entity.maskedPreview)
+                                        .font(.system(size: 9, design: .monospaced))
+                                    Image(systemName: "arrow.right")
+                                        .font(.system(size: 8))
+                                    Text(entity.replacementToken)
+                                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                        .foregroundStyle(.cyan)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Capsule().fill(Color.white.opacity(0.08)))
+                            }
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
+            HStack {
+                Button("Cancel") {
+                    vm.isShowingSanitizationApproval = false
+                }
+                Spacer()
+                Button("Run 100% Locally Instead") {
+                    vm.computeMode = .local
+                    vm.isShowingSanitizationApproval = false
+                    vm.sendChatMessage(approvedSanitizedPrompt: nil)
+                }
+                .buttonStyle(.bordered)
+                Button("Approve & Dispatch to Cloud") {
+                    let approved = vm.pendingSanitizedDraft
+                    vm.sendChatMessage(approvedSanitizedPrompt: approved)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color(red: 0.20, green: 0.65, blue: 0.75))
+            }
+        }
+        .padding(20)
+        .frame(width: 680)
+    }
+}
+
+/// Spotlight-style Floating Quick Ask HUD (`⌘K`) with 1-Click Split-Compute Actions on Clipboard or Prompt
+struct QuickAskSpotlightModalView: View {
+    @ObservedObject var vm: HybridAppViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                Image(systemName: "sparkle.magnifyingglass")
+                    .font(.title2)
+                    .foregroundStyle(.cyan)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("MacHybridAI Quick Ask Spotlight")
+                        .font(.headline.bold())
+                    Text("Type a prompt or leave blank to act directly on your current macOS Clipboard with automatic on-device PII scrubbing.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    vm.isShowingQuickAskSpotlight = false
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            TextField("Ask anything or leave empty to process macOS Clipboard...", text: $vm.quickAskPrompt)
+                .textFieldStyle(.roundedBorder)
+                .font(.body)
+
+            HStack(spacing: 8) {
+                Button {
+                    vm.runQuickAskAction(
+                        instructionPrefix: "Summarize the following content privately on this Mac:",
+                        mode: .local
+                    )
+                } label: {
+                    Label("Summarize Privately (Local)", systemImage: "memorychip.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.cyan)
+
+                Button {
+                    vm.runQuickAskAction(
+                        instructionPrefix: "Refactor, improve, and analyze the following (with PII masked):",
+                        mode: .hybrid
+                    )
+                } label: {
+                    Label("Sanitize & Analyze (Hybrid)", systemImage: "key.viewfinder")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.purple)
+
+                Button {
+                    vm.runQuickAskAction(
+                        instructionPrefix: "Compare perspectives and synthesize a consensus executive recommendation for:",
+                        mode: .hybrid,
+                        provider: .consensus
+                    )
+                } label: {
+                    Label("Multi-Cloud Consensus Arena", systemImage: "sparkles.rectangle.stack.fill")
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(20)
+        .frame(width: 620)
     }
 }
 
@@ -865,7 +1140,7 @@ struct HybridChatTabView: View {
 
                 Spacer()
 
-                if vm.computeMode == .hybrid {
+                if vm.computeMode != .local {
                     Picker("Cloud", selection: $vm.cloudProvider) {
                         ForEach(CloudProviderOption.allCases, id: \.self) { provider in
                             Text(provider.displayName).tag(provider)
@@ -880,7 +1155,7 @@ struct HybridChatTabView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 190)
+                .frame(width: 260)
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 12)
@@ -938,6 +1213,13 @@ struct HybridChatTabView: View {
 
                     Spacer()
 
+                    if vm.computeMode != .local {
+                        Toggle("Inspect Before Cloud", isOn: $vm.approveBeforeCloudDispatch)
+                            .toggleStyle(.checkbox)
+                            .font(.caption2.bold())
+                            .help("Preview and edit the Station 2 sanitized payload before it leaves your Mac")
+                    }
+
                     Text("Cloud AI Retention: OFF (Stateless)")
                         .font(.caption2.bold())
                         .padding(.horizontal, 8)
@@ -951,7 +1233,7 @@ struct HybridChatTabView: View {
                         HStack(spacing: 8) {
                             ForEach(vm.attachedFiles, id: \.self) { path in
                                 HStack(spacing: 4) {
-                                    Image(systemName: "doc.text.fill")
+                                    Image(systemName: "doc.viewfinder.fill")
                                     Text((path as NSString).lastPathComponent)
                                         .font(.caption)
                                     Button {
@@ -978,7 +1260,17 @@ struct HybridChatTabView: View {
                             .foregroundStyle(.cyan)
                     }
                     .buttonStyle(.plain)
-                    .help("Attach local Mac file (processed on-device)")
+                    .help("Attach local Mac file, PDF, or screenshot (Vision OCR + BM25 RAG processed on-device)")
+
+                    Button {
+                        vm.toggleVoiceDictation()
+                    } label: {
+                        Image(systemName: vm.isVoiceDictating ? "waveform.circle.fill" : "mic.circle.fill")
+                            .font(.system(size: 22))
+                            .foregroundStyle(vm.isVoiceDictating ? .orange : .cyan)
+                    }
+                    .buttonStyle(.plain)
+                    .help("On-Device Voice Dictation (transcribed locally & scrubbed by Privacy Gate)")
 
                     TextEditor(text: $vm.promptText)
                         .font(.body)
@@ -991,12 +1283,12 @@ struct HybridChatTabView: View {
                         }
 
                     Button {
-                        vm.sendChatMessage()
+                        vm.requestSendChatMessage()
                     } label: {
                         HStack(spacing: 6) {
                             Image(systemName: "paperplane.fill")
                                 .symbolRenderingMode(.hierarchical)
-                            Text(vm.computeMode == .local ? "Send Local" : "Send Hybrid")
+                            Text(vm.computeMode == .local ? "Send Local" : (vm.computeMode == .auto ? "Send Auto" : "Send Hybrid"))
                                 .font(.subheadline.bold())
                         }
                         .padding(.horizontal, 12)
@@ -1309,9 +1601,43 @@ struct ChatBubbleRowView: View {
                     }
 
                 // Expandable 4-Station Relay & Sanitized Cloud Prompt Inspector
-                if !message.stations.isEmpty || message.sanitizedCloudPrompt != nil {
-                    DisclosureGroup("View 4-Station Hybrid Relay & Sanitized Cloud Prompt") {
+                if !message.stations.isEmpty || message.sanitizedCloudPrompt != nil || message.receipt != nil {
+                    DisclosureGroup("View 4-Station Hybrid Relay, Sanitized Cloud Prompt & Cryptographic Receipt") {
                         VStack(alignment: .leading, spacing: 8) {
+                            if let receipt = message.receipt {
+                                HStack(alignment: .center, spacing: 8) {
+                                    Image(systemName: "checkmark.shield.fill")
+                                        .foregroundStyle(.green)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Zero-Knowledge Cryptographic Privacy Receipt (SHA-256)")
+                                            .font(.caption2.bold())
+                                            .foregroundStyle(.green)
+                                        Text("Payload SHA-256: \(receipt.outboundPayloadSha256.prefix(24))… · Receipt Sig: \(receipt.receiptSignatureSha256.prefix(24))…")
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Button("Copy Receipt") {
+                                        let text = """
+                                        MacHybridAI Zero-Knowledge Privacy Receipt
+                                        Mode: \(receipt.modeExecuted)
+                                        Local Model: \(receipt.localModelUsed)
+                                        Cloud Models: \(receipt.cloudModelsUsed)
+                                        PII Masked: \(receipt.piiFlaggedCount) (\(receipt.piiCategories.joined(separator: ", ")))
+                                        PII Restored: \(receipt.piiRestoredCount)
+                                        Cloud Zero Retention: \(receipt.cloudZeroRetention)
+                                        Outbound Payload SHA-256: \(receipt.outboundPayloadSha256)
+                                        Receipt Signature SHA-256: \(receipt.receiptSignatureSha256)
+                                        """
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(text, forType: .string)
+                                    }
+                                    .controlSize(.mini)
+                                }
+                                .padding(8)
+                                .background(RoundedRectangle(cornerRadius: 8).fill(Color.green.opacity(0.08)))
+                            }
+
                             if let sanitized = message.sanitizedCloudPrompt {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text("What Reached the Cloud (Sanitized by Privacy Gate · Not Saved by Cloud AI):")
@@ -1504,6 +1830,26 @@ struct PrivacyGateTabView: View {
                 .onChange(of: vm.guardianPolicy) { _, _ in
                     vm.runInspector()
                     vm.updateComposerLiveAudit()
+                }
+
+                HStack(spacing: 12) {
+                    Toggle("Inspect & Approve Sanitized Diff Before Every Cloud Call", isOn: $vm.approveBeforeCloudDispatch)
+                        .font(.caption.bold())
+                    Spacer()
+                    Button {
+                        vm.importAndScrubFileViaVisionOCR()
+                    } label: {
+                        Label("OCR Scrub Image / PDF (Apple Vision)", systemImage: "doc.viewfinder.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .tint(.cyan)
+                }
+
+                if !vm.lastVisionOCRSourceFile.isEmpty {
+                    Label("Extracted & scrubbed on-device via Apple Vision OCR: \(vm.lastVisionOCRSourceFile)", systemImage: "checkmark.seal.fill")
+                        .font(.caption2.bold())
+                        .foregroundStyle(.cyan)
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
@@ -1775,6 +2121,42 @@ struct ProvidersConfigTabView: View {
                     .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.05)))
                 }
 
+                // Developer OpenAI-Compatible Local Proxy Endpoint Card
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Label("Drop-In OpenAI-Compatible Local Proxy (/v1/chat/completions & /v1/models)", systemImage: "network.badge.shield.half.filled")
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.cyan)
+                        Spacer()
+                        Button("Copy OpenAI Base URL") {
+                            let portStr: String
+                            if case .running(let p) = DaemonManager.shared.state {
+                                portStr = "\(p)"
+                            } else {
+                                portStr = "8765"
+                            }
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString("http://127.0.0.1:\(portStr)/v1", forType: .string)
+                        }
+                        .controlSize(.small)
+                    }
+                    Text("Point Cursor, Continue.dev, Zed, or any OpenAI SDK client to MacHybridAI's local loopback proxy for automatic Station 2 PII scrubbing, PIIVault rehydration, and cryptographic SHA-256 receipts.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        ForEach(["machybrid-auto", "machybrid-local", "machybrid-hybrid", "machybrid-consensus"], id: \.self) { m in
+                            Text(m)
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(Color.cyan.opacity(0.16)))
+                                .foregroundStyle(.cyan)
+                        }
+                    }
+                }
+                .padding(14)
+                .appleLiquidGlassCard(cornerRadius: 12, tint: .cyan, tintOpacity: 0.05, borderOpacity: 0.14)
+
                 Form {
                     Section("On-Device Local Model (This Mac — Apple Silicon Metal / MLX)") {
                         TextField("Active Local Model Identifier (MLX / LiteRT / Ollama)", text: $vm.localModel)
@@ -1901,7 +2283,17 @@ struct MenuBarHybridPanelView: View {
                         .foregroundStyle(.green)
                 }
             }
-            HStack {
+            HStack(spacing: 6) {
+                Button {
+                    vm.toggleVoiceDictation()
+                } label: {
+                    Image(systemName: vm.isVoiceDictating ? "waveform.circle.fill" : "mic.circle.fill")
+                        .font(.system(size: 16))
+                        .foregroundStyle(vm.isVoiceDictating ? .orange : .cyan)
+                }
+                .buttonStyle(.plain)
+                .help("On-Device Voice Dictation")
+
                 TextField("Ask Local Mac or Hybrid Cloud...", text: $vm.promptText)
                     .textFieldStyle(.roundedBorder)
                     .onChange(of: vm.promptText) { _, _ in
@@ -1911,6 +2303,31 @@ struct MenuBarHybridPanelView: View {
                     vm.sendChatMessage()
                 }
                 .buttonStyle(.borderedProminent)
+            }
+
+            HStack(spacing: 6) {
+                Button("Summarize Clipboard") {
+                    vm.runQuickAskAction(
+                        instructionPrefix: "Summarize the following content privately on this Mac:",
+                        mode: .local
+                    )
+                }
+                .controlSize(.mini)
+                Button("Sanitize & Analyze") {
+                    vm.runQuickAskAction(
+                        instructionPrefix: "Refactor, improve, and analyze the following (with PII masked):",
+                        mode: .hybrid
+                    )
+                }
+                .controlSize(.mini)
+                Button("Consensus") {
+                    vm.runQuickAskAction(
+                        instructionPrefix: "Compare perspectives and synthesize a consensus recommendation for:",
+                        mode: .hybrid,
+                        provider: .consensus
+                    )
+                }
+                .controlSize(.mini)
             }
 
             if let lastMsg = vm.activeConversation?.messages.last(where: { $0.role == "assistant" }) {

@@ -172,4 +172,35 @@ struct MacHybridAITests {
         let renderedPlain = String(inline.characters)
         #expect(renderedPlain == "Prepared for Sam Reyes (sam.reyes@meridian.io)")
     }
+
+    @Test("Smart Auto mode, Multi-Cloud Consensus option, Cryptographic Receipt, and LocalVisionOCRScrubber")
+    func testSmartAutoConsensusCryptographicReceiptAndVisionOCR() throws {
+        #expect(ComputeModeOption.allCases.contains(.auto))
+        #expect(CloudProviderOption.allCases.contains(.consensus))
+
+        let receipt = ExecutionReceiptModel(
+            modeExecuted: "hybrid",
+            localModelUsed: "mlx-community/gemma-3-4b-it-4bit",
+            localAgentLocation: "on this Mac",
+            cloudModelsUsed: "Multi-Cloud Consensus Arena",
+            piiFlaggedCount: 2,
+            piiRestoredCount: 2,
+            piiCategories: ["PERSON", "EMAIL"],
+            nothingLeftMac: false,
+            cloudZeroRetention: true,
+            outboundPayloadSha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            receiptSignatureSha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        )
+        #expect(receipt.outboundPayloadSha256.count == 64)
+        #expect(receipt.receiptSignatureSha256.count == 64)
+
+        let tmpURL = FileManager.default.temporaryDirectory.appendingPathComponent("vision_ocr_test_\(UUID().uuidString).txt")
+        try "Invoice for Sam Reyes (sam.reyes@meridian.io)".write(to: tmpURL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+
+        let (extracted, audit) = LocalVisionOCRScrubber.extractAndAuditFile(at: tmpURL, policy: .reversibleMask)
+        #expect(extracted.contains("Sam Reyes"))
+        #expect(audit.piiFlagged == true)
+        #expect(!audit.sanitizedText.contains("sam.reyes@meridian.io"))
+    }
 }

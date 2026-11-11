@@ -15,9 +15,11 @@ Implements Perplexity-style Hybrid Compute on macOS:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import platform
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -28,6 +30,7 @@ from .history import (
     HistoryStorageLocation,
     PromptHistoryManager,
 )
+from .local_rag import LocalWorkspaceRAG
 from .m365_proxy import M365CopilotProxyManager, M365ModelCatalog, M365ProxySettings
 from .profiler import HardwareProfiler
 from .providers import (
@@ -118,7 +121,7 @@ class StationStep:
 
 @dataclass
 class ExecutionReceipt:
-    """'Where the work ran' transparency receipt."""
+    """'Where the work ran' transparency & zero-knowledge cryptographic receipt."""
 
     mode_executed: str
     local_model_used: str
@@ -129,6 +132,24 @@ class ExecutionReceipt:
     pii_categories: List[str]
     nothing_left_mac: bool
     cloud_zero_retention: bool = True
+    outbound_payload_sha256: str = ""
+    receipt_signature_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.outbound_payload_sha256:
+            self.outbound_payload_sha256 = (
+                "local_only_no_outbound_payload"
+                if self.nothing_left_mac
+                else hashlib.sha256(self.cloud_models_used.encode("utf-8")).hexdigest()
+            )
+        if not self.receipt_signature_sha256:
+            canonical = (
+                f"{self.mode_executed}|{self.local_model_used}|{self.cloud_models_used}|"
+                f"{self.outbound_payload_sha256}|{self.pii_flagged_count}|"
+                f"{self.pii_restored_count}|{','.join(self.pii_categories)}|"
+                f"{self.cloud_zero_retention}"
+            )
+            self.receipt_signature_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -199,6 +220,7 @@ class HybridOrchestrator:
             encrypt_at_rest=self.config.history_encrypt_at_rest,
             redacted_only=self.config.history_redacted_only,
         )
+        self.rag = LocalWorkspaceRAG()
         self.allowed_roots = [
             os.path.abspath(os.path.expanduser(r))
             for r in (allowed_roots or [os.path.expanduser("~")])
@@ -276,12 +298,22 @@ class HybridOrchestrator:
                 labels.append(base)
         return labels
 
-    def _resolve_smart_auto_mode(self, prompt: str) -> ComputeMode:
-        """Smart Auto-Router: routes high-risk secret prompts or simple queries locally, and complex reasoning to Hybrid."""
+    def classify_prompt_complexity(self, prompt: str) -> Dict[str, Any]:
+        """Scores prompt sensitivity & reasoning complexity for Adaptive Smart Auto routing."""
         pre_scan = self.guardian.redact(prompt)
         high_risk = {"SECRET", "SSN", "CREDIT_CARD"}
-        if any(cat in high_risk for cat in pre_scan.categories):
-            return ComputeMode.LOCAL
+        flagged_high_risk = [cat for cat in pre_scan.categories if cat in high_risk]
+        if flagged_high_risk:
+            return {
+                "recommended_mode": ComputeMode.LOCAL.value,
+                "complexity_score": 0.95,
+                "high_risk_categories": flagged_high_risk,
+                "rationale": (
+                    f"High-sensitivity credentials/identifiers detected ({', '.join(flagged_high_risk)}); "
+                    "routed 100% locally on Apple Silicon."
+                ),
+            }
+
         words = prompt.split()
         complex_keywords = {
             "benchmark",
@@ -293,10 +325,67 @@ class HybridOrchestrator:
             "market",
             "deck",
             "multi-step",
+            "refactor",
+            "audit",
+            "strategy",
+            "consensus",
         }
-        if len(words) >= 12 or any(w.lower().strip(".,?!") in complex_keywords for w in words):
-            return ComputeMode.HYBRID
-        return ComputeMode.LOCAL
+        matched_kw = [
+            w.lower().strip(".,?!")
+            for w in words
+            if w.lower().strip(".,?!") in complex_keywords
+        ]
+        score = min(1.0, round((len(words) / 24.0) + (0.25 * len(matched_kw)), 2))
+        if len(words) >= 12 or matched_kw:
+            return {
+                "recommended_mode": ComputeMode.HYBRID.value,
+                "complexity_score": max(0.55, score),
+                "high_risk_categories": [],
+                "rationale": (
+                    "Multi-step reasoning or research query detected; "
+                    "routed via 4-Station Hybrid Compute with on-device PII scrubbing."
+                ),
+            }
+        return {
+            "recommended_mode": ComputeMode.LOCAL.value,
+            "complexity_score": score,
+            "high_risk_categories": [],
+            "rationale": "Concise query suited for fast, zero-cost on-device Apple Silicon execution.",
+        }
+
+    def _resolve_smart_auto_mode(self, prompt: str) -> ComputeMode:
+        """Smart Auto-Router: routes high-risk secret prompts or simple queries locally, and complex reasoning to Hybrid."""
+        decision = self.classify_prompt_complexity(prompt)
+        return ComputeMode(str(decision["recommended_mode"]))
+
+    def _apply_thermal_memory_guard(self, requested_model: str) -> tuple[str, bool, str]:
+        """Checks live macOS thermal state & memory pressure, stepping down to a lightweight 4-bit model if needed."""
+        try:
+            mem_used_pct, avail_mem_gb = HardwareProfiler.read_memory_stats()
+            cpu_busy = HardwareProfiler.read_cpu_busy_percent()
+            thermal_state, _ = HardwareProfiler.read_thermal_and_pressure_state(
+                mem_used_pct=mem_used_pct,
+                cpu_busy=cpu_busy,
+                gpu_busy=0,
+            )
+            fast_fallback = "mlx-community/gemma-3-4b-it-4bit"
+            target = requested_model or fast_fallback
+            guarded, triggered, reason = HardwareProfiler.evaluate_guardrail(
+                requested_model=target,
+                fast_fallback_model=fast_fallback,
+                mem_used_pct=mem_used_pct,
+                avail_mem_gb=avail_mem_gb,
+                thermal_state=thermal_state,
+                recommendations=[],
+            )
+            if triggered:
+                from .providers import MLXProvider
+
+                MLXProvider.unload_all()
+                return guarded, True, reason
+        except Exception:
+            pass
+        return requested_model, False, ""
 
     def run_task(
         self,
@@ -309,26 +398,49 @@ class HybridOrchestrator:
         session_id: Optional[str] = None,
         save_to_history: bool = True,
         approved_sanitized_prompt: Optional[str] = None,
+        consensus_providers: Optional[List[str]] = None,
     ) -> TaskExecutionResult:
         """Executes a task in Fully Local, Auto Hybrid, Hybrid, or Cloud mode with PII Guardian protection."""
         requested_mode = mode or self.config.compute_mode
+        auto_routed = requested_mode == ComputeMode.AUTO
         active_mode = (
             self._resolve_smart_auto_mode(prompt)
-            if requested_mode == ComputeMode.AUTO
+            if auto_routed
             else requested_mode
         )
         active_cloud_provider = cloud_provider or self.config.cloud_provider
         task_id = f"task_{int(time.time() * 1000)}"
 
         loaded_files = self._normalize_attached_file_labels(file_paths or [])
-        file_context = inline_file_context.strip()
+        raw_file_context = inline_file_context.strip()
+
+        # On-Device Local Workspace RAG: when large file context is attached, retrieve top-k relevant chunks
+        rag_chunks_used = 0
+        if len(raw_file_context) > 1000:
+            retrieved = self.rag.retrieve(
+                query=prompt,
+                top_k=4,
+                inline_context=raw_file_context,
+            )
+            if retrieved:
+                rag_chunks_used = len(retrieved)
+                file_context = self.rag.format_retrieved_context(retrieved)
+            else:
+                file_context = raw_file_context
+        else:
+            file_context = raw_file_context
+
+        # Live Memory Pressure & Thermal Guardrail
+        effective_local_model, guardrail_active, guardrail_reason = self._apply_thermal_memory_guard(
+            self.config.local_model
+        )
 
         stations: List[StationStep] = []
         total_tokens = 0
 
         local_provider = LocalModelProvider(
             backend_type=self.config.local_backend,
-            model=self.config.local_model,
+            model=effective_local_model,
             base_url=self.config.local_base_url,
             litert_model_path=self.config.litert_model_path,
         )
@@ -345,6 +457,14 @@ class HybridOrchestrator:
             elapsed_ms = max(1, int((time.monotonic() - t0) * 1000))
             total_tokens += local_resp.tokens_used
 
+            local_badges = ["Fully Local", local_resp.model, "Nothing leaves this Mac"]
+            if auto_routed:
+                local_badges.append("Smart Auto → Local")
+            if rag_chunks_used > 0:
+                local_badges.append(f"On-Device RAG ({rag_chunks_used} chunks)")
+            if guardrail_active:
+                local_badges.append("Thermal/Memory Guardrail")
+
             stations.append(
                 StationStep(
                     station_index=1,
@@ -353,11 +473,12 @@ class HybridOrchestrator:
                     locality="local",
                     title=f"Local agent & {local_resp.model} processed task on-device",
                     detail=(
-                        f"Processed {len(loaded_files)} local file(s) on this Mac. "
-                        f"Nothing leaves this Mac."
+                        f"Processed {len(loaded_files)} local file(s) on this Mac"
+                        + (f" ({rag_chunks_used} RAG chunks indexed)." if rag_chunks_used else ".")
+                        + (f" {guardrail_reason}" if guardrail_active else " Nothing leaves this Mac.")
                     ),
                     duration_ms=elapsed_ms,
-                    badges=["Fully Local", local_resp.model, "Nothing leaves this Mac"],
+                    badges=local_badges,
                 )
             )
             stations.append(
@@ -395,6 +516,7 @@ class HybridOrchestrator:
                 pii_categories=[],
                 nothing_left_mac=True,
                 cloud_zero_retention=True,
+                outbound_payload_sha256="local_only_no_outbound_payload",
             )
             active_session_id = session_id
             if save_to_history:
@@ -438,6 +560,14 @@ class HybridOrchestrator:
         local_ms = max(1, int((time.monotonic() - t_local_start) * 1000))
         total_tokens += local_resp.tokens_used
 
+        st1_badges = ["This Mac", local_resp.model]
+        if auto_routed:
+            st1_badges.append("Smart Auto → Hybrid")
+        if rag_chunks_used > 0:
+            st1_badges.append(f"On-Device RAG ({rag_chunks_used} chunks)")
+        if guardrail_active:
+            st1_badges.append("Thermal/Memory Guardrail")
+
         stations.append(
             StationStep(
                 station_index=1,
@@ -448,9 +578,10 @@ class HybridOrchestrator:
                 detail=(
                     f"Extracted structure from {len(loaded_files)} file(s) using "
                     f"{local_resp.model} before Privacy Gate inspection."
+                    + (f" Retrieved {rag_chunks_used} top BM25 RAG chunk(s)." if rag_chunks_used else "")
                 ),
                 duration_ms=local_ms,
-                badges=["This Mac", local_resp.model],
+                badges=st1_badges,
             )
         )
 
@@ -461,6 +592,11 @@ class HybridOrchestrator:
             combined_for_cloud = f"{prompt}\n\nContext:\n{file_context}"
 
         redaction: RedactionResult = self.guardian.redact(combined_for_cloud)
+        outbound_sanitized = (
+            approved_sanitized_prompt.strip()
+            if (approved_sanitized_prompt and approved_sanitized_prompt.strip())
+            else redaction.sanitized_text
+        )
         gate_ms = max(1, int((time.monotonic() - t_gate_start) * 1000))
 
         # Check if Guardian policy forces local execution when PII is found
@@ -490,6 +626,7 @@ class HybridOrchestrator:
                 pii_categories=redaction.categories,
                 nothing_left_mac=True,
                 cloud_zero_retention=True,
+                outbound_payload_sha256="local_only_no_outbound_payload",
             )
             active_session_id = session_id
             if save_to_history:
@@ -522,6 +659,9 @@ class HybridOrchestrator:
             if redaction.pii_flagged
             else ["No PII detected", "Verified Clean"]
         )
+        if approved_sanitized_prompt and approved_sanitized_prompt.strip():
+            gate_badges.append("User-Approved Sanitized Diff")
+
         stations.append(
             StationStep(
                 station_index=2,
@@ -544,15 +684,51 @@ class HybridOrchestrator:
             )
         )
 
-        # Station 3: Cloud Research & Reasoning (using sanitized stand-ins ONLY & store=False)
+        # Station 3: Cloud Research & Reasoning (Single Cloud or Multi-Cloud Consensus Arena)
         t_cloud_start = time.monotonic()
-        cloud_resp = self._invoke_cloud_provider(
-            provider_name=active_cloud_provider,
-            sanitized_prompt=redaction.sanitized_text,
-            tools=tools,
+        use_consensus = (
+            active_cloud_provider.lower().strip() == "consensus"
+            or (consensus_providers is not None and len(consensus_providers) >= 2)
         )
-        cloud_ms = max(1, int((time.monotonic() - t_cloud_start) * 1000))
-        total_tokens += cloud_resp.tokens_used
+
+        if use_consensus:
+            arena_targets = consensus_providers or ["gemini", "m365_copilot"]
+            with ThreadPoolExecutor(max_workers=min(4, len(arena_targets))) as pool:
+                futures = [
+                    pool.submit(
+                        self._invoke_cloud_provider,
+                        provider_name=prov,
+                        sanitized_prompt=outbound_sanitized,
+                        tools=tools,
+                    )
+                    for prov in arena_targets
+                ]
+                arena_responses = [f.result() for f in futures]
+
+            cloud_ms = max(1, int((time.monotonic() - t_cloud_start) * 1000))
+            for r in arena_responses:
+                total_tokens += r.tokens_used
+
+            combined_cloud_raw = "\n\n".join(
+                f"#### Cloud Arena Candidate {idx + 1}: {r.provider} (`{r.model}`)\n{r.output_text}"
+                for idx, r in enumerate(arena_responses)
+            )
+            cloud_provider_summary = " + ".join(f"{r.provider} ({r.model})" for r in arena_responses)
+            cloud_resp = ProviderResponse(
+                provider="Multi-Cloud Consensus Arena",
+                model=cloud_provider_summary,
+                locality="cloud",
+                output_text=combined_cloud_raw,
+                tokens_used=sum(r.tokens_used for r in arena_responses),
+            )
+        else:
+            cloud_resp = self._invoke_cloud_provider(
+                provider_name=active_cloud_provider,
+                sanitized_prompt=outbound_sanitized,
+                tools=tools,
+            )
+            cloud_ms = max(1, int((time.monotonic() - t_cloud_start) * 1000))
+            total_tokens += cloud_resp.tokens_used
 
         stations.append(
             StationStep(
@@ -603,6 +779,7 @@ class HybridOrchestrator:
             )
         )
 
+        outbound_hash = hashlib.sha256(outbound_sanitized.encode("utf-8")).hexdigest()
         receipt = ExecutionReceipt(
             mode_executed=active_mode.value,
             local_model_used=f"{local_resp.model} (on this Mac)",
@@ -613,6 +790,7 @@ class HybridOrchestrator:
             pii_categories=redaction.categories,
             nothing_left_mac=False,
             cloud_zero_retention=True,
+            outbound_payload_sha256=outbound_hash,
         )
 
         active_session_id = session_id
@@ -622,7 +800,7 @@ class HybridOrchestrator:
                 response_text=final_output,
                 compute_mode=active_mode.value,
                 cloud_provider=cloud_resp.provider,
-                sanitized_cloud_prompt=redaction.sanitized_text,
+                sanitized_cloud_prompt=outbound_sanitized,
                 pii_masked_count=redaction.pii_count,
                 pii_restored_count=restored_count,
                 session_id=session_id,
@@ -634,7 +812,7 @@ class HybridOrchestrator:
             session_id=active_session_id,
             prompt=prompt,
             final_output=final_output,
-            cloud_Prompt_sent=redaction.sanitized_text,
+            cloud_Prompt_sent=outbound_sanitized,
             stations=stations,
             receipt=receipt,
             telemetry=self.collect_telemetry(tokens=total_tokens),

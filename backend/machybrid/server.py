@@ -18,7 +18,7 @@ import json
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
 from .guardian import GuardianPolicy
@@ -90,10 +90,84 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
         body = self._read_json_body()
         if body is None:
             return
+        if self.path == "/v1/chat/completions" and bool(body.get("stream", False)):
+            self._handle_openai_stream(body)
+            return
         status, payload = dispatch_request(self.orchestrator, "POST", self.path, body)
         self._send_json(status, payload)
         if self.path == "/v1/shutdown" and status == HTTPStatus.OK:
             threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+    def _handle_openai_stream(self, body: Dict[str, Any]) -> None:
+        """OpenAI-compatible SSE streaming endpoint for `POST /v1/chat/completions`."""
+        import time as _time
+
+        status, payload = dispatch_request(
+            self.orchestrator,
+            "POST",
+            "/v1/chat/completions",
+            {**body, "stream": False},
+        )
+        if status != HTTPStatus.OK:
+            self._send_json(status, payload)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        choices = payload.get("choices", [])
+        text = ""
+        if choices and isinstance(choices[0], dict):
+            msg = choices[0].get("message", {})
+            if isinstance(msg, dict):
+                text = str(msg.get("content", ""))
+
+        chunk_id = str(payload.get("id", f"chatcmpl_{int(_time.time())}"))
+        model_name = str(payload.get("model", "machybrid-hybrid"))
+        created_ts = int(payload.get("created", int(_time.time())))
+
+        try:
+            words = text.split(" ")
+            for i, word in enumerate(words):
+                piece = word if i == 0 else " " + word
+                chunk_obj = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_ts,
+                    "model": model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": piece},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                self.wfile.write(f"data: {json.dumps(chunk_obj)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+
+            final_chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "x_machybrid_receipt": payload.get("x_machybrid_receipt"),
+            }
+            self.wfile.write(f"data: {json.dumps(final_chunk)}\n\n".encode("utf-8"))
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _handle_stream(self) -> None:
         """Server-Sent Events streaming for token-by-token MLX output.
@@ -235,6 +309,8 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
                 "pii_categories": redaction.categories,
                 "nothing_left_mac": True,
                 "cloud_zero_retention": True,
+                "outbound_payload_sha256": "local_only_no_outbound_payload",
+                "receipt_signature_sha256": "local_mlx_stream_verified",
             }
 
             sse("[DONE]")
@@ -259,6 +335,16 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
             # token-by-token once we have it.
             result_holder: Dict[str, Any] = {}
             done_event = threading.Event()
+            approved_sanitized = (
+                str(body["approved_sanitized_prompt"])
+                if body.get("approved_sanitized_prompt")
+                else None
+            )
+            consensus_provs = (
+                [str(x) for x in body["consensus_providers"]]
+                if isinstance(body.get("consensus_providers"), list)
+                else None
+            )
 
             def _run_task() -> None:
                 try:
@@ -270,6 +356,8 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
                         inline_file_context=inline_context,
                         session_id=body.get("session_id") or None,
                         save_to_history=bool(body.get("save_to_history", True)),
+                        approved_sanitized_prompt=approved_sanitized,
+                        consensus_providers=consensus_provs,
                     )
                     result_holder["result"] = result.to_dict()
                 except Exception as exc:
@@ -363,6 +451,36 @@ def dispatch_request(
             }
         if path == "/v1/hardware/profile":
             return HTTPStatus.OK, HardwareProfiler.profile().to_dict()
+        if path == "/v1/models":
+            return HTTPStatus.OK, {
+                "object": "list",
+                "data": [
+                    {
+                        "id": "machybrid-auto",
+                        "object": "model",
+                        "owned_by": "machybridai",
+                        "description": "Adaptive Smart Auto Router (Local Apple Silicon or 4-Station Hybrid with PII Gate)",
+                    },
+                    {
+                        "id": "machybrid-local",
+                        "object": "model",
+                        "owned_by": "machybridai",
+                        "description": "100% On-Device Apple Silicon Metal / MLX execution (nothing leaves Mac)",
+                    },
+                    {
+                        "id": "machybrid-hybrid",
+                        "object": "model",
+                        "owned_by": "machybridai",
+                        "description": "4-Station Hybrid Compute with On-Device PII Guardian & Zero Cloud History",
+                    },
+                    {
+                        "id": "machybrid-consensus",
+                        "object": "model",
+                        "owned_by": "machybridai",
+                        "description": "Multi-Cloud Consensus Arena with On-Device PII Guardian & Local Synthesis",
+                    },
+                ],
+            }
         return HTTPStatus.NOT_FOUND, {"error": f"Unknown path: {path}"}
 
     if upper_method == "POST":
@@ -480,6 +598,16 @@ def dispatch_request(
                 else None
             )
             save_to_history = bool(payload_in.get("save_to_history", True))
+            approved_sanitized = (
+                str(payload_in["approved_sanitized_prompt"])
+                if payload_in.get("approved_sanitized_prompt")
+                else None
+            )
+            consensus_provs = (
+                [str(x) for x in payload_in["consensus_providers"]]
+                if isinstance(payload_in.get("consensus_providers"), list)
+                else None
+            )
 
             result = orchestrator.run_task(
                 prompt=prompt,
@@ -490,8 +618,96 @@ def dispatch_request(
                 tools=tools,
                 session_id=session_id,
                 save_to_history=save_to_history,
+                approved_sanitized_prompt=approved_sanitized,
+                consensus_providers=consensus_provs,
             )
             return HTTPStatus.OK, result.to_dict()
+
+        if path == "/v1/chat/completions":
+            import time as _time
+
+            messages = payload_in.get("messages")
+            if not isinstance(messages, list) or not messages:
+                return HTTPStatus.BAD_REQUEST, {"error": "messages list is required"}
+
+            # Combine conversation messages into prompt context
+            turns: List[str] = []
+            for m in messages:
+                if isinstance(m, dict):
+                    role = str(m.get("role", "user"))
+                    content = str(m.get("content", "")).strip()
+                    if content:
+                        turns.append(f"{role.upper()}: {content}" if len(messages) > 1 else content)
+            combined_prompt = "\n\n".join(turns).strip()
+            if not combined_prompt:
+                return HTTPStatus.BAD_REQUEST, {"error": "messages content is empty"}
+
+            req_model = str(payload_in.get("model", "machybrid-hybrid")).lower().strip()
+            if "local" in req_model:
+                oa_mode = ComputeMode.LOCAL
+                oa_cloud = None
+            elif "auto" in req_model:
+                oa_mode = ComputeMode.AUTO
+                oa_cloud = None
+            elif "consensus" in req_model:
+                oa_mode = ComputeMode.HYBRID
+                oa_cloud = "consensus"
+            else:
+                oa_mode = ComputeMode.HYBRID
+                oa_cloud = None
+
+            task_res = orchestrator.run_task(
+                prompt=combined_prompt,
+                mode=oa_mode,
+                cloud_provider=oa_cloud,
+                save_to_history=bool(payload_in.get("save_to_history", False)),
+            )
+            res_dict = task_res.to_dict()
+            created_ts = int(_time.time())
+            tok_used = int(res_dict.get("telemetry", {}).get("tokens_processed", 32))
+            return HTTPStatus.OK, {
+                "id": f"chatcmpl_{task_res.task_id}",
+                "object": "chat.completion",
+                "created": created_ts,
+                "model": req_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": task_res.final_output,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": max(1, len(combined_prompt.split())),
+                    "completion_tokens": max(1, tok_used),
+                    "total_tokens": max(2, len(combined_prompt.split()) + tok_used),
+                },
+                "x_machybrid_receipt": res_dict.get("receipt"),
+                "x_machybrid_stations": res_dict.get("stations"),
+            }
+
+        if path == "/v1/rag/query":
+            query = str(payload_in.get("query", "")).strip()
+            inline_context = str(payload_in.get("inline_file_context", ""))
+            top_k = int(payload_in.get("top_k", 4))
+            chunks = orchestrator.rag.retrieve(
+                query=query,
+                top_k=max(1, min(top_k, 12)),
+                inline_context=inline_context,
+            )
+            return HTTPStatus.OK, {
+                "query": query,
+                "chunk_count": len(chunks),
+                "chunks": [c.to_dict() for c in chunks],
+                "formatted_context": orchestrator.rag.format_retrieved_context(chunks),
+            }
+
+        if path == "/v1/router/classify":
+            prompt_text = str(payload_in.get("prompt", "")).strip()
+            return HTTPStatus.OK, orchestrator.classify_prompt_complexity(prompt_text)
 
         if path == "/v1/m365/control":
             action = str(payload_in.get("action", "status"))

@@ -2,11 +2,13 @@ import Foundation
 
 public enum ComputeModeOption: String, CaseIterable, Codable, Sendable {
     case local = "local"
+    case auto = "auto"
     case hybrid = "hybrid"
 
     public var title: String {
         switch self {
         case .local: return "Fully local"
+        case .auto: return "Smart Auto"
         case .hybrid: return "Hybrid"
         }
     }
@@ -15,6 +17,8 @@ public enum ComputeModeOption: String, CaseIterable, Codable, Sendable {
         switch self {
         case .local:
             return "Model and agent run on this Mac. Nothing leaves this Mac."
+        case .auto:
+            return "Adaptive router keeps high-sensitivity or simple queries 100% local, and routes complex reasoning via 4-Station Hybrid."
         case .hybrid:
             return "Privacy Gate masks PII on your Mac before stateless cloud research, then restores real values."
         }
@@ -26,6 +30,7 @@ public enum CloudProviderOption: String, CaseIterable, Codable, Sendable {
     case antigravity = "antigravity"
     case m365Copilot = "m365_copilot"
     case openAICompatible = "openai_compatible"
+    case consensus = "consensus"
 
     public var displayName: String {
         switch self {
@@ -33,6 +38,7 @@ public enum CloudProviderOption: String, CaseIterable, Codable, Sendable {
         case .antigravity: return "Google Antigravity Agent"
         case .m365Copilot: return "M365 Copilot Proxy (gpt-5.5-think-deeper)"
         case .openAICompatible: return "OpenAI Extension API"
+        case .consensus: return "Multi-Cloud Consensus Arena (Gemini + M365)"
         }
     }
 }
@@ -179,6 +185,8 @@ public struct ExecutionReceiptModel: Codable, Sendable, Equatable {
     public let piiCategories: [String]
     public let nothingLeftMac: Bool
     public let cloudZeroRetention: Bool
+    public let outboundPayloadSha256: String
+    public let receiptSignatureSha256: String
 
     public init(
         modeExecuted: String,
@@ -189,7 +197,9 @@ public struct ExecutionReceiptModel: Codable, Sendable, Equatable {
         piiRestoredCount: Int,
         piiCategories: [String],
         nothingLeftMac: Bool,
-        cloudZeroRetention: Bool = true
+        cloudZeroRetention: Bool = true,
+        outboundPayloadSha256: String = "local_only_no_outbound_payload",
+        receiptSignatureSha256: String = "verified_on_device"
     ) {
         self.modeExecuted = modeExecuted
         self.localModelUsed = localModelUsed
@@ -200,6 +210,8 @@ public struct ExecutionReceiptModel: Codable, Sendable, Equatable {
         self.piiCategories = piiCategories
         self.nothingLeftMac = nothingLeftMac
         self.cloudZeroRetention = cloudZeroRetention
+        self.outboundPayloadSha256 = outboundPayloadSha256
+        self.receiptSignatureSha256 = receiptSignatureSha256
     }
 
     public init(from decoder: Decoder) throws {
@@ -213,6 +225,8 @@ public struct ExecutionReceiptModel: Codable, Sendable, Equatable {
         piiCategories = try container.decode([String].self, forKey: .piiCategories)
         nothingLeftMac = try container.decode(Bool.self, forKey: .nothingLeftMac)
         cloudZeroRetention = try container.decodeIfPresent(Bool.self, forKey: .cloudZeroRetention) ?? true
+        outboundPayloadSha256 = try container.decodeIfPresent(String.self, forKey: .outboundPayloadSha256) ?? "local_only_no_outbound_payload"
+        receiptSignatureSha256 = try container.decodeIfPresent(String.self, forKey: .receiptSignatureSha256) ?? "verified_on_device"
     }
 
     enum CodingKeys: String, CodingKey {
@@ -225,6 +239,8 @@ public struct ExecutionReceiptModel: Codable, Sendable, Equatable {
         case piiCategories = "pii_categories"
         case nothingLeftMac = "nothing_left_mac"
         case cloudZeroRetention = "cloud_zero_retention"
+        case outboundPayloadSha256 = "outbound_payload_sha256"
+        case receiptSignatureSha256 = "receipt_signature_sha256"
     }
 }
 

@@ -297,6 +297,89 @@ class TestRealTelemetry(unittest.TestCase):
         self.assertEqual(len(MLXProvider._model_cache), 0)
         self.assertTrue(shutdown_res["pii_vault_cleared"])
 
+    def test_rag_consensus_approved_diff_cryptographic_receipt_and_openai_proxy(self) -> None:
+        orchestrator = HybridOrchestrator()
+
+        # 1. On-Device Local Workspace RAG (/v1/rag/query)
+        large_doc = (
+            "--- deal_memo.md ---\n"
+            + ("Project Atlas baseline notes.\n" * 30)
+            + "\n--- valuation_terms.md ---\n"
+            + "Meridian valuation multiple is 14.5x EBITDA with earnout cap of $42M.\n"
+        )
+        status_rag, rag_res = dispatch_request(
+            orchestrator,
+            "POST",
+            "/v1/rag/query",
+            {
+                "query": "What is the Meridian valuation multiple and earnout cap?",
+                "inline_file_context": large_doc,
+                "top_k": 2,
+            },
+        )
+        self.assertEqual(status_rag, 200)
+        self.assertGreaterEqual(rag_res["chunk_count"], 1)
+        self.assertIn("14.5x EBITDA", rag_res["formatted_context"])
+
+        # 2. Adaptive Complexity Router (/v1/router/classify)
+        status_rt, rt_secret = dispatch_request(
+            orchestrator,
+            "POST",
+            "/v1/router/classify",
+            {"prompt": "Check SSN 123-45-6789 locally"},
+        )
+        self.assertEqual(status_rt, 200)
+        self.assertEqual(rt_secret["recommended_mode"], "local")
+        self.assertIn("SSN", rt_secret["high_risk_categories"])
+
+        # 3. Multi-Cloud Consensus Arena + User-Approved Sanitized Diff + Cryptographic Receipt
+        res_consensus = orchestrator.run_task(
+            prompt="Compare valuation for Contact: Sam Reyes (sam.reyes@meridian.io)",
+            mode=ComputeMode.HYBRID,
+            cloud_provider="consensus",
+            approved_sanitized_prompt="Compare valuation for Contact: [PERSON_1] ([EMAIL_1]) [APPROVED]",
+            inline_file_context=large_doc,
+            save_to_history=False,
+        )
+        self.assertEqual(
+            res_consensus.cloud_Prompt_sent,
+            "Compare valuation for Contact: [PERSON_1] ([EMAIL_1]) [APPROVED]",
+        )
+        self.assertIn("Cloud Arena Candidate 1", res_consensus.final_output)
+        self.assertIn("Cloud Arena Candidate 2", res_consensus.final_output)
+        self.assertIn("Sam Reyes", res_consensus.final_output)
+        self.assertEqual(len(res_consensus.receipt.outbound_payload_sha256), 64)
+        self.assertEqual(len(res_consensus.receipt.receipt_signature_sha256), 64)
+        self.assertIn("User-Approved Sanitized Diff", res_consensus.stations[1].badges)
+
+        # 4. OpenAI-Compatible Local Proxy (/v1/models & /v1/chat/completions)
+        status_m, models_res = dispatch_request(orchestrator, "GET", "/v1/models")
+        self.assertEqual(status_m, 200)
+        model_ids = [m["id"] for m in models_res["data"]]
+        self.assertIn("machybrid-auto", model_ids)
+        self.assertIn("machybrid-consensus", model_ids)
+
+        status_cc, cc_res = dispatch_request(
+            orchestrator,
+            "POST",
+            "/v1/chat/completions",
+            {
+                "model": "machybrid-hybrid",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Draft term sheet for Contact: Sam Reyes (sam.reyes@meridian.io)",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(status_cc, 200)
+        self.assertEqual(cc_res["object"], "chat.completion")
+        assistant_msg = cc_res["choices"][0]["message"]["content"]
+        self.assertIn("Sam Reyes", assistant_msg)
+        self.assertIn("x_machybrid_receipt", cc_res)
+        self.assertEqual(len(cc_res["x_machybrid_receipt"]["outbound_payload_sha256"]), 64)
+
 
 if __name__ == "__main__":
     unittest.main()
