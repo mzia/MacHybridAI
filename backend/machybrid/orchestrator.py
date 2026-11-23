@@ -242,14 +242,15 @@ class HybridOrchestrator:
         self.rag = LocalWorkspaceRAG()
         # In-memory API keys configured at runtime (never persisted to disk or echoed by /v1/config)
         self._runtime_api_keys: Dict[str, str] = {}
+        self._configured_provider_ids: set[str] = set()
         self.allowed_roots = [
             os.path.abspath(os.path.expanduser(r))
             for r in (allowed_roots or [os.path.expanduser("~")])
         ]
 
     def list_cloud_providers(self) -> List[Dict[str, Any]]:
-        """Returns all built-in and custom cloud AI provider presets with live key detection status."""
-        return build_cloud_provider_catalog(self._runtime_api_keys)
+        """Returns all built-in and custom cloud AI provider presets with live readiness metadata."""
+        return build_cloud_provider_catalog(sorted(self._configured_provider_ids))
 
     def update_config(self, updates: Dict[str, Any]) -> HybridConfig:
         """Updates orchestrator configuration and syncs Guardian, M365, and History settings."""
@@ -300,10 +301,18 @@ class HybridOrchestrator:
                 key_id = str(k).strip().lower()
                 secret_val = str(v).strip()
                 if key_id:
+                    canonical_pid = next(
+                        (pid for pid in CLOUD_PROVIDER_PRESETS if pid == key_id),
+                        None,
+                    )
                     if secret_val:
                         self._runtime_api_keys[key_id] = secret_val
+                        if canonical_pid is not None:
+                            self._configured_provider_ids.add(canonical_pid)
                     else:
                         self._runtime_api_keys.pop(key_id, None)
+                        if canonical_pid is not None:
+                            self._configured_provider_ids.discard(canonical_pid)
         if "m365_port" in updates:
             self.config.m365_port = int(updates["m365_port"])
             self.m365_manager.settings.port = self.config.m365_port
@@ -1029,6 +1038,7 @@ class HybridOrchestrator:
         m365_ok, m365_msg = self.m365_manager.stop()
         self.guardian.vault.clear()
         self._runtime_api_keys.clear()
+        self._configured_provider_ids.clear()
 
         return {
             "status": "shutting_down",

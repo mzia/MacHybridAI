@@ -968,14 +968,15 @@ def _resolve_endpoint_url(base_url: str, suffix: str) -> str:
 
 
 def build_cloud_provider_catalog(
-    runtime_api_keys: Optional[Dict[str, str]] = None,
+    configured_provider_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Returns all supported cloud AI providers with live key detection status (never exposes key values)."""
-    keys = runtime_api_keys or {}
+    """Returns all supported cloud AI providers with live credential-presence status (never reads secret values)."""
+    configured_set = frozenset(configured_provider_ids or [])
+    present_env_vars = frozenset(os.environ.keys())
     catalog: List[Dict[str, Any]] = []
     for pid, preset in CLOUD_PROVIDER_PRESETS.items():
         env_var = str(preset.get("api_key_env", ""))
-        has_key = bool(keys.get(pid)) or bool(env_var and os.environ.get(env_var, "").strip())
+        is_configured = (pid in configured_set) or (bool(env_var) and env_var in present_env_vars)
         catalog.append(
             {
                 "id": pid,
@@ -986,7 +987,7 @@ def build_cloud_provider_catalog(
                 "recommended_models": list(preset["recommended_models"]),
                 "api_key_env": env_var,
                 "auth_header": preset["auth_header"],
-                "api_key_configured": has_key,
+                "api_key_configured": is_configured,
             }
         )
     return catalog

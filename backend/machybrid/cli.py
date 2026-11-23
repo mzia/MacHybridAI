@@ -123,22 +123,24 @@ def _print_providers_table(ansi: _ANSI, orchestrator: HybridOrchestrator) -> Non
     providers = orchestrator.list_cloud_providers()
     print(ansi.bold("\nSupported Cloud AI Providers (All Behind On-Device Privacy Gate):"))
     for p in providers:
-        key_badge = (
-            ansi.green("KEY READY")
-            if p["api_key_configured"]
-            else ansi.dim(f"set {p['api_key_env']}" if p["api_key_env"] else "local proxy")
+        is_ready = bool(p.get("api_key_configured"))
+        env_var_name = str(p.get("api_key_env", ""))
+        status_badge = (
+            ansi.green("READY")
+            if is_ready
+            else ansi.dim(f"set {env_var_name}" if env_var_name else "local proxy")
         )
         active_mark = ansi.cyan("◀ active") if p["id"] == orchestrator.config.cloud_provider else ""
         print(
             f"  {ansi.bold(str(p['id']).ljust(18))} "
             f"{str(p['protocol']).ljust(11)} "
             f"{str(p['default_model']).ljust(36)} "
-            f"{key_badge} {active_mark}"
+            f"{status_badge} {active_mark}"
         )
     print(
         ansi.dim(
             "\n  Tip: Use `/provider anthropic` or `/provider openai` or `/provider consensus`, "
-            "and `/key <provider> <api_key>` to load a RAM-only key.\n"
+            "and `/key <provider> <token>` to load a RAM-only token.\n"
         )
     )
 
