@@ -8,6 +8,7 @@ from .agent import (
     AgentTurnRecord,
     HybridCLIAgent,
     WorkspaceToolbox,
+    diagnose_cli_permissions,
 )
 from .guardian import (
     GuardianPolicy,
@@ -53,6 +54,7 @@ __all__ = [
     "AgentTurnRecord",
     "HybridCLIAgent",
     "WorkspaceToolbox",
+    "diagnose_cli_permissions",
     "GuardianPolicy",
     "PIIEntity",
     "PIIGuardian",

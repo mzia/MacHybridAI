@@ -11,9 +11,10 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from machybrid.agent import HybridCLIAgent, WorkspaceToolbox
+from machybrid.agent import HybridCLIAgent, WorkspaceToolbox, diagnose_cli_permissions
 from machybrid.cli import _ANSI, handle_slash_command, main
 from machybrid.orchestrator import ComputeMode, HybridOrchestrator
+from machybrid.profiler import HardwareProfiler
 from machybrid.providers import ProviderResponse
 
 
@@ -198,6 +199,188 @@ class TestHybridCLIAgentAndEndToEnd(unittest.TestCase):
             self.assertTrue(agent.approve_cloud_dispatch)
             self.assertTrue(handle_slash_command("/clear", agent, orch, ansi, box))
             self.assertFalse(handle_slash_command("/quit", agent, orch, ansi, box))
+
+    def test_direct_list_files_returns_all_dirs_and_files_and_ignores_bundles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "README.md").write_text("# Demo\n", encoding="utf-8")
+            (root / "main.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "notes.txt").write_text("hello\n", encoding="utf-8")
+            (root / ".DS_Store").write_bytes(b"\x00\x01")
+            (root / "src").mkdir()
+            (root / "src" / "helper.py").write_text("x = 1\n", encoding="utf-8")
+            (root / "docs").mkdir()
+            (root / "Sample.app").mkdir()
+            (root / "Sample.app" / "Info.plist").write_text("plist", encoding="utf-8")
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = main(
+                    [
+                        "--workspace",
+                        str(root),
+                        "--json",
+                        "list the files in this directory",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            payload = json.loads(buf.getvalue())
+            self.assertTrue(payload["receipt"]["nothing_left_mac"])
+            self.assertEqual(payload["total_tool_calls"], 1)
+            output = payload["final_output"]
+            self.assertIn("docs/", output)
+            self.assertIn("src/", output)
+            self.assertIn("README.md", output)
+            self.assertIn("main.py", output)
+            self.assertIn("notes.txt", output)
+            self.assertNotIn("Sample.app", output)
+            self.assertNotIn(".DS_Store", output)
+
+    def test_list_files_and_doctor_report_permission_errors_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            locked = root / "locked_dir"
+            locked.mkdir()
+            os.chmod(locked, 0o000)
+            try:
+                tb = WorkspaceToolbox(str(root), plan_mode=True, auto_approve=True)
+                out, ok = tb.execute("list_files", {"path": "locked_dir"})
+                self.assertTrue(ok)
+                if os.geteuid() != 0:
+                    self.assertIn("PermissionError", out)
+                    self.assertIn("Files and Folders", out)
+
+                checks = diagnose_cli_permissions(str(locked))
+                ws_check = next(c for c in checks if c["name"] == "workspace_read")
+                if os.geteuid() != 0:
+                    self.assertFalse(ws_check["ok"])
+                    self.assertIn("Files and Folders", ws_check["remediation"])
+            finally:
+                os.chmod(locked, 0o755)
+
+    def test_session_always_approval_avoids_reprompting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            f1 = root / "a.txt"
+            f1.write_text("one", encoding="utf-8")
+            prompts_seen = []
+
+            def approve_always(name: str, args: dict, preview: str) -> str:
+                prompts_seen.append(name)
+                return "always"
+
+            tb = WorkspaceToolbox(
+                str(root),
+                plan_mode=False,
+                auto_approve=False,
+                approval_callback=approve_always,
+            )
+            _, ok1 = tb.execute("edit_file", {"path": "a.txt", "old": "one", "new": "two"})
+            _, ok2 = tb.execute("write_file", {"path": "b.txt", "content": "three"})
+            self.assertTrue(ok1)
+            self.assertTrue(ok2)
+            # Only prompted once for the first edit; `"always"` enabled session-wide edit approval
+            self.assertEqual(len(prompts_seen), 1)
+            self.assertEqual(f1.read_text(encoding="utf-8"), "two")
+            self.assertEqual((root / "b.txt").read_text(encoding="utf-8"), "three")
+
+    def test_doctor_subcommand_json_and_repl_direct_slash_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "alpha.py").write_text("def hello():\n    return 'world'\n", encoding="utf-8")
+            (root / "sub").mkdir()
+
+            # 1. `machybrid doctor --json`
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = main(["--workspace", str(root), "--json", "doctor"])
+            self.assertEqual(rc, 0)
+            doc = json.loads(buf.getvalue())
+            names = {c["name"] for c in doc["checks"]}
+            self.assertIn("workspace_read", names)
+            self.assertIn("workspace_write", names)
+            self.assertIn("mlx_metal_runtime", names)
+            ws_read = next(c for c in doc["checks"] if c["name"] == "workspace_read")
+            self.assertTrue(ws_read["ok"])
+
+            # 2. REPL direct slash tools: /ls, /read, /search, /doctor
+            orch = HybridOrchestrator()
+            agent = HybridCLIAgent(orchestrator=orch, workspace_root=str(root), plan_mode=True)
+            ansi = _ANSI(False)
+            box = [None]
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                self.assertTrue(handle_slash_command("/ls", agent, orch, ansi, box))
+                self.assertTrue(handle_slash_command("/read alpha.py 1 2", agent, orch, ansi, box))
+                self.assertTrue(handle_slash_command("/search hello", agent, orch, ansi, box))
+                self.assertTrue(handle_slash_command("/doctor", agent, orch, ansi, box))
+            out = buf.getvalue()
+            self.assertIn("alpha.py", out)
+            self.assertIn("sub/", out)
+            self.assertIn("1: def hello():", out)
+            self.assertIn("alpha.py:1:", out)
+            self.assertIn("workspace_read", out)
+
+    def test_vm_stat_counts_inactive_pages_as_reclaimable_memory(self) -> None:
+        fake_vm_stat = (
+            b"Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+            b"Pages free:                             200000.\n"
+            b"Pages active:                           900000.\n"
+            b"Pages inactive:                         800000.\n"
+            b"Pages speculative:                       20000.\n"
+            b"Pages purgeable:                         30000.\n"
+        )
+        HardwareProfiler._mem_stats_cache = None
+        with patch("machybrid.profiler.platform.system", return_value="Darwin"):
+            with patch.object(
+                HardwareProfiler,
+                "get_static_hardware_info",
+                return_value={"unified_memory_gb": 48},
+            ):
+                with patch("machybrid.profiler.subprocess.check_output", return_value=fake_vm_stat):
+                    used_pct, avail_gb = HardwareProfiler.read_memory_stats()
+        HardwareProfiler._mem_stats_cache = None
+        # (200k + 800k + 20k + 30k) * 16384 bytes ~= 16.02 GB available -> ~66% used!
+        self.assertGreater(avail_gb, 15.0)
+        self.assertLess(used_pct, 75)
+
+    def test_mlx_import_probe_caches_failure_once_to_prevent_nanobind_sigabrt(self) -> None:
+        orig_done = HardwareProfiler._mlx_probe_done
+        orig_core = HardwareProfiler._mlx_core_module
+        orig_lm = HardwareProfiler._mlx_lm_module
+        orig_err = HardwareProfiler._mlx_probe_error
+        try:
+            HardwareProfiler._mlx_probe_done = False
+            HardwareProfiler._mlx_core_module = None
+            HardwareProfiler._mlx_lm_module = None
+            HardwareProfiler._mlx_probe_error = ""
+
+            import_calls = []
+            real_import = __import__
+
+            def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+                if name == "mlx.core":
+                    import_calls.append(name)
+                    raise ImportError("[metal::load_device] No Metal device available")
+                return real_import(name, globals, locals, fromlist, level)
+
+            with patch("builtins.__import__", side_effect=fake_import):
+                m1, l1, err1 = HardwareProfiler.get_mlx_modules()
+                m2, l2, err2 = HardwareProfiler.get_mlx_modules()
+
+            self.assertIsNone(m1)
+            self.assertIsNone(l1)
+            self.assertIsNone(m2)
+            self.assertIsNone(l2)
+            self.assertIn("No Metal device available", err1)
+            self.assertEqual(err1, err2)
+            # Must NEVER attempt a second `import mlx.core` after first failure!
+            self.assertEqual(len(import_calls), 1)
+        finally:
+            HardwareProfiler._mlx_probe_done = orig_done
+            HardwareProfiler._mlx_core_module = orig_core
+            HardwareProfiler._mlx_lm_module = orig_lm
+            HardwareProfiler._mlx_probe_error = orig_err
 
 
 if __name__ == "__main__":

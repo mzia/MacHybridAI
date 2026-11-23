@@ -152,26 +152,23 @@ class MLXProvider:
 
     @classmethod
     def is_available(cls) -> bool:
-        """Returns True when mlx and mlx-lm are importable (cached per process)."""
+        """Returns True when mlx and mlx-lm are importable and Metal is initialized (cached once per process)."""
         if cls._mlx_available_cache is not None:
             return cls._mlx_available_cache
-        try:
-            import mlx.core  # noqa: F401
-            import mlx_lm  # noqa: F401
-            cls._mlx_available_cache = True
-        except ImportError:
-            cls._mlx_available_cache = False
+        mx, mlx_lm_mod, _ = HardwareProfiler.get_mlx_modules()
+        cls._mlx_available_cache = mx is not None and mlx_lm_mod is not None
         return cls._mlx_available_cache
 
     @staticmethod
     def unified_memory_gb() -> int:
         """Returns unified memory size in GB via MLX device info or HardwareProfiler."""
         try:
-            import mlx.core as mx
-            info = mx.device_info()
-            mem = int(info.get("memory_size", 0)) // (1024 ** 3)
-            if mem > 0:
-                return mem
+            mx, _, _ = HardwareProfiler.get_mlx_modules()
+            if mx is not None:
+                info = mx.device_info()
+                mem = int(info.get("memory_size", 0)) // (1024 ** 3)
+                if mem > 0:
+                    return mem
         except Exception:
             pass
         return int(HardwareProfiler.get_static_hardware_info()["unified_memory_gb"])
@@ -411,12 +408,14 @@ class MLXProvider:
 
     def _load_model(self) -> Any:
         """Load model+tokenizer once, configure Metal wired memory limit, and cache in-process."""
-        from mlx_lm import load
+        mx, mlx_lm_mod, mlx_err = HardwareProfiler.get_mlx_modules()
+        if mx is None or mlx_lm_mod is None:
+            raise RuntimeError(f"MLX runtime unavailable: {mlx_err or 'mlx-lm not installed'}")
+        load = mlx_lm_mod.load
 
         with MLXProvider._inference_lock:
             if not MLXProvider._wired_limit_configured:
                 try:
-                    import mlx.core as mx
                     info = mx.device_info()
                     ws_limit = int(info.get("max_recommended_working_set_size", 0))
                     if ws_limit > 0 and hasattr(mx, "set_wired_limit"):
@@ -426,7 +425,29 @@ class MLXProvider:
                 MLXProvider._wired_limit_configured = True
 
             if self._model_id not in MLXProvider._model_cache:
-                model, tokenizer = load(self._model_id)
+                prev_disable_bars = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
+                prev_offline = os.environ.get("HF_HUB_OFFLINE")
+                os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+                try:
+                    from huggingface_hub.utils import disable_progress_bars  # type: ignore[import-not-found]
+
+                    disable_progress_bars()
+                except Exception:
+                    pass
+                _, is_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(self._model_id)
+                if is_complete:
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                try:
+                    model, tokenizer = load(self._model_id)
+                finally:
+                    if prev_disable_bars is None:
+                        os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+                    else:
+                        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = prev_disable_bars
+                    if prev_offline is None:
+                        os.environ.pop("HF_HUB_OFFLINE", None)
+                    else:
+                        os.environ["HF_HUB_OFFLINE"] = prev_offline
                 MLXProvider._model_cache[self._model_id] = (model, tokenizer)
             return MLXProvider._model_cache[self._model_id]
 
@@ -438,11 +459,12 @@ class MLXProvider:
             cls._model_cache.clear()
         gc.collect()
         try:
-            import mlx.core as mx
-            if hasattr(mx, "clear_cache"):
-                mx.clear_cache()
-            elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
-                mx.metal.clear_cache()
+            mx = HardwareProfiler._mlx_core_module
+            if mx is not None:
+                if hasattr(mx, "clear_cache"):
+                    mx.clear_cache()
+                elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
+                    mx.metal.clear_cache()
         except Exception:
             pass
         return unloaded

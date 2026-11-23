@@ -20,6 +20,7 @@ import os
 import platform
 import plistlib
 import subprocess
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -225,9 +226,39 @@ class HardwareProfiler:
     _mem_stats_cache: Optional[Tuple[float, Tuple[int, float]]] = None
     _therm_level_cache: Optional[Tuple[float, int]] = None
     _hf_inspect_cache: Dict[Tuple[str, str], Tuple[float, Tuple[bool, bool, int, str, int]]] = {}
+    _mlx_probe_lock = threading.Lock()
+    _mlx_probe_done: bool = False
+    _mlx_core_module: Any = None
+    _mlx_lm_module: Any = None
+    _mlx_probe_error: str = ""
     _SAFE_REPO_CHARS = frozenset(
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:"
     )
+
+    @classmethod
+    def get_mlx_modules(cls) -> Tuple[Any, Any, str]:
+        """Imports `mlx.core` and `mlx_lm` at most once per Python process.
+
+        On Apple Silicon, if `import mlx.core` fails once (e.g. `[metal::load_device]
+        No Metal device available` in a sandboxed or headless session), re-importing
+        `mlx.core` in the same process causes nanobind's C++ registry (`_gc_func`) to
+        call `abort()` (SIGABRT). Caching the first probe prevents that crash completely.
+        """
+        with cls._mlx_probe_lock:
+            if not cls._mlx_probe_done:
+                cls._mlx_probe_done = True
+                try:
+                    import mlx.core as mx  # type: ignore[import-not-found]
+                    import mlx_lm  # type: ignore[import-not-found]
+
+                    cls._mlx_core_module = mx
+                    cls._mlx_lm_module = mlx_lm
+                    cls._mlx_probe_error = ""
+                except Exception as exc:
+                    cls._mlx_core_module = None
+                    cls._mlx_lm_module = None
+                    cls._mlx_probe_error = str(exc)
+            return cls._mlx_core_module, cls._mlx_lm_module, cls._mlx_probe_error
 
     @classmethod
     def _sysctl_str(cls, key: str, default: str = "") -> str:
@@ -277,22 +308,21 @@ class HardwareProfiler:
         max_buffer_gb = round(mem_gb * 0.58, 2)
 
         try:
-            import mlx.core as mx
-            import mlx_lm  # noqa: F401
-
-            mlx_avail = True
-            metal_avail = bool(mx.metal.is_available())
-            info = mx.device_info()
-            if info.get("device_name") and brand == "Apple Silicon":
-                brand = str(info["device_name"])
-            if info.get("architecture"):
-                gpu_arch = str(info["architecture"])
-            ws_bytes = int(info.get("max_recommended_working_set_size", 0))
-            if ws_bytes > 0:
-                working_set_gb = round(ws_bytes / (1024**3), 2)
-            mb_bytes = int(info.get("max_buffer_length", 0))
-            if mb_bytes > 0:
-                max_buffer_gb = round(mb_bytes / (1024**3), 2)
+            mx, mlx_lm_mod, _ = cls.get_mlx_modules()
+            if mx is not None and mlx_lm_mod is not None:
+                mlx_avail = True
+                metal_avail = bool(mx.metal.is_available())
+                info = mx.device_info()
+                if info.get("device_name") and brand == "Apple Silicon":
+                    brand = str(info["device_name"])
+                if info.get("architecture"):
+                    gpu_arch = str(info["architecture"])
+                ws_bytes = int(info.get("max_recommended_working_set_size", 0))
+                if ws_bytes > 0:
+                    working_set_gb = round(ws_bytes / (1024**3), 2)
+                mb_bytes = int(info.get("max_buffer_length", 0))
+                if mb_bytes > 0:
+                    max_buffer_gb = round(mb_bytes / (1024**3), 2)
         except Exception:
             pass
 
@@ -389,6 +419,7 @@ class HardwareProfiler:
 
             page_size = 16384
             free_pages = 0
+            inactive_pages = 0
             spec_pages = 0
             purgeable_pages = 0
 
@@ -403,6 +434,10 @@ class HardwareProfiler:
                     val = line.split(":", 1)[1].strip().rstrip(".")
                     if val.isdigit():
                         free_pages = int(val)
+                elif line.startswith("Pages inactive:"):
+                    val = line.split(":", 1)[1].strip().rstrip(".")
+                    if val.isdigit():
+                        inactive_pages = int(val)
                 elif line.startswith("Pages speculative:"):
                     val = line.split(":", 1)[1].strip().rstrip(".")
                     if val.isdigit():
@@ -413,8 +448,9 @@ class HardwareProfiler:
                         purgeable_pages = int(val)
 
             total_pages = max(1, total_bytes // page_size)
-            avail_pages = free_pages + spec_pages + purgeable_pages
-            used_pages = max(0, total_pages - (free_pages + spec_pages))
+            # On macOS, inactive & purgeable pages are reclaimable file cache (matching Activity Monitor)
+            avail_pages = free_pages + inactive_pages + spec_pages + purgeable_pages
+            used_pages = max(0, total_pages - avail_pages)
             used_pct = min(100, max(0, int((used_pages / total_pages) * 100)))
             avail_gb = round((avail_pages * page_size) / (1024**3), 2)
             out = (used_pct, max(1.0, avail_gb))

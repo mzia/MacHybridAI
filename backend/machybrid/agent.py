@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .m365_proxy import M365ToolEmulator
 from .orchestrator import ComputeMode, ExecutionReceipt, HybridOrchestrator
+from .profiler import HardwareProfiler
 from .providers import LocalModelProvider, ProviderResponse
 
 _IGNORED_DIRS = frozenset(
@@ -46,6 +47,214 @@ _IGNORED_DIRS = frozenset(
         "build",
     }
 )
+
+
+def _is_ignored_dir(name: str) -> bool:
+    return (
+        name in _IGNORED_DIRS
+        or name.endswith(".app")
+        or name.endswith(".egg-info")
+        or name.startswith(".aider.")
+    )
+
+
+def _is_ignored_file(name: str) -> bool:
+    return name == ".DS_Store" or name.startswith(".aider.")
+
+
+def diagnose_cli_permissions(
+    workspace_root: str,
+    orchestrator: Optional[HybridOrchestrator] = None,
+) -> List[Dict[str, Any]]:
+    """Checks all macOS filesystem, TCC, Metal/MLX, history, PATH, and cloud permissions needed by the CLI."""
+    root = os.path.realpath(os.path.abspath(os.path.expanduser(workspace_root)))
+    home = os.path.expanduser("~")
+    checks: List[Dict[str, Any]] = []
+
+    # 1. Workspace directory read & listing access (catches macOS TCC denials on Desktop/Documents/Downloads)
+    try:
+        with os.scandir(root) as it:
+            entry_count = sum(1 for _ in it)
+        checks.append(
+            {
+                "name": "workspace_read",
+                "ok": True,
+                "detail": f"Readable ({entry_count} top-level entries in {root})",
+                "remediation": "",
+            }
+        )
+    except PermissionError:
+        checks.append(
+            {
+                "name": "workspace_read",
+                "ok": False,
+                "detail": f"macOS denied directory read access to {root}",
+                "remediation": (
+                    "Grant your terminal app access in macOS System Settings -> "
+                    "Privacy & Security -> Files and Folders (or Full Disk Access)."
+                ),
+            }
+        )
+    except OSError as exc:
+        checks.append(
+            {
+                "name": "workspace_read",
+                "ok": False,
+                "detail": f"Cannot read workspace {root}: {exc}",
+                "remediation": "Verify the --workspace path exists and is accessible.",
+            }
+        )
+
+    # 2. Workspace write permission (needed for edit_file / write_file)
+    can_write = os.access(root, os.W_OK)
+    checks.append(
+        {
+            "name": "workspace_write",
+            "ok": can_write,
+            "detail": f"{'Writable' if can_write else 'Read-only'} ({root})",
+            "remediation": "" if can_write else "Use --plan for read-only mode or fix directory write permissions.",
+        }
+    )
+
+    # 3. macOS TCC protected folder advisory
+    protected_roots = [
+        os.path.realpath(os.path.join(home, folder))
+        for folder in ("Desktop", "Documents", "Downloads")
+    ]
+    in_tcc_folder = False
+    for p in protected_roots:
+        try:
+            if os.path.commonpath([p, root]) == p:
+                in_tcc_folder = True
+                break
+        except ValueError:
+            continue
+    checks.append(
+        {
+            "name": "macos_tcc_scope",
+            "ok": True,
+            "detail": (
+                "Workspace is inside a macOS TCC-protected folder (Desktop/Documents/Downloads)"
+                if in_tcc_folder
+                else "Workspace is outside macOS TCC-protected Desktop/Documents/Downloads folders"
+            ),
+            "remediation": (
+                "If macOS prompts, allow your terminal in System Settings -> Privacy & Security -> Files and Folders."
+                if in_tcc_folder
+                else ""
+            ),
+        }
+    )
+
+    # 4. Apple Silicon Metal & MLX local inference runtime
+    mx_mod, mlx_lm_mod, mlx_err = HardwareProfiler.get_mlx_modules()
+    mlx_ok = mx_mod is not None and mlx_lm_mod is not None
+    if mlx_ok:
+        mlx_detail = "Apple MLX + Metal GPU runtime available"
+        mlx_fix = ""
+    elif "metal" in mlx_err.lower():
+        mlx_detail = f"Metal GPU unavailable in this session ({mlx_err.splitlines()[0][:140]})"
+        mlx_fix = "Run in a standard macOS Terminal session with Metal GPU access (not a headless/sandboxed subshell)."
+    else:
+        mlx_detail = "MLX not installed in current Python interpreter"
+        mlx_fix = "Install mlx-lm (`pip install mlx mlx-lm`) or run via Homebrew Python."
+    checks.append(
+        {
+            "name": "mlx_metal_runtime",
+            "ok": mlx_ok,
+            "detail": mlx_detail,
+            "remediation": mlx_fix,
+        }
+    )
+
+    # 5. Local HuggingFace MLX model cache access
+    hf_dir = Path(os.environ.get("HF_HUB_CACHE", os.path.expanduser("~/.cache/huggingface/hub")))
+    try:
+        if hf_dir.is_dir():
+            cached = HardwareProfiler.scan_cached_models(hf_hub_dir=hf_dir)
+            complete = [m for m in cached if m.is_complete]
+            checks.append(
+                {
+                    "name": "hf_model_cache",
+                    "ok": len(complete) > 0,
+                    "detail": f"{len(complete)} complete local MLX model(s) cached in {hf_dir}",
+                    "remediation": "" if complete else "Download a local model: huggingface-cli download mlx-community/gemma-3-4b-it-4bit",
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "name": "hf_model_cache",
+                    "ok": False,
+                    "detail": f"HuggingFace cache folder not found ({hf_dir})",
+                    "remediation": "Run: huggingface-cli download mlx-community/gemma-3-4b-it-4bit",
+                }
+            )
+    except PermissionError:
+        checks.append(
+            {
+                "name": "hf_model_cache",
+                "ok": False,
+                "detail": f"Permission denied reading {hf_dir}",
+                "remediation": f"Allow read access to {hf_dir} or set HF_HUB_CACHE to a readable directory.",
+            }
+        )
+
+    # 6. History storage directory permissions
+    hist_dir = Path(os.path.expanduser("~/Library/Application Support/MacHybridAI/history"))
+    try:
+        probe = hist_dir
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        hist_writable = probe.is_dir() and os.access(probe, os.W_OK)
+        checks.append(
+            {
+                "name": "history_storage",
+                "ok": hist_writable,
+                "detail": f"{'Accessible' if hist_writable else 'Not writable'} ({hist_dir})",
+                "remediation": "" if hist_writable else "Ensure ~/Library/Application Support/MacHybridAI is writable.",
+            }
+        )
+    except OSError:
+        checks.append(
+            {
+                "name": "history_storage",
+                "ok": False,
+                "detail": f"Cannot stat {hist_dir} (sandboxed or restricted)",
+                "remediation": "Run outside a restricted sandbox to persist local prompt history.",
+            }
+        )
+
+    # 7. CLI installation & PATH check
+    local_bin = os.path.expanduser("~/.local/bin")
+    cli_bin = os.path.join(local_bin, "machybrid")
+    on_path = local_bin in os.environ.get("PATH", "").split(os.pathsep)
+    installed = os.path.isfile(cli_bin) and os.access(cli_bin, os.X_OK)
+    checks.append(
+        {
+            "name": "cli_path_install",
+            "ok": installed and on_path,
+            "detail": f"installed={installed}, ~/.local/bin in PATH={on_path}",
+            "remediation": "" if (installed and on_path) else "Run `./scripts/install_cli.sh` and add `export PATH=\"$HOME/.local/bin:$PATH\"` to ~/.zshrc.",
+        }
+    )
+
+    # 8. Cloud AI provider credential readiness (reads presence metadata only, never secrets)
+    orch = orchestrator or HybridOrchestrator()
+    ready_providers = [p["id"] for p in orch.list_cloud_providers() if p.get("configured")]
+    checks.append(
+        {
+            "name": "cloud_providers_ready",
+            "ok": len(ready_providers) > 0,
+            "detail": (
+                f"{len(ready_providers)} cloud provider(s) ready: {', '.join(ready_providers)}"
+                if ready_providers
+                else "0 cloud API keys set in environment (Local Apple Silicon & offline modes still work)"
+            ),
+            "remediation": "" if ready_providers else "Export GEMINI_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY — or use `/key <provider> <value>` in REPL.",
+        }
+    )
+    return checks
 
 
 @dataclass
@@ -130,11 +339,13 @@ class WorkspaceToolbox:
         workspace_root: str,
         plan_mode: bool = False,
         auto_approve: bool = False,
-        approval_callback: Optional[Callable[[str, Dict[str, Any], str], bool]] = None,
+        approval_callback: Optional[Callable[[str, Dict[str, Any], str], Any]] = None,
     ) -> None:
         self.workspace_root = os.path.realpath(os.path.abspath(os.path.expanduser(workspace_root)))
         self.plan_mode = plan_mode
         self.auto_approve = auto_approve
+        self.allow_all_edits = False
+        self.allow_all_commands = False
         self.approval_callback = approval_callback
 
     @staticmethod
@@ -251,8 +462,19 @@ class WorkspaceToolbox:
             return False
         if self.auto_approve:
             return True
+        if tool_name in {"write_file", "edit_file"} and self.allow_all_edits:
+            return True
+        if tool_name == "run_command" and self.allow_all_commands:
+            return True
         if self.approval_callback is not None:
-            return bool(self.approval_callback(tool_name, args, preview))
+            decision = self.approval_callback(tool_name, args, preview)
+            if decision == "always":
+                if tool_name in {"write_file", "edit_file"}:
+                    self.allow_all_edits = True
+                elif tool_name == "run_command":
+                    self.allow_all_commands = True
+                return True
+            return bool(decision)
         return False
 
     def execute(self, tool_name: str, arguments: Dict[str, Any]) -> Tuple[str, bool]:
@@ -276,31 +498,71 @@ class WorkspaceToolbox:
         return f"[Unknown tool: {tool_name}]", False
 
     def _tool_list_files(self, args: Dict[str, Any]) -> str:
-        rel = str(args.get("path", "."))
-        max_depth = max(1, min(4, int(args.get("max_depth", 2))))
+        rel = str(args.get("path", ".")).strip() or "."
+        max_depth = max(1, min(4, int(args.get("max_depth", 1))))
         try:
             target = self.resolve_safe_path(rel)
             if not target.exists():
                 return f"Path not found: {rel}"
             if target.is_file():
                 return str(target.relative_to(self.workspace_root))
+
+            # Explicit readability probe so macOS TCC PermissionError is never silently swallowed
+            try:
+                with os.scandir(target) as it:
+                    _ = next(it, None)
+            except PermissionError:
+                return (
+                    f"PermissionError: macOS denied read access to '{target}'. "
+                    "Grant your terminal app access in System Settings -> Privacy & Security -> "
+                    "Files and Folders (or Full Disk Access), then retry."
+                )
+
             entries: List[str] = []
+            denied_paths: List[str] = []
             base_depth = len(target.parts)
-            for root, dirs, files in os.walk(target):
-                dirs[:] = sorted(d for d in dirs if d not in _IGNORED_DIRS)
+
+            def _on_walk_error(err: OSError) -> None:
+                if isinstance(err, PermissionError) and err.filename:
+                    denied_paths.append(os.path.relpath(err.filename, self.workspace_root))
+
+            for root, dirs, files in os.walk(target, onerror=_on_walk_error):
+                visible_dirs = sorted(d for d in dirs if not _is_ignored_dir(d))
                 cur_depth = len(Path(root).parts) - base_depth
-                if cur_depth >= max_depth:
-                    dirs.clear()
                 rel_root = os.path.relpath(root, self.workspace_root)
+
+                # Show subdirectories explicitly (e.g. `backend/`, `Sources/`)
+                for dname in visible_dirs:
+                    rel_dir = dname if rel_root == "." else os.path.join(rel_root, dname)
+                    entries.append(f"{rel_dir}/")
+
+                # Show files in this directory
                 for fname in sorted(files):
-                    if fname.startswith(".DS_Store"):
+                    if _is_ignored_file(fname):
                         continue
                     rel_file = fname if rel_root == "." else os.path.join(rel_root, fname)
                     entries.append(rel_file)
-                    if len(entries) >= 200:
-                        entries.append("... (truncated at 200 files)")
-                        return "\n".join(entries)
-            return "\n".join(entries) if entries else "(empty directory)"
+                    if len(entries) >= 250:
+                        entries.append("... (truncated at 250 entries)")
+                        break
+
+                if len(entries) >= 250:
+                    break
+
+                if cur_depth + 1 >= max_depth:
+                    dirs.clear()
+                else:
+                    dirs[:] = visible_dirs
+
+            if not entries and not denied_paths:
+                return "(empty directory)"
+            out_lines = list(entries)
+            if denied_paths:
+                out_lines.append(
+                    f"\n[Permission Denied on {len(denied_paths)} path(s): {', '.join(denied_paths[:5])} — "
+                    "grant Files & Folders / Full Disk Access in macOS System Settings]"
+                )
+            return "\n".join(out_lines)
         except Exception as exc:
             return f"list_files error: {exc}"
 
@@ -335,8 +597,10 @@ class WorkspaceToolbox:
                 pattern = re.compile(re.escape(query), re.IGNORECASE)
             hits: List[str] = []
             for root, dirs, files in os.walk(target):
-                dirs[:] = sorted(d for d in dirs if d not in _IGNORED_DIRS)
+                dirs[:] = sorted(d for d in dirs if not _is_ignored_dir(d))
                 for fname in sorted(files):
+                    if _is_ignored_file(fname):
+                        continue
                     fpath = Path(root) / fname
                     try:
                         if fpath.stat().st_size > 512_000:
@@ -455,9 +719,33 @@ class HybridCLIAgent:
         "All sensitive data in prompts and tool outputs has been masked into stand-in tokens "
         "like `[PERSON_1]`, `[EMAIL_1]`, `[SECRET_1]` by the on-device Privacy Gate. "
         "Preserve those stand-in tokens verbatim in your reasoning, edits, and answers so the Mac "
-        "can restore real values locally. When you need a tool, invoke it via native tool calling "
-        "or a Markdown fenced block (```read_file, ```search_code, ```edit_file, ```write_file, ```run_command). "
-        "When the task is complete, respond clearly in Markdown without extra tool blocks."
+        "can restore real values locally. "
+        "Only call a tool when you need data not already present in the workspace overview or prior "
+        "tool results, or when modifying files or running a command. "
+        "When calling a tool via Markdown fence, put ONLY ONE exact tool name right after triple "
+        "backticks (for example ```read_file) followed by a valid JSON object and closing ```. "
+        "Never combine multiple tool names or trailing commas in a code fence header. "
+        "When the task is complete, respond clearly and accurately in Markdown without extra tool blocks."
+    )
+
+    _DIRECT_LIST_FILES_RE = re.compile(
+        r"^(?:"
+        r"ls(?:\s+-[a-zA-Z]+)*|"
+        r"dir|"
+        r"(?:please\s+)?(?:can\s+you\s+|could\s+you\s+)?(?:list|show|display|print)\s+"
+        r"(?:me\s+)?(?:all\s+)?(?:the\s+)?(?:files|folders|directories|contents|"
+        r"files\s+and\s+(?:folders|directories)|directories\s+and\s+files)"
+        r"(?:\s+(?:in|of|under|inside)\s+(?:this|the\s+current|current|my|workspace)?\s*"
+        r"(?:dir|directory|folder|workspace|repo|project)?)?|"
+        r"what(?:\s+files|\s+folders|'s|\s+is|\s+are)?\s+(?:in|inside)\s+"
+        r"(?:this|the\s+current|current|my)\s+(?:dir|directory|folder|workspace)"
+        r")(?:\s+(?:in|of|under|inside)\s+(?P<target>[./~A-Za-z0-9_-]+(?:/[A-Za-z0-9_.-]+)*))?"
+        r"[\s?.!]*$",
+        re.IGNORECASE,
+    )
+    _DIRECT_LS_TARGET_RE = re.compile(
+        r"^ls(?:\s+-[a-zA-Z]+)*\s+(?P<target>[./~A-Za-z0-9_-]+(?:/[A-Za-z0-9_.-]+)*)\s*$",
+        re.IGNORECASE,
     )
 
     def __init__(
@@ -468,7 +756,7 @@ class HybridCLIAgent:
         plan_mode: bool = False,
         auto_approve: bool = False,
         approve_cloud_dispatch: bool = False,
-        approval_callback: Optional[Callable[[str, Dict[str, Any], str], bool]] = None,
+        approval_callback: Optional[Callable[[str, Dict[str, Any], str], Any]] = None,
         cloud_approval_callback: Optional[Callable[[str, int, List[str]], Optional[str]]] = None,
         event_callback: Optional[Callable[[str, str], None]] = None,
     ) -> None:
@@ -498,6 +786,36 @@ class HybridCLIAgent:
         files_listing, _ = self.toolbox.execute("list_files", {"path": ".", "max_depth": 2})
         return f"Workspace root: {os.path.basename(self.workspace_root)}\nFiles:\n{files_listing[:2000]}"
 
+    def _build_local_system_instruction(self, tools: List[Dict[str, Any]]) -> str:
+        """Builds system prompt with `<tools>` schema instructions for local models."""
+        tools_prompt = M365ToolEmulator.format_tools_prompt(tools)
+        if not tools_prompt:
+            return self.AGENT_SYSTEM_PROMPT
+        return f"{self.AGENT_SYSTEM_PROMPT}\n\n{tools_prompt}"
+
+    @classmethod
+    def _try_direct_workspace_tool(cls, goal: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """Detects unambiguous single-intent workspace listing goals for instant grounded Station 1 execution.
+
+        Multi-step or compound prompts (e.g. 'list files and explain auth.py') return None so the
+        full autonomous hybrid reasoning loop handles them.
+        """
+        stripped = goal.strip()
+        if not stripped or len(stripped) > 160:
+            return None
+
+        ls_match = cls._DIRECT_LS_TARGET_RE.match(stripped)
+        if ls_match:
+            target = ls_match.group("target").strip().rstrip("/") or "."
+            return "list_files", {"path": target, "max_depth": 1}
+
+        m = cls._DIRECT_LIST_FILES_RE.match(stripped)
+        if not m:
+            return None
+        target = (m.group("target") or ".").strip().rstrip("/") or "."
+        recursive = bool(re.search(r"\b(?:all|recursiv\w*|tree)\b", stripped, re.IGNORECASE))
+        return "list_files", {"path": target, "max_depth": 2 if recursive else 1}
+
     def _call_reasoning_model(
         self,
         active_mode: ComputeMode,
@@ -510,6 +828,8 @@ class HybridCLIAgent:
 
         Returns `(response, outbound_sha256, pii_flagged_count, pii_categories, nothing_left_mac)`.
         """
+        local_system_instruction = self._build_local_system_instruction(tools)
+
         if active_mode == ComputeMode.LOCAL:
             self._emit("station1", f"Running 100% locally on Apple Silicon ({effective_local_model or 'auto'})")
             local_provider = LocalModelProvider(
@@ -520,7 +840,7 @@ class HybridCLIAgent:
             )
             resp = local_provider.generate(
                 prompt=prompt_text,
-                system_instruction=self.AGENT_SYSTEM_PROMPT,
+                system_instruction=local_system_instruction,
             )
             return resp, "local_only_no_outbound_payload", 0, [], True
 
@@ -541,7 +861,7 @@ class HybridCLIAgent:
             )
             resp = local_provider.generate(
                 prompt=prompt_text,
-                system_instruction=self.AGENT_SYSTEM_PROMPT,
+                system_instruction=local_system_instruction,
             )
             return (
                 resp,
@@ -566,7 +886,7 @@ class HybridCLIAgent:
                 )
                 resp = local_provider.generate(
                     prompt=prompt_text,
-                    system_instruction=self.AGENT_SYSTEM_PROMPT,
+                    system_instruction=local_system_instruction,
                 )
                 return (
                     resp,
@@ -652,6 +972,82 @@ class HybridCLIAgent:
     ) -> AgentRunResult:
         """Executes the autonomous multi-step Hybrid Agent loop for `goal`."""
         t0 = time.monotonic()
+
+        # Station 1 grounded fast path for unambiguous directory-listing goals:
+        # executes WorkspaceToolbox directly without small-model hallucination or truncation.
+        direct_call = None if attached_files else self._try_direct_workspace_tool(goal)
+        if direct_call is not None:
+            tool_name, tool_args = direct_call
+            self._emit("station1", "Executing grounded local workspace tool directly on this Mac")
+            self._emit("tool", f"Executing local tool `{tool_name}`")
+            t_tool = time.monotonic()
+            tool_out, was_approved = self.toolbox.execute(tool_name, tool_args)
+            tool_ms = max(1, int((time.monotonic() - t_tool) * 1000))
+
+            target_label = str(tool_args.get("path", "."))
+            if tool_out.startswith(("PermissionError:", "list_files error:", "Directory not found:")):
+                final_answer = tool_out
+            elif tool_out == "(empty directory)":
+                final_answer = f"**Workspace directory (`{target_label}`)** is empty."
+            else:
+                listing_lines = [
+                    ln
+                    for ln in tool_out.splitlines()
+                    if ln.strip() and not ln.startswith("[Permission Denied") and not ln.startswith("... (")
+                ]
+                dir_count = sum(1 for ln in listing_lines if ln.endswith("/"))
+                file_count = len(listing_lines) - dir_count
+                final_answer = (
+                    f"**Workspace directory (`{target_label}`)** — "
+                    f"{dir_count} director{'y' if dir_count == 1 else 'ies'}, "
+                    f"{file_count} file{'' if file_count == 1 else 's'}:\n\n"
+                    f"```\n{tool_out}\n```"
+                )
+
+            step_record = AgentTurnRecord(
+                step=1,
+                mode_used=ComputeMode.LOCAL.value,
+                provider_used="Local Workspace Toolbox",
+                model_used="station1-grounded-tool",
+                assistant_text=final_answer,
+                tool_calls=[
+                    AgentToolCall(
+                        tool_name=tool_name,
+                        arguments=tool_args,
+                        output=tool_out[:4000],
+                        approved=was_approved,
+                        duration_ms=tool_ms,
+                        pii_scrubbed_before_cloud=0,
+                    )
+                ],
+                outbound_sanitized_sha256="local_only_no_outbound_payload",
+                pii_flagged_count=0,
+            )
+            self._conversation_turns.append(f"USER: {goal}\nASSISTANT: {final_answer[:600]}")
+            receipt = ExecutionReceipt(
+                mode_executed=ComputeMode.LOCAL.value,
+                local_model_used="station1-grounded-tool (on this Mac)",
+                local_agent_location="on this Mac",
+                cloud_models_used="not used",
+                pii_flagged_count=0,
+                pii_restored_count=0,
+                pii_categories=[],
+                nothing_left_mac=True,
+                cloud_zero_retention=True,
+                outbound_payload_sha256="local_only_no_outbound_payload",
+            )
+            total_ms = max(1, int((time.monotonic() - t0) * 1000))
+            return AgentRunResult(
+                goal=goal,
+                workspace=self.workspace_root,
+                final_output=final_answer,
+                steps=[step_record],
+                receipt=receipt,
+                plan_mode=self.toolbox.plan_mode,
+                total_tool_calls=1,
+                total_duration_ms=total_ms,
+            )
+
         requested_mode = mode or self.orchestrator.config.compute_mode
         active_mode = (
             self.orchestrator._resolve_smart_auto_mode(goal)
