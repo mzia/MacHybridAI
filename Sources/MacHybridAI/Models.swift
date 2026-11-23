@@ -25,20 +25,123 @@ public enum ComputeModeOption: String, CaseIterable, Codable, Sendable {
     }
 }
 
+public enum CustomCloudProtocolOption: String, CaseIterable, Codable, Sendable {
+    case openai = "openai"
+    case anthropic = "anthropic"
+
+    public var displayName: String {
+        switch self {
+        case .openai: return "OpenAI Compatible (/chat/completions)"
+        case .anthropic: return "Anthropic Messages (/v1/messages)"
+        }
+    }
+}
+
 public enum CloudProviderOption: String, CaseIterable, Codable, Sendable {
     case gemini = "gemini"
+    case openai = "openai"
+    case anthropic = "anthropic"
     case antigravity = "antigravity"
     case m365Copilot = "m365_copilot"
+    case openRouter = "openrouter"
+    case xai = "xai"
+    case groq = "groq"
+    case deepseek = "deepseek"
+    case mistral = "mistral"
+    case perplexity = "perplexity"
+    case together = "together"
     case openAICompatible = "openai_compatible"
     case consensus = "consensus"
 
     public var displayName: String {
         switch self {
         case .gemini: return "Google Gemini (gemini-3.8-flash)"
+        case .openai: return "OpenAI (gpt-4.1 / o3-mini)"
+        case .anthropic: return "Anthropic Claude (claude-sonnet-4-5)"
         case .antigravity: return "Google Antigravity Agent"
         case .m365Copilot: return "M365 Copilot Proxy (gpt-5.5-think-deeper)"
-        case .openAICompatible: return "OpenAI Extension API"
-        case .consensus: return "Multi-Cloud Consensus Arena (Gemini + M365)"
+        case .openRouter: return "OpenRouter (300+ Cloud Models)"
+        case .xai: return "xAI Grok (grok-3)"
+        case .groq: return "Groq LPU (llama-3.3-70b)"
+        case .deepseek: return "DeepSeek (deepseek-reasoner)"
+        case .mistral: return "Mistral AI (mistral-large)"
+        case .perplexity: return "Perplexity Sonar (sonar-pro)"
+        case .together: return "Together AI (Llama 3.3 70B)"
+        case .openAICompatible: return "Custom Any Cloud AI (OpenAI / Anthropic / Azure)"
+        case .consensus: return "Multi-Cloud Consensus (Gemini + Claude + OpenAI)"
+        }
+    }
+
+    public var shortName: String {
+        switch self {
+        case .gemini: return "Gemini"
+        case .openai: return "OpenAI"
+        case .anthropic: return "Claude"
+        case .antigravity: return "Antigravity"
+        case .m365Copilot: return "M365 Copilot"
+        case .openRouter: return "OpenRouter"
+        case .xai: return "xAI Grok"
+        case .groq: return "Groq"
+        case .deepseek: return "DeepSeek"
+        case .mistral: return "Mistral"
+        case .perplexity: return "Perplexity"
+        case .together: return "Together"
+        case .openAICompatible: return "Custom API"
+        case .consensus: return "Consensus"
+        }
+    }
+
+    public var defaultBaseURL: String {
+        switch self {
+        case .gemini, .antigravity: return "https://generativelanguage.googleapis.com"
+        case .openai: return "https://api.openai.com/v1"
+        case .anthropic: return "https://api.anthropic.com/v1"
+        case .m365Copilot: return "http://127.0.0.1:4141/v1"
+        case .openRouter: return "https://openrouter.ai/api/v1"
+        case .xai: return "https://api.x.ai/v1"
+        case .groq: return "https://api.groq.com/openai/v1"
+        case .deepseek: return "https://api.deepseek.com/v1"
+        case .mistral: return "https://api.mistral.ai/v1"
+        case .perplexity: return "https://api.perplexity.ai"
+        case .together: return "https://api.together.xyz/v1"
+        case .openAICompatible: return "https://api.openai.com/v1"
+        case .consensus: return "multi-cloud"
+        }
+    }
+
+    public var defaultModel: String {
+        switch self {
+        case .gemini: return "gemini-3.8-flash"
+        case .openai: return "gpt-4.1"
+        case .anthropic: return "claude-sonnet-4-5"
+        case .antigravity: return "antigravity-preview-05-2026"
+        case .m365Copilot: return "gpt-5.5-think-deeper"
+        case .openRouter: return "anthropic/claude-sonnet-4.5"
+        case .xai: return "grok-3"
+        case .groq: return "llama-3.3-70b-versatile"
+        case .deepseek: return "deepseek-reasoner"
+        case .mistral: return "mistral-large-latest"
+        case .perplexity: return "sonar-pro"
+        case .together: return "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+        case .openAICompatible: return "gpt-4.1"
+        case .consensus: return "gemini + anthropic + openai"
+        }
+    }
+
+    public var apiKeyEnvName: String {
+        switch self {
+        case .gemini, .antigravity: return "GEMINI_API_KEY"
+        case .openai, .openAICompatible: return "OPENAI_API_KEY"
+        case .anthropic: return "ANTHROPIC_API_KEY"
+        case .m365Copilot: return "M365_SECRETS_FILE"
+        case .openRouter: return "OPENROUTER_API_KEY"
+        case .xai: return "XAI_API_KEY"
+        case .groq: return "GROQ_API_KEY"
+        case .deepseek: return "DEEPSEEK_API_KEY"
+        case .mistral: return "MISTRAL_API_KEY"
+        case .perplexity: return "PERPLEXITY_API_KEY"
+        case .together: return "TOGETHER_API_KEY"
+        case .consensus: return "GEMINI_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY"
         }
     }
 }

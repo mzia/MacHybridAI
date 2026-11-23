@@ -34,14 +34,19 @@ from .local_rag import LocalWorkspaceRAG
 from .m365_proxy import M365CopilotProxyManager, M365ModelCatalog, M365ProxySettings
 from .profiler import HardwareProfiler
 from .providers import (
+    CLOUD_PROVIDER_PRESETS,
+    DEFAULT_ANTHROPIC_MODEL,
     DEFAULT_ANTIGRAVITY_AGENT,
     DEFAULT_GEMINI_MODEL,
+    DEFAULT_OPENAI_MODEL,
+    AnthropicProvider,
     AntigravityProvider,
     GeminiProvider,
     LocalModelProvider,
     M365CopilotProvider,
     OpenAICompatibleProvider,
     ProviderResponse,
+    build_cloud_provider_catalog,
     normalize_gemini_model,
 )
 
@@ -60,15 +65,23 @@ class HybridConfig:
     """User-configurable settings for MacHybridAI."""
 
     compute_mode: ComputeMode = ComputeMode.HYBRID
-    cloud_provider: str = "gemini"  # "gemini" | "antigravity" | "openai_compatible" | "m365_copilot"
+    cloud_provider: str = "gemini"  # Any preset ID ("gemini", "openai", "anthropic", "openrouter", "xai", "groq", "deepseek", "mistral", "perplexity", "together", "antigravity", "m365_copilot", "openai_compatible", "consensus")
     gemini_model: str = DEFAULT_GEMINI_MODEL
     antigravity_agent: str = DEFAULT_ANTIGRAVITY_AGENT
+    anthropic_model: str = DEFAULT_ANTHROPIC_MODEL
+    anthropic_base_url: str = "https://api.anthropic.com/v1"
     local_backend: str = "mlx"       # "mlx" | "litert" | "ollama" | "lmstudio"
     local_model: str = ""            # empty = auto-select best MLX model by available RAM
     local_base_url: str = "http://127.0.0.1:11434/v1"
     litert_model_path: str = "~/.litert-lm/models/gemma4-26b/model.litertlm"
     openai_base_url: str = "https://api.openai.com/v1"
-    openai_model: str = "gpt-4.1"
+    openai_model: str = DEFAULT_OPENAI_MODEL
+    custom_provider_protocol: str = "openai"  # "openai" | "anthropic"
+    custom_provider_auth_header: str = "Authorization"  # "Authorization" | "x-api-key" | "api-key"
+    provider_models: Dict[str, str] = field(default_factory=dict)
+    consensus_providers: List[str] = field(
+        default_factory=lambda: ["gemini", "anthropic", "openai"]
+    )
     m365_port: int = 4141
     m365_model: str = M365ModelCatalog.DEFAULT_TOOL_MODEL
     guardian_policy: GuardianPolicy = GuardianPolicy.REVERSIBLE_MASK
@@ -85,12 +98,18 @@ class HybridConfig:
             "cloud_provider": self.cloud_provider,
             "gemini_model": normalize_gemini_model(self.gemini_model),
             "antigravity_agent": self.antigravity_agent,
+            "anthropic_model": self.anthropic_model,
+            "anthropic_base_url": self.anthropic_base_url,
             "local_backend": self.local_backend,
             "local_model": self.local_model,
             "local_base_url": self.local_base_url,
             "litert_model_path": self.litert_model_path,
             "openai_base_url": self.openai_base_url,
             "openai_model": self.openai_model,
+            "custom_provider_protocol": self.custom_provider_protocol,
+            "custom_provider_auth_header": self.custom_provider_auth_header,
+            "provider_models": dict(self.provider_models),
+            "consensus_providers": list(self.consensus_providers),
             "m365_port": self.m365_port,
             "m365_model": M365ModelCatalog.resolve_model(self.m365_model),
             "guardian_policy": self.guardian_policy.value,
@@ -221,10 +240,16 @@ class HybridOrchestrator:
             redacted_only=self.config.history_redacted_only,
         )
         self.rag = LocalWorkspaceRAG()
+        # In-memory API keys configured at runtime (never persisted to disk or echoed by /v1/config)
+        self._runtime_api_keys: Dict[str, str] = {}
         self.allowed_roots = [
             os.path.abspath(os.path.expanduser(r))
             for r in (allowed_roots or [os.path.expanduser("~")])
         ]
+
+    def list_cloud_providers(self) -> List[Dict[str, Any]]:
+        """Returns all built-in and custom cloud AI provider presets with live key detection status."""
+        return build_cloud_provider_catalog(self._runtime_api_keys)
 
     def update_config(self, updates: Dict[str, Any]) -> HybridConfig:
         """Updates orchestrator configuration and syncs Guardian, M365, and History settings."""
@@ -236,6 +261,10 @@ class HybridOrchestrator:
             self.config.gemini_model = normalize_gemini_model(str(updates["gemini_model"]))
         if "antigravity_agent" in updates:
             self.config.antigravity_agent = str(updates["antigravity_agent"])
+        if "anthropic_model" in updates:
+            self.config.anthropic_model = str(updates["anthropic_model"]).strip() or DEFAULT_ANTHROPIC_MODEL
+        if "anthropic_base_url" in updates:
+            self.config.anthropic_base_url = str(updates["anthropic_base_url"]).strip() or "https://api.anthropic.com/v1"
         if "local_backend" in updates:
             self.config.local_backend = str(updates["local_backend"])
         if "local_model" in updates:
@@ -248,6 +277,33 @@ class HybridOrchestrator:
             self.config.openai_base_url = str(updates["openai_base_url"])
         if "openai_model" in updates:
             self.config.openai_model = str(updates["openai_model"])
+        if "custom_provider_protocol" in updates:
+            proto = str(updates["custom_provider_protocol"]).strip().lower()
+            if proto in {"openai", "anthropic"}:
+                self.config.custom_provider_protocol = proto
+        if "custom_provider_auth_header" in updates:
+            hdr = str(updates["custom_provider_auth_header"]).strip()
+            if hdr:
+                self.config.custom_provider_auth_header = hdr
+        if "provider_models" in updates and isinstance(updates["provider_models"], dict):
+            for k, v in updates["provider_models"].items():
+                key_clean = str(k).strip().lower()
+                val_clean = str(v).strip()
+                if key_clean and val_clean:
+                    self.config.provider_models[key_clean] = val_clean
+        if "consensus_providers" in updates and isinstance(updates["consensus_providers"], list):
+            cleaned_provs = [str(x).strip().lower() for x in updates["consensus_providers"] if str(x).strip()]
+            if len(cleaned_provs) >= 2:
+                self.config.consensus_providers = cleaned_provs[:4]
+        if "api_keys" in updates and isinstance(updates["api_keys"], dict):
+            for k, v in updates["api_keys"].items():
+                key_id = str(k).strip().lower()
+                secret_val = str(v).strip()
+                if key_id:
+                    if secret_val:
+                        self._runtime_api_keys[key_id] = secret_val
+                    else:
+                        self._runtime_api_keys.pop(key_id, None)
         if "m365_port" in updates:
             self.config.m365_port = int(updates["m365_port"])
             self.m365_manager.settings.port = self.config.m365_port
@@ -691,7 +747,7 @@ class HybridOrchestrator:
         )
 
         if use_consensus:
-            arena_targets = consensus_providers or ["gemini", "m365_copilot"]
+            arena_targets = consensus_providers or self.config.consensus_providers or ["gemini", "anthropic", "openai"]
             with ThreadPoolExecutor(max_workers=min(4, len(arena_targets))) as pool:
                 futures = [
                     pool.submit(
@@ -825,23 +881,78 @@ class HybridOrchestrator:
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> ProviderResponse:
         name = provider_name.lower().strip()
+        if name == "claude":
+            name = "anthropic"
+        elif name == "custom":
+            name = "openai_compatible"
+
+        runtime_key = self._runtime_api_keys.get(name, "")
+
         if name == "antigravity":
             return AntigravityProvider(
+                api_key=runtime_key or self._runtime_api_keys.get("gemini", "") or None,
                 agent_id=self.config.antigravity_agent,
             ).generate(prompt=sanitized_prompt)
+
         if name == "m365_copilot":
             return M365CopilotProvider(
                 base_url=self.m365_manager.settings.base_url,
                 model=self.config.m365_model,
             ).generate(prompt=sanitized_prompt, tools=tools)
+
+        if name == "anthropic":
+            return AnthropicProvider(
+                api_key=runtime_key,
+                model=self.config.provider_models.get("anthropic", self.config.anthropic_model),
+                base_url=self.config.anthropic_base_url,
+                provider_label="anthropic",
+            ).generate(prompt=sanitized_prompt, tools=tools)
+
+        if name == "openai":
+            return OpenAICompatibleProvider(
+                base_url="https://api.openai.com/v1",
+                api_key=runtime_key,
+                model=self.config.provider_models.get("openai", self.config.openai_model),
+                provider_label="openai",
+                api_key_env="OPENAI_API_KEY",
+                auth_header="Authorization",
+            ).generate(prompt=sanitized_prompt, tools=tools)
+
         if name == "openai_compatible":
+            custom_key = runtime_key or self._runtime_api_keys.get("openai", "")
+            if self.config.custom_provider_protocol == "anthropic":
+                return AnthropicProvider(
+                    api_key=custom_key or self._runtime_api_keys.get("anthropic", ""),
+                    model=self.config.provider_models.get("openai_compatible", self.config.openai_model),
+                    base_url=self.config.openai_base_url,
+                    provider_label="custom_anthropic",
+                ).generate(prompt=sanitized_prompt, tools=tools)
             return OpenAICompatibleProvider(
                 base_url=self.config.openai_base_url,
-                model=self.config.openai_model,
+                api_key=custom_key,
+                model=self.config.provider_models.get("openai_compatible", self.config.openai_model),
+                provider_label="openai_compatible",
+                api_key_env="OPENAI_API_KEY",
+                auth_header=self.config.custom_provider_auth_header,
             ).generate(prompt=sanitized_prompt, tools=tools)
+
+        # Built-in OpenAI-compatible cloud service presets (OpenRouter, xAI Grok, Groq, DeepSeek, Mistral, Perplexity, Together)
+        preset = CLOUD_PROVIDER_PRESETS.get(name)
+        if preset and preset.get("protocol") == "openai":
+            return OpenAICompatibleProvider(
+                base_url=str(preset["base_url"]),
+                api_key=runtime_key,
+                model=self.config.provider_models.get(name, str(preset["default_model"])),
+                provider_label=name,
+                api_key_env=str(preset.get("api_key_env", "")),
+                auth_header=str(preset.get("auth_header", "Authorization")),
+                extra_headers=preset.get("extra_headers"),
+            ).generate(prompt=sanitized_prompt, tools=tools)
+
         # Default: Google Gemini (`gemini-3.8-flash`)
         return GeminiProvider(
-            model=self.config.gemini_model,
+            api_key=runtime_key or None,
+            model=self.config.provider_models.get("gemini", self.config.gemini_model),
         ).generate(prompt=sanitized_prompt, tools=tools)
 
     @staticmethod
@@ -917,6 +1028,7 @@ class HybridOrchestrator:
 
         m365_ok, m365_msg = self.m365_manager.stop()
         self.guardian.vault.clear()
+        self._runtime_api_keys.clear()
 
         return {
             "status": "shutting_down",

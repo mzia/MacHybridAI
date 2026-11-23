@@ -794,26 +794,360 @@ class LocalModelProvider:
         )
 
 
-class OpenAICompatibleProvider:
-    """Configurable OpenAI Extension Provider (`/v1/chat/completions`).
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-5"
+DEFAULT_OPENAI_MODEL = "gpt-4.1"
 
-    Allows easy configuration of any OpenAI-compatible service (OpenRouter,
-    Together, vLLM, Groq, OpenAI, Azure OpenAI, etc.).
+
+CLOUD_PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
+    "gemini": {
+        "id": "gemini",
+        "name": "Google Gemini",
+        "protocol": "gemini",
+        "base_url": "https://generativelanguage.googleapis.com",
+        "default_model": DEFAULT_GEMINI_MODEL,
+        "recommended_models": [
+            "gemini-3.8-flash",
+            "gemini-3.1-pro-preview",
+            "gemini-3.5-flash-lite",
+        ],
+        "api_key_env": "GEMINI_API_KEY",
+        "auth_header": "x-goog-api-key",
+    },
+    "openai": {
+        "id": "openai",
+        "name": "OpenAI",
+        "protocol": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "default_model": DEFAULT_OPENAI_MODEL,
+        "recommended_models": ["gpt-4.1", "gpt-4o", "o3-mini", "o4-mini"],
+        "api_key_env": "OPENAI_API_KEY",
+        "auth_header": "Authorization",
+    },
+    "anthropic": {
+        "id": "anthropic",
+        "name": "Anthropic Claude",
+        "protocol": "anthropic",
+        "base_url": "https://api.anthropic.com/v1",
+        "default_model": DEFAULT_ANTHROPIC_MODEL,
+        "recommended_models": [
+            "claude-sonnet-4-5",
+            "claude-opus-4-1",
+            "claude-haiku-4-5",
+        ],
+        "api_key_env": "ANTHROPIC_API_KEY",
+        "auth_header": "x-api-key",
+    },
+    "antigravity": {
+        "id": "antigravity",
+        "name": "Google Antigravity Agent",
+        "protocol": "antigravity",
+        "base_url": "https://generativelanguage.googleapis.com",
+        "default_model": DEFAULT_ANTIGRAVITY_AGENT,
+        "recommended_models": [DEFAULT_ANTIGRAVITY_AGENT],
+        "api_key_env": "GEMINI_API_KEY",
+        "auth_header": "x-goog-api-key",
+    },
+    "m365_copilot": {
+        "id": "m365_copilot",
+        "name": "Microsoft 365 Copilot Proxy",
+        "protocol": "m365",
+        "base_url": "http://127.0.0.1:4141/v1",
+        "default_model": M365ModelCatalog.DEFAULT_TOOL_MODEL,
+        "recommended_models": [m.id for m in M365ModelCatalog.MODELS],
+        "api_key_env": "",
+        "auth_header": "Authorization",
+    },
+    "openrouter": {
+        "id": "openrouter",
+        "name": "OpenRouter (300+ Models)",
+        "protocol": "openai",
+        "base_url": "https://openrouter.ai/api/v1",
+        "default_model": "anthropic/claude-sonnet-4.5",
+        "recommended_models": [
+            "anthropic/claude-sonnet-4.5",
+            "openai/gpt-4.1",
+            "google/gemini-2.5-pro",
+            "deepseek/deepseek-r1",
+        ],
+        "api_key_env": "OPENROUTER_API_KEY",
+        "auth_header": "Authorization",
+        "extra_headers": {
+            "HTTP-Referer": "https://github.com/mzia/MacHybridAI",
+            "X-Title": "MacHybridAI",
+        },
+    },
+    "xai": {
+        "id": "xai",
+        "name": "xAI Grok",
+        "protocol": "openai",
+        "base_url": "https://api.x.ai/v1",
+        "default_model": "grok-3",
+        "recommended_models": ["grok-3", "grok-3-mini"],
+        "api_key_env": "XAI_API_KEY",
+        "auth_header": "Authorization",
+    },
+    "groq": {
+        "id": "groq",
+        "name": "Groq LPU",
+        "protocol": "openai",
+        "base_url": "https://api.groq.com/openai/v1",
+        "default_model": "llama-3.3-70b-versatile",
+        "recommended_models": [
+            "llama-3.3-70b-versatile",
+            "deepseek-r1-distill-llama-70b",
+            "qwen-qwq-32b",
+        ],
+        "api_key_env": "GROQ_API_KEY",
+        "auth_header": "Authorization",
+    },
+    "deepseek": {
+        "id": "deepseek",
+        "name": "DeepSeek",
+        "protocol": "openai",
+        "base_url": "https://api.deepseek.com/v1",
+        "default_model": "deepseek-reasoner",
+        "recommended_models": ["deepseek-reasoner", "deepseek-chat"],
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "auth_header": "Authorization",
+    },
+    "mistral": {
+        "id": "mistral",
+        "name": "Mistral AI",
+        "protocol": "openai",
+        "base_url": "https://api.mistral.ai/v1",
+        "default_model": "mistral-large-latest",
+        "recommended_models": ["mistral-large-latest", "codestral-latest"],
+        "api_key_env": "MISTRAL_API_KEY",
+        "auth_header": "Authorization",
+    },
+    "perplexity": {
+        "id": "perplexity",
+        "name": "Perplexity Sonar",
+        "protocol": "openai",
+        "base_url": "https://api.perplexity.ai",
+        "default_model": "sonar-pro",
+        "recommended_models": ["sonar-pro", "sonar-reasoning-pro", "sonar"],
+        "api_key_env": "PERPLEXITY_API_KEY",
+        "auth_header": "Authorization",
+    },
+    "together": {
+        "id": "together",
+        "name": "Together AI",
+        "protocol": "openai",
+        "base_url": "https://api.together.xyz/v1",
+        "default_model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        "recommended_models": [
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            "deepseek-ai/DeepSeek-R1",
+        ],
+        "api_key_env": "TOGETHER_API_KEY",
+        "auth_header": "Authorization",
+    },
+    "openai_compatible": {
+        "id": "openai_compatible",
+        "name": "Custom Cloud AI (OpenAI / Anthropic / Azure)",
+        "protocol": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "default_model": DEFAULT_OPENAI_MODEL,
+        "recommended_models": [DEFAULT_OPENAI_MODEL, DEFAULT_ANTHROPIC_MODEL],
+        "api_key_env": "OPENAI_API_KEY",
+        "auth_header": "Authorization",
+    },
+}
+
+
+def _resolve_endpoint_url(base_url: str, suffix: str) -> str:
+    """Safely joins `suffix` (e.g. `/chat/completions` or `/messages`) onto `base_url`, preserving query params (e.g. Azure `?api-version=`)."""
+    parsed = urllib.parse.urlsplit(base_url.strip())
+    clean_path = parsed.path.rstrip("/")
+    if not clean_path.endswith(suffix):
+        clean_path = f"{clean_path}{suffix}"
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, clean_path, parsed.query, "")
+    )
+
+
+def build_cloud_provider_catalog(
+    runtime_api_keys: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """Returns all supported cloud AI providers with live key detection status (never exposes key values)."""
+    keys = runtime_api_keys or {}
+    catalog: List[Dict[str, Any]] = []
+    for pid, preset in CLOUD_PROVIDER_PRESETS.items():
+        env_var = str(preset.get("api_key_env", ""))
+        has_key = bool(keys.get(pid)) or bool(env_var and os.environ.get(env_var, "").strip())
+        catalog.append(
+            {
+                "id": pid,
+                "name": preset["name"],
+                "protocol": preset["protocol"],
+                "base_url": preset["base_url"],
+                "default_model": preset["default_model"],
+                "recommended_models": list(preset["recommended_models"]),
+                "api_key_env": env_var,
+                "auth_header": preset["auth_header"],
+                "api_key_configured": has_key,
+            }
+        )
+    return catalog
+
+
+class AnthropicProvider:
+    """Native Anthropic Claude Messages API provider (`POST /v1/messages`).
+
+    Works with Anthropic (`https://api.anthropic.com/v1`) as well as any
+    Anthropic-Messages-compatible cloud proxy or gateway (e.g. AWS Bedrock / Vertex proxies).
+    """
+
+    ANTHROPIC_VERSION = "2023-06-01"
+
+    def __init__(
+        self,
+        api_key: str = "",
+        model: str = DEFAULT_ANTHROPIC_MODEL,
+        base_url: str = "https://api.anthropic.com/v1",
+        max_tokens: int = 2048,
+        provider_label: str = "anthropic",
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        self.model = (model or DEFAULT_ANTHROPIC_MODEL).strip()
+        self.max_tokens = max(128, max_tokens)
+        self.provider_label = provider_label
+
+    @staticmethod
+    def _convert_openai_tools(
+        tools: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        """Converts OpenAI-format tool definitions into Anthropic `input_schema` tools."""
+        converted: List[Dict[str, Any]] = []
+        for tool in tools or []:
+            fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+            name = str(fn.get("name", "")).strip()
+            if not name:
+                continue
+            converted.append(
+                {
+                    "name": name,
+                    "description": str(fn.get("description", "")),
+                    "input_schema": fn.get("parameters")
+                    or {"type": "object", "properties": {}},
+                }
+            )
+        return converted
+
+    def generate(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> ProviderResponse:
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if system_instruction:
+            payload["system"] = system_instruction
+        anth_tools = self._convert_openai_tools(tools)
+        if anth_tools:
+            payload["tools"] = anth_tools
+
+        headers = {
+            "Content-Type": "application/json",
+            "anthropic-version": self.ANTHROPIC_VERSION,
+            "Cache-Control": "no-store",
+        }
+        if self.api_key:
+            headers["x-api-key"] = self.api_key
+
+        is_loopback = self.base_url.startswith("http://127.0.0.1") or self.base_url.startswith(
+            "http://localhost"
+        )
+        if is_loopback or self.api_key:
+            try:
+                endpoint = _resolve_endpoint_url(self.base_url, "/messages")
+                data = _post_json_http(
+                    endpoint_url=endpoint,
+                    payload=payload,
+                    headers=headers,
+                    timeout=5.0 if is_loopback else 45.0,
+                )
+                content_blocks = data.get("content", [])
+                text_parts: List[str] = []
+                tool_calls: List[Dict[str, Any]] = []
+                for block in content_blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text":
+                        text_parts.append(str(block.get("text", "")))
+                    elif block.get("type") == "tool_use":
+                        tool_calls.append(
+                            {
+                                "id": str(block.get("id", "")),
+                                "type": "function",
+                                "function": {
+                                    "name": str(block.get("name", "")),
+                                    "arguments": json.dumps(block.get("input", {})),
+                                },
+                            }
+                        )
+                output_text = "\n".join(p for p in text_parts if p)
+                usage = data.get("usage", {}) if isinstance(data.get("usage"), dict) else {}
+                total_tokens = int(usage.get("input_tokens", 0)) + int(
+                    usage.get("output_tokens", 0)
+                )
+                return ProviderResponse(
+                    provider=self.provider_label,
+                    model=self.model,
+                    output_text=output_text,
+                    locality="cloud",
+                    tool_calls=tool_calls,
+                    tokens_used=total_tokens
+                    or max(16, len(prompt.split()) + len(output_text.split())),
+                    metadata={
+                        "protocol": "anthropic_messages",
+                        "base_url": self.base_url,
+                        "cloud_zero_retention": True,
+                    },
+                )
+            except (TimeoutError, OSError, ValueError):
+                pass
+
+        return GeminiProvider._synthesize_cloud_reasoning(
+            provider=self.provider_label,
+            model=self.model,
+            prompt=prompt,
+            mode_note=f"Anthropic Claude ({self.model})",
+        )
+
+
+class OpenAICompatibleProvider:
+    """Universal OpenAI-compatible Cloud Provider (`/chat/completions`).
+
+    Works out-of-the-box with OpenAI, OpenRouter, xAI Grok, Groq, DeepSeek,
+    Mistral, Perplexity, Together AI, Azure OpenAI, vLLM, LiteLLM, and any
+    custom OpenAI-compatible endpoint.
     """
 
     def __init__(
         self,
         base_url: str = "https://api.openai.com/v1",
         api_key: str = "",
-        model: str = "gpt-4.1",
+        model: str = DEFAULT_OPENAI_MODEL,
         provider_label: str = "openai_compatible",
         locality: str = "cloud",
+        api_key_env: str = "OPENAI_API_KEY",
+        auth_header: str = "Authorization",
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        self.api_key = api_key or (os.environ.get(api_key_env, "") if api_key_env else "")
         self.model = model
         self.provider_label = provider_label
         self.locality = locality
+        self.auth_header = auth_header or "Authorization"
+        self.extra_headers = dict(extra_headers or {})
 
     def generate(
         self,
@@ -829,8 +1163,13 @@ class OpenAICompatibleProvider:
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "store": False,
         }
+        # OpenAI native endpoint supports `store: false`; third-party APIs like Groq/DeepSeek/Perplexity
+        # reject unknown top-level keys, so only attach `store` for OpenAI endpoints.
+        parsed_base = urllib.parse.urlsplit(self.base_url)
+        host_lower = (parsed_base.hostname or "").lower()
+        if host_lower in {"api.openai.com", "127.0.0.1", "localhost"}:
+            payload["store"] = False
         if tools:
             payload["tools"] = tools
 
@@ -838,36 +1177,43 @@ class OpenAICompatibleProvider:
             "Content-Type": "application/json",
             "X-No-Store": "true",
             "Cache-Control": "no-store",
+            **self.extra_headers,
         }
         if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+            if self.auth_header.lower() == "authorization":
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            else:
+                headers[self.auth_header] = self.api_key
 
-        if self.base_url.startswith("http://127.0.0.1") or self.base_url.startswith(
-            "http://localhost"
-        ) or self.api_key:
+        is_loopback = host_lower in {"127.0.0.1", "localhost"}
+        if is_loopback or self.api_key:
             try:
+                endpoint = _resolve_endpoint_url(self.base_url, "/chat/completions")
                 data = _post_json_http(
-                    endpoint_url=f"{self.base_url}/chat/completions",
+                    endpoint_url=endpoint,
                     payload=payload,
                     headers=headers,
-                    timeout=5.0,
+                    timeout=5.0 if is_loopback else 45.0,
                 )
                 choices = data.get("choices", [])
                 msg = choices[0].get("message", {}) if choices else {}
                 content = msg.get("content") or ""
                 tool_calls = msg.get("tool_calls") or []
-                usage = data.get("usage", {})
+                usage = data.get("usage", {}) if isinstance(data.get("usage"), dict) else {}
                 return ProviderResponse(
                     provider=self.provider_label,
                     model=self.model,
                     output_text=content,
                     locality=self.locality,
                     tool_calls=tool_calls,
-                    tokens_used=usage.get(
-                        "total_tokens",
-                        max(16, len(prompt.split()) + len(content.split())),
+                    tokens_used=int(
+                        usage.get(
+                            "total_tokens",
+                            max(16, len(prompt.split()) + len(content.split())),
+                        )
                     ),
                     metadata={
+                        "protocol": "openai_chat_completions",
                         "base_url": self.base_url,
                         "store": False,
                         "cloud_zero_retention": True,
@@ -880,7 +1226,7 @@ class OpenAICompatibleProvider:
             provider=self.provider_label,
             model=self.model,
             prompt=prompt,
-            mode_note=f"OpenAI Extension ({self.base_url})",
+            mode_note=f"Cloud AI ({self.provider_label} · {self.base_url})",
         )
 
 

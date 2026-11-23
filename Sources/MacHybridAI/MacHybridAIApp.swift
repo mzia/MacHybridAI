@@ -244,10 +244,16 @@ final class HybridAppViewModel: ObservableObject {
     // Provider configuration fields
     @Published var geminiModel: String = "gemini-3.8-flash"
     @Published var antigravityAgent: String = "antigravity-preview-05-2026"
+    @Published var anthropicModel: String = "claude-sonnet-4-5"
+    @Published var anthropicBaseURL: String = "https://api.anthropic.com/v1"
     @Published var localModel: String = "gemma4:26b"
     @Published var localEndpoint: String = "http://127.0.0.1:11434/v1"
     @Published var openAIBaseURL: String = "https://api.openai.com/v1"
     @Published var openAIModel: String = "gpt-4.1"
+    @Published var customProviderProtocol: CustomCloudProtocolOption = .openai
+    @Published var customProviderAuthHeader: String = "Authorization"
+    @Published var cloudApiKeyInput: String = ""
+    @Published var providerSyncStatus: String = ""
     @Published var m365Port: String = "4141"
     @Published var m365Model: String = "gpt-5.5-think-deeper"
     @Published var m365InteractiveApproval: Bool = true
@@ -313,6 +319,62 @@ final class HybridAppViewModel: ObservableObject {
         Task.detached(priority: .utility) {
             BackendBridge.shared.updateBackendConfig(body: ["local_model": modelId])
         }
+    }
+
+    func applyCloudProviderPreset(_ provider: CloudProviderOption) {
+        self.cloudProvider = provider
+        switch provider {
+        case .gemini:
+            if geminiModel.isEmpty { geminiModel = provider.defaultModel }
+        case .anthropic:
+            anthropicBaseURL = provider.defaultBaseURL
+            if anthropicModel.isEmpty { anthropicModel = provider.defaultModel }
+        case .openai:
+            openAIBaseURL = provider.defaultBaseURL
+            openAIModel = provider.defaultModel
+            customProviderProtocol = .openai
+            customProviderAuthHeader = "Authorization"
+        case .openRouter, .xai, .groq, .deepseek, .mistral, .perplexity, .together:
+            openAIBaseURL = provider.defaultBaseURL
+            openAIModel = provider.defaultModel
+            customProviderProtocol = .openai
+            customProviderAuthHeader = "Authorization"
+        case .openAICompatible:
+            if openAIBaseURL.isEmpty { openAIBaseURL = provider.defaultBaseURL }
+            if openAIModel.isEmpty { openAIModel = provider.defaultModel }
+        case .antigravity, .m365Copilot, .consensus:
+            break
+        }
+        syncCloudProviderConfiguration()
+    }
+
+    func syncCloudProviderConfiguration() {
+        let fields: [String: String] = [
+            "cloud_provider": cloudProvider.rawValue,
+            "gemini_model": geminiModel,
+            "antigravity_agent": antigravityAgent,
+            "anthropic_model": anthropicModel,
+            "anthropic_base_url": anthropicBaseURL,
+            "openai_base_url": openAIBaseURL,
+            "openai_model": openAIModel,
+            "custom_provider_protocol": customProviderProtocol.rawValue,
+            "custom_provider_auth_header": customProviderAuthHeader,
+            "m365_model": m365Model,
+        ]
+        var apiKeys: [String: String] = [:]
+        let trimmedKey = cloudApiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedKey.isEmpty {
+            apiKeys[cloudProvider.rawValue] = trimmedKey
+            if cloudProvider == .openAICompatible {
+                apiKeys["openai"] = trimmedKey
+            }
+        }
+        BackendBridge.shared.syncCloudProviderConfigAsync(fields: fields, apiKeys: apiKeys)
+        let keyNote = trimmedKey.isEmpty
+            ? "using \(cloudProvider.apiKeyEnvName) from environment"
+            : "in-memory API key loaded (never saved to disk)"
+        providerSyncStatus = "Active Cloud AI: \(cloudProvider.shortName) (\(keyNote))"
+        cloudApiKeyInput = ""
     }
 
     func runBenchmark(for modelId: String? = nil) {
@@ -1744,16 +1806,20 @@ struct PromptHistoryAndICloudTabView: View {
                             Text("interactions.create(store=False) — Zero server-side interaction storage").font(.caption).foregroundStyle(.secondary)
                         }
                         GridRow {
-                            Text("Google Antigravity").font(.caption.bold())
-                            Text("Ephemeral session context — Zero persistent cloud history").font(.caption).foregroundStyle(.secondary)
+                            Text("OpenAI (GPT-4.1 / o3)").font(.caption.bold())
+                            Text("store=false + X-No-Store: true + Privacy Gate PII masking").font(.caption).foregroundStyle(.secondary)
+                        }
+                        GridRow {
+                            Text("Anthropic Claude").font(.caption.bold())
+                            Text("Native /v1/messages API + Cache-Control: no-store + Privacy Gate PII masking").font(.caption).foregroundStyle(.secondary)
                         }
                         GridRow {
                             Text("M365 Copilot Proxy").font(.caption.bold())
                             Text("Temporary Chat Mode locked (M365_SAVE_HISTORY disabled)").font(.caption).foregroundStyle(.secondary)
                         }
                         GridRow {
-                            Text("OpenAI Extension API").font(.caption.bold())
-                            Text("store=false + X-No-Store: true + Cache-Control: no-store").font(.caption).foregroundStyle(.secondary)
+                            Text("OpenRouter / Grok / Groq / DeepSeek / Custom").font(.caption.bold())
+                            Text("Universal OpenAI or Anthropic protocol + X-No-Store: true + On-Device PII Vault").font(.caption).foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -2130,7 +2196,7 @@ struct ProvidersConfigTabView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                     HStack(spacing: 8) {
-                        ForEach(["machybrid-auto", "machybrid-local", "machybrid-hybrid", "machybrid-consensus"], id: \.self) { m in
+                        ForEach(["machybrid-auto", "machybrid-local", "machybrid-openai", "machybrid-claude", "machybrid-consensus"], id: \.self) { m in
                             Text(m)
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                                 .padding(.horizontal, 8)
@@ -2143,6 +2209,71 @@ struct ProvidersConfigTabView: View {
                 .padding(14)
                 .appleLiquidGlassCard(cornerRadius: 12, tint: .cyan, tintOpacity: 0.05, borderOpacity: 0.14)
 
+                // Universal Cloud AI Service Hub (OpenAI, Claude, Gemini, OpenRouter, xAI, Groq, DeepSeek, Mistral, Perplexity, Together, Azure/Custom)
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Label("Universal Cloud AI Hub — Connect Any Cloud AI Service Behind Privacy Gate", systemImage: "cloud.bolt.fill")
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.purple)
+                        Spacer()
+                        Button("Apply & Sync Cloud Provider") {
+                            vm.syncCloudProviderConfiguration()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .tint(.purple)
+                    }
+                    Text("Click any cloud AI service preset below (or enter a custom OpenAI / Anthropic / Azure endpoint). Station 2 Privacy Gate automatically scrubs PII on-device before calling the selected cloud provider and restores real values at Station 4.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(CloudProviderOption.allCases, id: \.self) { provider in
+                                Button {
+                                    vm.applyCloudProviderPreset(provider)
+                                } label: {
+                                    Text(provider.shortName)
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .background(
+                                            Capsule().fill(
+                                                vm.cloudProvider == provider
+                                                    ? Color.purple.opacity(0.45)
+                                                    : Color.white.opacity(0.08)
+                                            )
+                                        )
+                                        .overlay(
+                                            Capsule().strokeBorder(
+                                                vm.cloudProvider == provider ? Color.purple : Color.clear,
+                                                lineWidth: 1
+                                            )
+                                        )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+
+                    HStack(spacing: 8) {
+                        SecureField("Optional In-Memory API Key for \(vm.cloudProvider.shortName) (or set \(vm.cloudProvider.apiKeyEnvName))", text: $vm.cloudApiKeyInput)
+                            .textFieldStyle(.roundedBorder)
+                        Button("Load Key (RAM Only)") {
+                            vm.syncCloudProviderConfiguration()
+                        }
+                        .controlSize(.small)
+                    }
+
+                    if !vm.providerSyncStatus.isEmpty {
+                        Label(vm.providerSyncStatus, systemImage: "checkmark.circle.fill")
+                            .font(.caption2.bold())
+                            .foregroundStyle(.green)
+                    }
+                }
+                .padding(14)
+                .appleLiquidGlassCard(cornerRadius: 12, tint: .purple, tintOpacity: 0.06, borderOpacity: 0.16)
+
                 Form {
                     Section("On-Device Local Model (This Mac — Apple Silicon Metal / MLX)") {
                         TextField("Active Local Model Identifier (MLX / LiteRT / Ollama)", text: $vm.localModel)
@@ -2152,7 +2283,23 @@ struct ProvidersConfigTabView: View {
                         TextField("Local OpenAI-Compatible Endpoint", text: $vm.localEndpoint)
                     }
 
-                    Section("Default Cloud AI — Google Gemini & Antigravity (Stateless store=false)") {
+                    Section("OpenAI, OpenRouter, xAI Grok, Groq, DeepSeek, Mistral, Perplexity, Together & Custom Cloud AI") {
+                        Picker("API Wire Protocol", selection: $vm.customProviderProtocol) {
+                            ForEach(CustomCloudProtocolOption.allCases, id: \.self) { proto in
+                                Text(proto.displayName).tag(proto)
+                            }
+                        }
+                        TextField("Cloud Service Base URL (e.g. https://api.openai.com/v1 or Azure URL)", text: $vm.openAIBaseURL)
+                        TextField("Model Identifier (e.g. gpt-4.1, o3-mini, grok-3, deepseek-reasoner)", text: $vm.openAIModel)
+                        TextField("Auth Header (Authorization, x-api-key, or api-key for Azure)", text: $vm.customProviderAuthHeader)
+                    }
+
+                    Section("Anthropic Claude (Native Messages API — /v1/messages)") {
+                        TextField("Claude Model (e.g. claude-sonnet-4-5, claude-opus-4-1, claude-haiku-4-5)", text: $vm.anthropicModel)
+                        TextField("Anthropic Base URL (default: https://api.anthropic.com/v1)", text: $vm.anthropicBaseURL)
+                    }
+
+                    Section("Google Gemini & Antigravity (Stateless store=false)") {
                         TextField("Gemini Model (Interactions API)", text: $vm.geminiModel)
                         TextField("Antigravity Managed Agent ID", text: $vm.antigravityAgent)
                     }
@@ -2162,11 +2309,6 @@ struct ProvidersConfigTabView: View {
                         TextField("M365 Tone / Model (Recommended: gpt-5.5-think-deeper)", text: $vm.m365Model)
                         Toggle("Interactive Browser SSO/MFA Approval (M365_ENABLE_INTERACTIVE_APPROVAL=1)", isOn: $vm.m365InteractiveApproval)
                         Toggle("Avoid PerUserThrottled Reserve Guard (M365_AVOID_THROTTLING=1)", isOn: $vm.m365AvoidThrottling)
-                    }
-
-                    Section("Custom OpenAI Extension Method (store=false, X-No-Store: true)") {
-                        TextField("OpenAI-Compatible Base URL", text: $vm.openAIBaseURL)
-                        TextField("OpenAI-Compatible Model Name", text: $vm.openAIModel)
                     }
                 }
                 .formStyle(.grouped)

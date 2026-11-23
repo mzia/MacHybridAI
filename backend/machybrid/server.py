@@ -454,6 +454,11 @@ def dispatch_request(
             }
         if path == "/v1/hardware/profile":
             return HTTPStatus.OK, HardwareProfiler.profile().to_dict()
+        if path == "/v1/providers":
+            return HTTPStatus.OK, {
+                "active_provider": orchestrator.config.cloud_provider,
+                "providers": orchestrator.list_cloud_providers(),
+            }
         if path == "/v1/models":
             return HTTPStatus.OK, {
                 "object": "list",
@@ -477,10 +482,28 @@ def dispatch_request(
                         "description": "4-Station Hybrid Compute with On-Device PII Guardian & Zero Cloud History",
                     },
                     {
+                        "id": "machybrid-openai",
+                        "object": "model",
+                        "owned_by": "machybridai",
+                        "description": "4-Station Hybrid routed to OpenAI (gpt-4.1 / o3-mini) with On-Device PII Guardian",
+                    },
+                    {
+                        "id": "machybrid-claude",
+                        "object": "model",
+                        "owned_by": "machybridai",
+                        "description": "4-Station Hybrid routed to Anthropic Claude (Messages API) with On-Device PII Guardian",
+                    },
+                    {
+                        "id": "machybrid-openrouter",
+                        "object": "model",
+                        "owned_by": "machybridai",
+                        "description": "4-Station Hybrid routed to OpenRouter (300+ models) with On-Device PII Guardian",
+                    },
+                    {
                         "id": "machybrid-consensus",
                         "object": "model",
                         "owned_by": "machybridai",
-                        "description": "Multi-Cloud Consensus Arena with On-Device PII Guardian & Local Synthesis",
+                        "description": "Multi-Cloud Consensus Arena (Gemini + Claude + OpenAI) with On-Device PII Guardian",
                     },
                 ],
             }
@@ -644,18 +667,34 @@ def dispatch_request(
                 return HTTPStatus.BAD_REQUEST, {"error": "messages content is empty"}
 
             req_model = str(payload_in.get("model", "machybrid-hybrid")).lower().strip()
+            oa_mode = ComputeMode.HYBRID
+            oa_cloud: Optional[str] = None
             if "local" in req_model:
                 oa_mode = ComputeMode.LOCAL
-                oa_cloud = None
             elif "auto" in req_model:
                 oa_mode = ComputeMode.AUTO
-                oa_cloud = None
             elif "consensus" in req_model:
-                oa_mode = ComputeMode.HYBRID
                 oa_cloud = "consensus"
-            else:
-                oa_mode = ComputeMode.HYBRID
-                oa_cloud = None
+            elif "claude" in req_model or "anthropic" in req_model:
+                oa_cloud = "anthropic"
+            elif "openai" in req_model or req_model.startswith(("gpt-", "o3", "o4")):
+                oa_cloud = "openai"
+            elif "openrouter" in req_model:
+                oa_cloud = "openrouter"
+            elif "grok" in req_model or "xai" in req_model:
+                oa_cloud = "xai"
+            elif "groq" in req_model:
+                oa_cloud = "groq"
+            elif "deepseek" in req_model:
+                oa_cloud = "deepseek"
+            elif "mistral" in req_model:
+                oa_cloud = "mistral"
+            elif "perplexity" in req_model or "sonar" in req_model:
+                oa_cloud = "perplexity"
+            elif "together" in req_model:
+                oa_cloud = "together"
+            elif "gemini" in req_model:
+                oa_cloud = "gemini"
 
             task_res = orchestrator.run_task(
                 prompt=combined_prompt,

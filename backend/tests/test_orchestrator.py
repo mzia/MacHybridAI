@@ -380,6 +380,125 @@ class TestRealTelemetry(unittest.TestCase):
         self.assertIn("x_machybrid_receipt", cc_res)
         self.assertEqual(len(cc_res["x_machybrid_receipt"]["outbound_payload_sha256"]), 64)
 
+    def test_universal_cloud_providers_openai_anthropic_and_custom_presets(self) -> None:
+        from machybrid.providers import AnthropicProvider, _resolve_endpoint_url
+
+        orchestrator = HybridOrchestrator()
+
+        # 1. GET /v1/providers returns all major cloud AI providers
+        status_p, prov_res = dispatch_request(orchestrator, "GET", "/v1/providers")
+        self.assertEqual(status_p, 200)
+        provider_ids = {p["id"] for p in prov_res["providers"]}
+        for expected in (
+            "gemini",
+            "openai",
+            "anthropic",
+            "openrouter",
+            "xai",
+            "groq",
+            "deepseek",
+            "mistral",
+            "perplexity",
+            "together",
+            "m365_copilot",
+            "openai_compatible",
+        ):
+            self.assertIn(expected, provider_ids)
+
+        # 2. Verify URL resolution preserves Azure query parameters and avoids duplicate suffixes
+        azure_url = _resolve_endpoint_url(
+            "https://my-org.openai.azure.com/openai/deployments/gpt4?api-version=2024-10-21",
+            "/chat/completions",
+        )
+        self.assertEqual(
+            azure_url,
+            "https://my-org.openai.azure.com/openai/deployments/gpt4/chat/completions?api-version=2024-10-21",
+        )
+        self.assertEqual(
+            _resolve_endpoint_url("https://api.anthropic.com/v1/messages", "/messages"),
+            "https://api.anthropic.com/v1/messages",
+        )
+
+        # 3. Anthropic tool conversion from OpenAI schema
+        anth_tools = AnthropicProvider._convert_openai_tools(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_ticker",
+                        "description": "Looks up a stock ticker.",
+                        "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}}},
+                    },
+                }
+            ]
+        )
+        self.assertEqual(len(anth_tools), 1)
+        self.assertEqual(anth_tools[0]["name"], "lookup_ticker")
+        self.assertIn("input_schema", anth_tools[0])
+
+        # 4. Run Privacy Gate Hybrid tasks across OpenAI, Anthropic Claude, OpenRouter, xAI Grok, Groq, DeepSeek, Mistral, Perplexity, Together
+        for provider_id in (
+            "openai",
+            "anthropic",
+            "claude",
+            "openrouter",
+            "xai",
+            "groq",
+            "deepseek",
+            "mistral",
+            "perplexity",
+            "together",
+        ):
+            res = orchestrator.run_task(
+                prompt="Evaluate contract for Contact: Sam Reyes (sam.reyes@meridian.io)",
+                mode=ComputeMode.HYBRID,
+                cloud_provider=provider_id,
+                save_to_history=False,
+            )
+            self.assertIsNotNone(res.cloud_Prompt_sent)
+            assert res.cloud_Prompt_sent is not None
+            self.assertNotIn("sam.reyes@meridian.io", res.cloud_Prompt_sent)
+            self.assertIn("sam.reyes@meridian.io", res.final_output)
+            self.assertIn("Sam Reyes", res.final_output)
+
+        # 5. OpenAI-compatible proxy routes `machybrid-claude` and `machybrid-openai` directly
+        st_cl, cl_res = dispatch_request(
+            orchestrator,
+            "POST",
+            "/v1/chat/completions",
+            {
+                "model": "machybrid-claude",
+                "messages": [{"role": "user", "content": "Analyze Contact: Sam Reyes (sam.reyes@meridian.io)"}],
+            },
+        )
+        self.assertEqual(st_cl, 200)
+        self.assertIn("anthropic", cl_res["x_machybrid_receipt"]["cloud_models_used"])
+        self.assertIn("Sam Reyes", cl_res["choices"][0]["message"]["content"])
+
+        # 6. Runtime API keys stay strictly in memory, never leak via /v1/config or /v1/providers, and clear on shutdown
+        secret_test_key = "sk-test-never-expose-999999999999"
+        st_cfg, cfg_out = dispatch_request(
+            orchestrator,
+            "POST",
+            "/v1/config",
+            {
+                "cloud_provider": "anthropic",
+                "anthropic_model": "claude-opus-4-1",
+                "custom_provider_protocol": "anthropic",
+                "custom_provider_auth_header": "x-api-key",
+                "api_keys": {"anthropic": secret_test_key},
+            },
+        )
+        self.assertEqual(st_cfg, 200)
+        self.assertNotIn(secret_test_key, str(cfg_out))
+        st_p2, prov_res2 = dispatch_request(orchestrator, "GET", "/v1/providers")
+        self.assertEqual(st_p2, 200)
+        self.assertNotIn(secret_test_key, str(prov_res2))
+        anth_entry = next(p for p in prov_res2["providers"] if p["id"] == "anthropic")
+        self.assertTrue(anth_entry["api_key_configured"])
+        orchestrator.shutdown_all_local_resources()
+        self.assertEqual(orchestrator._runtime_api_keys, {})
+
 
 if __name__ == "__main__":
     unittest.main()
