@@ -29,6 +29,29 @@ xattr -cr /Applications/MacHybridAI.app && open /Applications/MacHybridAI.app
 
 ---
 
+## Hybrid Agentic CLI (`machybrid` / `mh`) — Antigravity-Style Terminal Agent
+
+Use MacHybridAI directly from your terminal as an autonomous coding & computer agent—just like Google Antigravity (`agy`), but running **Hybrid Split-Compute** with on-device PII & secret redaction before any cloud call:
+
+```bash
+# 1. Install `machybrid` and `mh` into ~/.local/bin (zero pip required)
+chmod +x scripts/install_cli.sh && ./scripts/install_cli.sh
+
+# 2. Launch the interactive Hybrid Agentic REPL (with /mode, /provider, /plan, /approve, /hardware, /receipt)
+machybrid
+
+# 3. One-shot autonomous agent tasks with ANY Cloud AI behind the Privacy Gate
+machybrid --mode hybrid --provider anthropic "Audit auth.py and fix edge cases"
+machybrid --mode hybrid --provider openai --approve-cloud "Refactor billing.py"
+machybrid --mode local "Summarize sensitive notes.txt privately on Apple Silicon"
+machybrid --mode hybrid --provider consensus "Compare architectures for caching" --plan
+
+# 4. Drop-in OpenAI-compatible privacy proxy for Cursor / Zed / Continue.dev
+machybrid proxy --port 8765
+```
+
+---
+
 ## Documentation, Manual (`man`) & Wiki
 
 Full setup and usage documentation is available in the [**MacHybridAI Wiki**](wiki/Home.md) and the UNIX manual page ([`man/MacHybridAI.1`](man/MacHybridAI.1) — view via `man ./man/MacHybridAI.1`):

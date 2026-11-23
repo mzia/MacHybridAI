@@ -2,6 +2,13 @@
 
 __version__ = "1.2.0"
 
+from .agent import (
+    AgentRunResult,
+    AgentToolCall,
+    AgentTurnRecord,
+    HybridCLIAgent,
+    WorkspaceToolbox,
+)
 from .guardian import (
     GuardianPolicy,
     PIIEntity,
@@ -41,6 +48,11 @@ from .providers import (
 
 __all__ = [
     "__version__",
+    "AgentRunResult",
+    "AgentToolCall",
+    "AgentTurnRecord",
+    "HybridCLIAgent",
+    "WorkspaceToolbox",
     "GuardianPolicy",
     "PIIEntity",
     "PIIGuardian",
