@@ -953,8 +953,8 @@ class HybridOrchestrator:
                 api_key=runtime_key,
                 model=self.config.provider_models.get(name, str(preset["default_model"])),
                 provider_label=name,
-                api_key_env=str(preset.get("api_key_env", "")),
-                auth_header=str(preset.get("auth_header", "Authorization")),
+                api_key_env=str(preset.get("env_var", "")),
+                auth_header=str(preset.get("header_name", "Authorization")),
                 extra_headers=preset.get("extra_headers"),
             ).generate(prompt=sanitized_prompt, tools=tools)
 

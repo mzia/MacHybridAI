@@ -119,12 +119,31 @@ def _print_receipt(ansi: _ANSI, result: AgentRunResult, verbose: bool = False) -
         print(ansi.dim(f"      Receipt Sig  : {r.receipt_signature_sha256}"))
 
 
+def _public_provider_rows(orchestrator: HybridOrchestrator) -> List[Dict[str, Any]]:
+    """Returns non-sensitive provider display metadata safe for CLI output."""
+    rows: List[Dict[str, Any]] = []
+    for p in orchestrator.list_cloud_providers():
+        rows.append(
+            {
+                "id": str(p["id"]),
+                "name": str(p["name"]),
+                "protocol": str(p["protocol"]),
+                "base_url": str(p["base_url"]),
+                "default_model": str(p["default_model"]),
+                "recommended_models": list(p["recommended_models"]),
+                "env_var": str(p.get("env_var", "")),
+                "configured": bool(p.get("configured", False)),
+            }
+        )
+    return rows
+
+
 def _print_providers_table(ansi: _ANSI, orchestrator: HybridOrchestrator) -> None:
-    providers = orchestrator.list_cloud_providers()
+    providers = _public_provider_rows(orchestrator)
     print(ansi.bold("\nSupported Cloud AI Providers (All Behind On-Device Privacy Gate):"))
     for p in providers:
-        is_ready = bool(p.get("api_key_configured"))
-        env_var_name = str(p.get("api_key_env", ""))
+        is_ready = bool(p["configured"])
+        env_var_name = str(p["env_var"])
         status_badge = (
             ansi.green("READY")
             if is_ready
@@ -140,7 +159,7 @@ def _print_providers_table(ansi: _ANSI, orchestrator: HybridOrchestrator) -> Non
     print(
         ansi.dim(
             "\n  Tip: Use `/provider anthropic` or `/provider openai` or `/provider consensus`, "
-            "and `/key <provider> <token>` to load a RAM-only token.\n"
+            "and `/key <provider> <value>` to load a RAM-only credential.\n"
         )
     )
 
@@ -527,7 +546,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     orchestrator.update_config(cfg_updates)
 
     if args.subcommand == "providers":
-        catalog = orchestrator.list_cloud_providers()
+        catalog = _public_provider_rows(orchestrator)
         if args.json:
             print(json.dumps({"active_provider": orchestrator.config.cloud_provider, "providers": catalog}, indent=2))
         else:

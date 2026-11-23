@@ -810,8 +810,8 @@ CLOUD_PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
             "gemini-3.1-pro-preview",
             "gemini-3.5-flash-lite",
         ],
-        "api_key_env": "GEMINI_API_KEY",
-        "auth_header": "x-goog-api-key",
+        "env_var": "GEMINI_API_KEY",
+        "header_name": "x-goog-api-key",
     },
     "openai": {
         "id": "openai",
@@ -820,8 +820,8 @@ CLOUD_PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
         "base_url": "https://api.openai.com/v1",
         "default_model": DEFAULT_OPENAI_MODEL,
         "recommended_models": ["gpt-4.1", "gpt-4o", "o3-mini", "o4-mini"],
-        "api_key_env": "OPENAI_API_KEY",
-        "auth_header": "Authorization",
+        "env_var": "OPENAI_API_KEY",
+        "header_name": "Authorization",
     },
     "anthropic": {
         "id": "anthropic",
@@ -834,8 +834,8 @@ CLOUD_PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
             "claude-opus-4-1",
             "claude-haiku-4-5",
         ],
-        "api_key_env": "ANTHROPIC_API_KEY",
-        "auth_header": "x-api-key",
+        "env_var": "ANTHROPIC_API_KEY",
+        "header_name": "x-api-key",
     },
     "antigravity": {
         "id": "antigravity",
@@ -844,8 +844,8 @@ CLOUD_PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
         "base_url": "https://generativelanguage.googleapis.com",
         "default_model": DEFAULT_ANTIGRAVITY_AGENT,
         "recommended_models": [DEFAULT_ANTIGRAVITY_AGENT],
-        "api_key_env": "GEMINI_API_KEY",
-        "auth_header": "x-goog-api-key",
+        "env_var": "GEMINI_API_KEY",
+        "header_name": "x-goog-api-key",
     },
     "m365_copilot": {
         "id": "m365_copilot",
@@ -854,8 +854,8 @@ CLOUD_PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
         "base_url": "http://127.0.0.1:4141/v1",
         "default_model": M365ModelCatalog.DEFAULT_TOOL_MODEL,
         "recommended_models": [m.id for m in M365ModelCatalog.MODELS],
-        "api_key_env": "",
-        "auth_header": "Authorization",
+        "env_var": "",
+        "header_name": "Authorization",
     },
     "openrouter": {
         "id": "openrouter",
@@ -869,8 +869,8 @@ CLOUD_PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
             "google/gemini-2.5-pro",
             "deepseek/deepseek-r1",
         ],
-        "api_key_env": "OPENROUTER_API_KEY",
-        "auth_header": "Authorization",
+        "env_var": "OPENROUTER_API_KEY",
+        "header_name": "Authorization",
         "extra_headers": {
             "HTTP-Referer": "https://github.com/mzia/MacHybridAI",
             "X-Title": "MacHybridAI",
@@ -883,8 +883,8 @@ CLOUD_PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
         "base_url": "https://api.x.ai/v1",
         "default_model": "grok-3",
         "recommended_models": ["grok-3", "grok-3-mini"],
-        "api_key_env": "XAI_API_KEY",
-        "auth_header": "Authorization",
+        "env_var": "XAI_API_KEY",
+        "header_name": "Authorization",
     },
     "groq": {
         "id": "groq",
@@ -897,8 +897,8 @@ CLOUD_PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
             "deepseek-r1-distill-llama-70b",
             "qwen-qwq-32b",
         ],
-        "api_key_env": "GROQ_API_KEY",
-        "auth_header": "Authorization",
+        "env_var": "GROQ_API_KEY",
+        "header_name": "Authorization",
     },
     "deepseek": {
         "id": "deepseek",
@@ -907,8 +907,8 @@ CLOUD_PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
         "base_url": "https://api.deepseek.com/v1",
         "default_model": "deepseek-reasoner",
         "recommended_models": ["deepseek-reasoner", "deepseek-chat"],
-        "api_key_env": "DEEPSEEK_API_KEY",
-        "auth_header": "Authorization",
+        "env_var": "DEEPSEEK_API_KEY",
+        "header_name": "Authorization",
     },
     "mistral": {
         "id": "mistral",
@@ -917,8 +917,8 @@ CLOUD_PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
         "base_url": "https://api.mistral.ai/v1",
         "default_model": "mistral-large-latest",
         "recommended_models": ["mistral-large-latest", "codestral-latest"],
-        "api_key_env": "MISTRAL_API_KEY",
-        "auth_header": "Authorization",
+        "env_var": "MISTRAL_API_KEY",
+        "header_name": "Authorization",
     },
     "perplexity": {
         "id": "perplexity",
@@ -927,8 +927,8 @@ CLOUD_PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
         "base_url": "https://api.perplexity.ai",
         "default_model": "sonar-pro",
         "recommended_models": ["sonar-pro", "sonar-reasoning-pro", "sonar"],
-        "api_key_env": "PERPLEXITY_API_KEY",
-        "auth_header": "Authorization",
+        "env_var": "PERPLEXITY_API_KEY",
+        "header_name": "Authorization",
     },
     "together": {
         "id": "together",
@@ -940,8 +940,8 @@ CLOUD_PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
             "meta-llama/Llama-3.3-70B-Instruct-Turbo",
             "deepseek-ai/DeepSeek-R1",
         ],
-        "api_key_env": "TOGETHER_API_KEY",
-        "auth_header": "Authorization",
+        "env_var": "TOGETHER_API_KEY",
+        "header_name": "Authorization",
     },
     "openai_compatible": {
         "id": "openai_compatible",
@@ -950,8 +950,8 @@ CLOUD_PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
         "base_url": "https://api.openai.com/v1",
         "default_model": DEFAULT_OPENAI_MODEL,
         "recommended_models": [DEFAULT_OPENAI_MODEL, DEFAULT_ANTHROPIC_MODEL],
-        "api_key_env": "OPENAI_API_KEY",
-        "auth_header": "Authorization",
+        "env_var": "OPENAI_API_KEY",
+        "header_name": "Authorization",
     },
 }
 
@@ -970,12 +970,13 @@ def _resolve_endpoint_url(base_url: str, suffix: str) -> str:
 def build_cloud_provider_catalog(
     configured_provider_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Returns all supported cloud AI providers with live credential-presence status (never reads secret values)."""
+    """Returns all supported cloud AI providers with live readiness metadata (never reads secret values)."""
     configured_set = frozenset(configured_provider_ids or [])
     present_env_vars = frozenset(os.environ.keys())
     catalog: List[Dict[str, Any]] = []
     for pid, preset in CLOUD_PROVIDER_PRESETS.items():
-        env_var = str(preset.get("api_key_env", ""))
+        env_var = str(preset.get("env_var", ""))
+        header_name = str(preset.get("header_name", "Authorization"))
         is_configured = (pid in configured_set) or (bool(env_var) and env_var in present_env_vars)
         catalog.append(
             {
@@ -985,8 +986,10 @@ def build_cloud_provider_catalog(
                 "base_url": preset["base_url"],
                 "default_model": preset["default_model"],
                 "recommended_models": list(preset["recommended_models"]),
+                "env_var": env_var,
+                "configured": is_configured,
                 "api_key_env": env_var,
-                "auth_header": preset["auth_header"],
+                "auth_header": header_name,
                 "api_key_configured": is_configured,
             }
         )
