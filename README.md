@@ -6,16 +6,26 @@
 
 ---
 
-## Native macOS Installation Package (`.dmg` & `.pkg`)
+## Download & Install for macOS (Apple Silicon `arm64` · macOS 14+)
 
-Always-up-to-date native Apple Silicon (`arm64` Metal / MLX) & macOS 14+ installers are built and published automatically on [GitHub Releases](https://github.com/mzia/MacHybridAI/releases):
+[![Download MacHybridAI .dmg](https://img.shields.io/badge/Download_macOS_Installer-.dmg_(Recommended)-0ea5e9?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/mzia/MacHybridAI/releases/latest/download/MacHybridAI-latest.dmg)
+[![Download MacHybridAI .pkg](https://img.shields.io/badge/Download_Package_Installer-.pkg-6366f1?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/mzia/MacHybridAI/releases/latest/download/MacHybridAI-latest.pkg)
+[![Latest Release](https://img.shields.io/github/v/release/mzia/MacHybridAI?style=for-the-badge&color=10b981)](https://github.com/mzia/MacHybridAI/releases/latest)
 
-| Package Format | Download Link | Description |
+Pre-built, self-contained native macOS installation packages (embedding both the SwiftUI macOS App and the Python Hybrid Compute Engine) are available on [**GitHub Releases**](https://github.com/mzia/MacHybridAI/releases/latest):
+
+| Package Format | Direct 1-Click Download | How to Install |
 | :--- | :--- | :--- |
-| **macOS Disk Image (`.dmg`)** | [**`MacHybridAI-latest.dmg`**](https://github.com/mzia/MacHybridAI/releases/latest/download/MacHybridAI-latest.dmg) | Drag-and-drop `MacHybridAI.app` into `/Applications` |
-| **macOS Package Installer (`.pkg`)** | [**`MacHybridAI-latest.pkg`**](https://github.com/mzia/MacHybridAI/releases/latest/download/MacHybridAI-latest.pkg) | Standard macOS Installer package targeting `/Applications/MacHybridAI.app` |
-| **Zipped App Archive (`.app.zip`)** | [**`MacHybridAI-latest-macos-arm64.app.zip`**](https://github.com/mzia/MacHybridAI/releases/latest/download/MacHybridAI-latest-macos-arm64.app.zip) | Self-contained app bundle with embedded Python Hybrid Engine |
-| **SHA-256 Checksums** | [**`SHA256SUMS.txt`**](https://github.com/mzia/MacHybridAI/releases/latest/download/SHA256SUMS.txt) | Cryptographic SHA-256 digests for all release artifacts |
+| **macOS Disk Image (`.dmg`)** *(Recommended)* | [**`MacHybridAI-latest.dmg`**](https://github.com/mzia/MacHybridAI/releases/latest/download/MacHybridAI-latest.dmg) | Double-click `.dmg` and drag `MacHybridAI.app` into `/Applications` |
+| **macOS Installer Package (`.pkg`)** | [**`MacHybridAI-latest.pkg`**](https://github.com/mzia/MacHybridAI/releases/latest/download/MacHybridAI-latest.pkg) | Double-click `.pkg` to run the guided macOS Installer targeting `/Applications` |
+| **Zipped App Bundle (`.app.zip`)** | [**`MacHybridAI-latest-macos-arm64.app.zip`**](https://github.com/mzia/MacHybridAI/releases/latest/download/MacHybridAI-latest-macos-arm64.app.zip) | Unzip and move `MacHybridAI.app` to `/Applications` |
+| **SHA-256 Checksums** | [**`SHA256SUMS.txt`**](https://github.com/mzia/MacHybridAI/releases/latest/download/SHA256SUMS.txt) | Verify download integrity (`shasum -a 256 -c SHA256SUMS.txt`) |
+
+#### First-Launch Note (Open-Source Ad-Hoc Signed Build)
+Because this open-source release is ad-hoc signed, if macOS Gatekeeper prompts on first launch after installing to `/Applications`, clear the quarantine attribute once and launch:
+```bash
+xattr -cr /Applications/MacHybridAI.app && open /Applications/MacHybridAI.app
+```
 
 ---
 
@@ -50,16 +60,16 @@ Full setup and usage documentation is available in the [**MacHybridAI Wiki**](wi
   3. **Cloud Models**: Cloud models perform research and reasoning using the stand-in tokens only.
   4. **Result**: Local and cloud work are combined on your Mac and stand-in tokens are automatically restored to their real values from the local in-memory `PIIVault`.
 
-### 2. Multi-Provider Cloud & Local Architecture
-- **Default Cloud Providers**:
-  - **Google Gemini (`gemini-3.8-flash`)**: Powered by the `google-genai` (>= 2.3.0) Interactions API (`client.interactions.create`).
-  - **Google Antigravity (`antigravity-preview-05-2026` & `google-antigravity` SDK)**: Supports `LocalAgentConfig`, `LiteRTAgentConfig`, `LocalOpenAIAgentConfig`, and Managed Remote Antigravity Agents.
-- **Microsoft 365 Copilot Proxy Integration ([`cramt/m365-copilot-proxy`](https://github.com/cramt/m365-copilot-proxy))**:
-  - Built-in lifecycle manager (`M365CopilotProxyManager`) for `m365-proxy` (`http://127.0.0.1:4141/v1`), supporting `M365_ENABLE_INTERACTIVE_APPROVAL=1`, `M365_AVOID_THROTTLING=1`, and temporary-chat mode (`disableMemory=1`).
-  - Full **Prompt-Emulated Markdown-Fence & Shell-Routing Tool Calling** (`M365ToolEmulator`): Injects `<tools>` fenced templates, routes ```` ```bash ```` blocks directly to `run_command`/`bash`, and parses scalar `key: value` headers, body arguments, and aider-style `SEARCH/REPLACE` diffs into OpenAI `tool_calls`.
-  - Defaults to `gpt-5.5-think-deeper` (recommended for tool calling) and supports `gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-think-deeper`, `claude-sonnet-4.6`, and `claude-opus-4.8`.
-- **OpenAI Extension Method (`openai_compatible`)**:
-  - Easily configure any OpenAI-compatible `/v1/chat/completions` endpoint (OpenAI, OpenRouter, Groq, vLLM, Together, Azure).
+### 3. Universal Cloud AI & Local Architecture (Compatible with Any Cloud AI Service)
+- **Built-In Native & Preset Cloud Providers (All Protected by Station 2 Privacy Gate)**:
+  - **OpenAI (`openai`)**: Native `gpt-4.1`, `gpt-4o`, `o3-mini`, `o4-mini` with `store: false` and `X-No-Store: true`.
+  - **Anthropic Claude (`anthropic`)**: Native Anthropic Messages API (`POST /v1/messages`) supporting `claude-sonnet-4-5`, `claude-opus-4-1`, `claude-haiku-4-5`, and automatic OpenAI-to-Anthropic tool conversion.
+  - **Google Gemini (`gemini-3.8-flash`) & Google Antigravity (`antigravity-preview-05-2026`)**: Powered by the `google-genai` (>= 2.3.0) Interactions API (`store=False`) and `google-antigravity` SDK.
+  - **1-Click Cloud Presets**: **OpenRouter** (300+ models), **xAI Grok**, **Groq LPU**, **DeepSeek**, **Mistral AI**, **Perplexity Sonar**, and **Together AI**.
+  - **Microsoft 365 Copilot Proxy ([`cramt/m365-copilot-proxy`](https://github.com/cramt/m365-copilot-proxy))**: Managed local proxy (`http://127.0.0.1:4141/v1`) with temporary chat locked (`disableMemory=1`) and `<tools>` Markdown-fence tool calling.
+  - **Custom Any Cloud AI (`openai_compatible`)**: Point to **Azure OpenAI** (`?api-version=` preserved), AWS Bedrock / Vertex gateways, vLLM, LiteLLM, or any OpenAI (`/chat/completions`) or Anthropic (`/v1/messages`) endpoint with custom auth headers (`Authorization`, `x-api-key`, `api-key`).
+  - **Multi-Cloud Consensus Arena (`consensus`)**: Dispatch the same Station 2 sanitized payload concurrently across **Gemini + Claude + OpenAI** and synthesize locally on-device with `PIIVault` restoration.
+  - **Drop-In OpenAI-Compatible Local Proxy**: Point Cursor, Continue.dev, Zed, or any OpenAI SDK client to `http://127.0.0.1:<port>/v1` (`machybrid-auto`, `machybrid-local`, `machybrid-openai`, `machybrid-claude`, `machybrid-consensus`) for automatic on-device PII scrubbing, local BM25 RAG, Vision OCR redaction, and SHA-256 cryptographic privacy receipts.
 
 ---
 

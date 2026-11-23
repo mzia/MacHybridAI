@@ -1,6 +1,6 @@
 """MacHybridAI Hybrid Compute & PII Guardian Engine."""
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
 from .guardian import (
     GuardianPolicy,
@@ -9,6 +9,7 @@ from .guardian import (
     PIIVault,
     RedactionResult,
 )
+from .local_rag import LocalWorkspaceRAG, RAGChunk
 from .m365_proxy import (
     M365CopilotProxyManager,
     M365ModelCatalog,
@@ -29,6 +30,8 @@ from .profiler import (
     ModelRecommendation,
 )
 from .providers import (
+    CLOUD_PROVIDER_PRESETS,
+    AnthropicProvider,
     AntigravityProvider,
     GeminiProvider,
     LocalModelProvider,
@@ -43,6 +46,8 @@ __all__ = [
     "PIIGuardian",
     "PIIVault",
     "RedactionResult",
+    "LocalWorkspaceRAG",
+    "RAGChunk",
     "M365CopilotProxyManager",
     "M365ModelCatalog",
     "M365ToolEmulator",
@@ -56,6 +61,8 @@ __all__ = [
     "HardwareProfiler",
     "MacHardwareProfile",
     "ModelRecommendation",
+    "CLOUD_PROVIDER_PRESETS",
+    "AnthropicProvider",
     "AntigravityProvider",
     "GeminiProvider",
     "LocalModelProvider",
