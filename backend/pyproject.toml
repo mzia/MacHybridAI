@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "machybrid-engine"
-version = "1.0.0"
-description = "Hybrid Compute AI Engine for macOS with PII Guardian, Google Antigravity, Gemini, Local Models, OpenAI Extension, and M365 Copilot Proxy"
+version = "1.2.0"
+description = "Hybrid Compute AI Engine for macOS with PII Guardian, Universal Cloud AI (OpenAI, Anthropic Claude, Gemini, OpenRouter, xAI, Groq, DeepSeek, Mistral, Perplexity, Together, M365 Copilot), Local Apple Silicon MLX/LiteRT, and On-Device RAG"
 readme = { text = "MacHybridAI Hybrid Compute & Privacy Gate Engine", content-type = "text/markdown" }
 requires-python = ">=3.11"
 license = { text = "MIT" }
