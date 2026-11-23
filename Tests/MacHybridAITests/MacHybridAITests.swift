@@ -203,4 +203,28 @@ struct MacHybridAITests {
         #expect(audit.piiFlagged == true)
         #expect(!audit.sanitizedText.contains("sam.reyes@meridian.io"))
     }
+
+    @Test("Universal Cloud AI providers cover OpenAI, Anthropic Claude, OpenRouter, xAI, Groq, DeepSeek, Mistral, Perplexity, Together, and Custom protocols")
+    func testUniversalCloudProviderCatalog() {
+        let all = CloudProviderOption.allCases
+        #expect(all.contains(.openai))
+        #expect(all.contains(.anthropic))
+        #expect(all.contains(.gemini))
+        #expect(all.contains(.openRouter))
+        #expect(all.contains(.xai))
+        #expect(all.contains(.groq))
+        #expect(all.contains(.deepseek))
+        #expect(all.contains(.mistral))
+        #expect(all.contains(.perplexity))
+        #expect(all.contains(.together))
+        #expect(all.contains(.openAICompatible))
+        #expect(all.contains(.consensus))
+
+        #expect(CloudProviderOption.openai.defaultBaseURL == "https://api.openai.com/v1")
+        #expect(CloudProviderOption.anthropic.defaultBaseURL == "https://api.anthropic.com/v1")
+        #expect(CloudProviderOption.anthropic.apiKeyEnvName == "ANTHROPIC_API_KEY")
+        #expect(CloudProviderOption.openRouter.defaultBaseURL == "https://openrouter.ai/api/v1")
+        #expect(CustomCloudProtocolOption.allCases.contains(.openai))
+        #expect(CustomCloudProtocolOption.allCases.contains(.anthropic))
+    }
 }

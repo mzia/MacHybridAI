@@ -841,6 +841,20 @@ public final class BackendBridge: Sendable {
         _ = invoke(method: "POST", path: "/v1/config", body: body)
     }
 
+    /// Asynchronously syncs string config updates and optional in-memory API keys to `POST /v1/config`.
+    public func syncCloudProviderConfigAsync(
+        fields: [String: String],
+        apiKeys: [String: String] = [:]
+    ) {
+        Task.detached(priority: .utility) {
+            var payload: [String: Any] = fields
+            if !apiKeys.isEmpty {
+                payload["api_keys"] = apiKeys
+            }
+            _ = self.invoke(method: "POST", path: "/v1/config", body: payload)
+        }
+    }
+
     private func nativeThermalStateString() -> String {
         switch ProcessInfo.processInfo.thermalState {
         case .nominal: return "nominal"
