@@ -344,6 +344,44 @@ class TestHybridCLIAgentAndEndToEnd(unittest.TestCase):
         self.assertGreater(avail_gb, 15.0)
         self.assertLess(used_pct, 75)
 
+    def test_mlx_import_probe_caches_failure_once_to_prevent_nanobind_sigabrt(self) -> None:
+        orig_done = HardwareProfiler._mlx_probe_done
+        orig_core = HardwareProfiler._mlx_core_module
+        orig_lm = HardwareProfiler._mlx_lm_module
+        orig_err = HardwareProfiler._mlx_probe_error
+        try:
+            HardwareProfiler._mlx_probe_done = False
+            HardwareProfiler._mlx_core_module = None
+            HardwareProfiler._mlx_lm_module = None
+            HardwareProfiler._mlx_probe_error = ""
+
+            import_calls = []
+            real_import = __import__
+
+            def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+                if name == "mlx.core":
+                    import_calls.append(name)
+                    raise ImportError("[metal::load_device] No Metal device available")
+                return real_import(name, globals, locals, fromlist, level)
+
+            with patch("builtins.__import__", side_effect=fake_import):
+                m1, l1, err1 = HardwareProfiler.get_mlx_modules()
+                m2, l2, err2 = HardwareProfiler.get_mlx_modules()
+
+            self.assertIsNone(m1)
+            self.assertIsNone(l1)
+            self.assertIsNone(m2)
+            self.assertIsNone(l2)
+            self.assertIn("No Metal device available", err1)
+            self.assertEqual(err1, err2)
+            # Must NEVER attempt a second `import mlx.core` after first failure!
+            self.assertEqual(len(import_calls), 1)
+        finally:
+            HardwareProfiler._mlx_probe_done = orig_done
+            HardwareProfiler._mlx_core_module = orig_core
+            HardwareProfiler._mlx_lm_module = orig_lm
+            HardwareProfiler._mlx_probe_error = orig_err
+
 
 if __name__ == "__main__":
     unittest.main()

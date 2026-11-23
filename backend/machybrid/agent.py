@@ -31,7 +31,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .m365_proxy import M365ToolEmulator
 from .orchestrator import ComputeMode, ExecutionReceipt, HybridOrchestrator
 from .profiler import HardwareProfiler
-from .providers import LocalModelProvider, MLXProvider, ProviderResponse
+from .providers import LocalModelProvider, ProviderResponse
 
 _IGNORED_DIRS = frozenset(
     {
@@ -147,13 +147,23 @@ def diagnose_cli_permissions(
     )
 
     # 4. Apple Silicon Metal & MLX local inference runtime
-    mlx_ok = MLXProvider.is_available()
+    mx_mod, mlx_lm_mod, mlx_err = HardwareProfiler.get_mlx_modules()
+    mlx_ok = mx_mod is not None and mlx_lm_mod is not None
+    if mlx_ok:
+        mlx_detail = "Apple MLX + Metal GPU runtime available"
+        mlx_fix = ""
+    elif "metal" in mlx_err.lower():
+        mlx_detail = f"Metal GPU unavailable in this session ({mlx_err.splitlines()[0][:140]})"
+        mlx_fix = "Run in a standard macOS Terminal session with Metal GPU access (not a headless/sandboxed subshell)."
+    else:
+        mlx_detail = "MLX not installed in current Python interpreter"
+        mlx_fix = "Install mlx-lm (`pip install mlx mlx-lm`) or run via Homebrew Python."
     checks.append(
         {
             "name": "mlx_metal_runtime",
             "ok": mlx_ok,
-            "detail": "Apple MLX + Metal GPU runtime available" if mlx_ok else "MLX not installed in current Python interpreter",
-            "remediation": "" if mlx_ok else "Install mlx-lm (`pip install mlx mlx-lm`) or run via Homebrew Python.",
+            "detail": mlx_detail,
+            "remediation": mlx_fix,
         }
     )
 
