@@ -298,11 +298,25 @@ class HybridOrchestrator:
                 labels.append(base)
         return labels
 
+    _COMPLEX_KEYWORDS = frozenset({
+        "benchmark",
+        "compare",
+        "research",
+        "analyze",
+        "synthesize",
+        "architecture",
+        "market",
+        "deck",
+        "multi-step",
+        "refactor",
+        "audit",
+        "strategy",
+        "consensus",
+    })
+
     def classify_prompt_complexity(self, prompt: str) -> Dict[str, Any]:
         """Scores prompt sensitivity & reasoning complexity for Adaptive Smart Auto routing."""
-        pre_scan = self.guardian.redact(prompt)
-        high_risk = {"SECRET", "SSN", "CREDIT_CARD"}
-        flagged_high_risk = [cat for cat in pre_scan.categories if cat in high_risk]
+        flagged_high_risk = self.guardian.detect_high_risk_categories(prompt)
         if flagged_high_risk:
             return {
                 "recommended_mode": ComputeMode.LOCAL.value,
@@ -315,25 +329,10 @@ class HybridOrchestrator:
             }
 
         words = prompt.split()
-        complex_keywords = {
-            "benchmark",
-            "compare",
-            "research",
-            "analyze",
-            "synthesize",
-            "architecture",
-            "market",
-            "deck",
-            "multi-step",
-            "refactor",
-            "audit",
-            "strategy",
-            "consensus",
-        }
         matched_kw = [
             w.lower().strip(".,?!")
             for w in words
-            if w.lower().strip(".,?!") in complex_keywords
+            if w.lower().strip(".,?!") in self._COMPLEX_KEYWORDS
         ]
         score = min(1.0, round((len(words) / 24.0) + (0.25 * len(matched_kw)), 2))
         if len(words) >= 12 or matched_kw:
@@ -847,22 +846,11 @@ class HybridOrchestrator:
 
     @staticmethod
     def _read_cpu_percent_darwin() -> int:
-        """Reads real CPU busy % on macOS using stdlib `os.getloadavg()` normalized by logical CPU count."""
         return HardwareProfiler.read_cpu_busy_percent()
 
     @staticmethod
     def _read_memory_percent_darwin() -> int:
-        """Reads real memory pressure % on macOS via `vm_stat` + `hw.memsize`."""
-        used_pct, _ = HardwareProfiler.read_memory_stats()
-        return used_pct
-
-    @staticmethod
-    def _read_gpu_percent_darwin(arch: str) -> int:
-        """Reads GPU engine busy % from IOKit `IOAccelerator` (`ioreg`) on Apple Silicon without requiring root."""
-        if arch != "arm64" or platform.system() != "Darwin":
-            return 0
-        io_stats = HardwareProfiler.read_ioaccelerator_stats()
-        return int(io_stats.get("device_utilization", 0))
+        return HardwareProfiler.read_memory_stats()[0]
 
     @staticmethod
     def collect_telemetry(tokens: int = 0) -> MacTelemetry:
@@ -872,9 +860,13 @@ class HybridOrchestrator:
         chip = str(static["chip_brand"])
         mem_gb = int(static["unified_memory_gb"])
 
-        cpu_pct = HybridOrchestrator._read_cpu_percent_darwin()
-        mem_pct = HybridOrchestrator._read_memory_percent_darwin()
-        gpu_pct = HybridOrchestrator._read_gpu_percent_darwin(arch)
+        cpu_pct = HardwareProfiler.read_cpu_busy_percent()
+        mem_pct, _ = HardwareProfiler.read_memory_stats()
+        gpu_pct = (
+            int(HardwareProfiler.read_ioaccelerator_stats().get("device_utilization", 0))
+            if arch == "arm64" and platform.system() == "Darwin"
+            else 0
+        )
 
         return MacTelemetry(
             architecture=arch,

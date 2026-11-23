@@ -914,8 +914,21 @@ public enum MarkdownBlock: Sendable, Equatable {
 }
 
 public enum MarkdownBlockParser {
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var blockCache: [String: [MarkdownBlock]] = [:]
+    nonisolated(unsafe) private static var inlineCache: [String: AttributedString] = [:]
+    private static let tableSeparatorAllowedScalars = CharacterSet(charactersIn: "|-: ")
+    private static let inlineParseOptions = AttributedString.MarkdownParsingOptions(
+        allowsExtendedAttributes: true,
+        interpretedSyntax: .inlineOnlyPreservingWhitespace,
+        failurePolicy: .returnPartiallyParsedIfPossible
+    )
+
     /// Parses a raw Markdown string (including in-flight streaming responses) into structured blocks.
     public static func parse(_ markdown: String) -> [MarkdownBlock] {
+        if let cached = cacheLock.withLock({ blockCache[markdown] }) {
+            return cached
+        }
         let normalized = markdown.replacingOccurrences(of: "\r\n", with: "\n")
         let lines = normalized.components(separatedBy: "\n")
         var blocks: [MarkdownBlock] = []
@@ -1056,20 +1069,33 @@ public enum MarkdownBlockParser {
             blocks.append(.paragraph(text: paraLines.joined(separator: "\n")))
         }
 
+        cacheLock.withLock {
+            if blockCache.count >= 128 {
+                blockCache.removeAll(keepingCapacity: true)
+            }
+            blockCache[markdown] = blocks
+        }
         return blocks
     }
 
     /// Parses inline Markdown (**bold**, *italic*, `code`, ~~strike~~, [link](url)) into an AttributedString.
     public static func inlineAttributedString(_ text: String) -> AttributedString {
-        let options = AttributedString.MarkdownParsingOptions(
-            allowsExtendedAttributes: true,
-            interpretedSyntax: .inlineOnlyPreservingWhitespace,
-            failurePolicy: .returnPartiallyParsedIfPossible
-        )
-        if let parsed = try? AttributedString(markdown: text, options: options) {
-            return parsed
+        if let cached = cacheLock.withLock({ inlineCache[text] }) {
+            return cached
         }
-        return AttributedString(text)
+        let result: AttributedString
+        if let parsed = try? AttributedString(markdown: text, options: inlineParseOptions) {
+            result = parsed
+        } else {
+            result = AttributedString(text)
+        }
+        cacheLock.withLock {
+            if inlineCache.count >= 256 {
+                inlineCache.removeAll(keepingCapacity: true)
+            }
+            inlineCache[text] = result
+        }
+        return result
     }
 
     private static func isHorizontalRule(_ trimmed: String) -> Bool {
@@ -1124,8 +1150,7 @@ public enum MarkdownBlockParser {
 
     private static func isTableSeparatorLine(_ trimmed: String) -> Bool {
         guard trimmed.contains("|") && trimmed.contains("-") else { return false }
-        let allowed = CharacterSet(charactersIn: "|-: ")
-        return trimmed.unicodeScalars.allSatisfy { allowed.contains($0) }
+        return trimmed.unicodeScalars.allSatisfy { tableSeparatorAllowedScalars.contains($0) }
     }
 
     private static func parseTableRow(_ trimmed: String) -> [String] {
