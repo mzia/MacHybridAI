@@ -53,7 +53,7 @@ jobs:
           codesign --verify --deep --strict MacHybridAI.app
 
       - name: Publish / Update GitHub Release Installers
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.meta.outputs.tag_name }}
           name: "MacHybridAI ${{ steps.meta.outputs.tag_name }} — Native Apple Silicon macOS Installer"
