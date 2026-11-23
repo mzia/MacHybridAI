@@ -389,6 +389,7 @@ class HardwareProfiler:
 
             page_size = 16384
             free_pages = 0
+            inactive_pages = 0
             spec_pages = 0
             purgeable_pages = 0
 
@@ -403,6 +404,10 @@ class HardwareProfiler:
                     val = line.split(":", 1)[1].strip().rstrip(".")
                     if val.isdigit():
                         free_pages = int(val)
+                elif line.startswith("Pages inactive:"):
+                    val = line.split(":", 1)[1].strip().rstrip(".")
+                    if val.isdigit():
+                        inactive_pages = int(val)
                 elif line.startswith("Pages speculative:"):
                     val = line.split(":", 1)[1].strip().rstrip(".")
                     if val.isdigit():
@@ -413,8 +418,9 @@ class HardwareProfiler:
                         purgeable_pages = int(val)
 
             total_pages = max(1, total_bytes // page_size)
-            avail_pages = free_pages + spec_pages + purgeable_pages
-            used_pages = max(0, total_pages - (free_pages + spec_pages))
+            # On macOS, inactive & purgeable pages are reclaimable file cache (matching Activity Monitor)
+            avail_pages = free_pages + inactive_pages + spec_pages + purgeable_pages
+            used_pages = max(0, total_pages - avail_pages)
             used_pct = min(100, max(0, int((used_pages / total_pages) * 100)))
             avail_gb = round((avail_pages * page_size) / (1024**3), 2)
             out = (used_pct, max(1.0, avail_gb))

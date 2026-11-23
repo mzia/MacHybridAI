@@ -426,7 +426,29 @@ class MLXProvider:
                 MLXProvider._wired_limit_configured = True
 
             if self._model_id not in MLXProvider._model_cache:
-                model, tokenizer = load(self._model_id)
+                prev_disable_bars = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
+                prev_offline = os.environ.get("HF_HUB_OFFLINE")
+                os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+                try:
+                    from huggingface_hub.utils import disable_progress_bars  # type: ignore[import-not-found]
+
+                    disable_progress_bars()
+                except Exception:
+                    pass
+                _, is_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(self._model_id)
+                if is_complete:
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                try:
+                    model, tokenizer = load(self._model_id)
+                finally:
+                    if prev_disable_bars is None:
+                        os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+                    else:
+                        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = prev_disable_bars
+                    if prev_offline is None:
+                        os.environ.pop("HF_HUB_OFFLINE", None)
+                    else:
+                        os.environ["HF_HUB_OFFLINE"] = prev_offline
                 MLXProvider._model_cache[self._model_id] = (model, tokenizer)
             return MLXProvider._model_cache[self._model_id]
 

@@ -19,7 +19,7 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import __version__
-from .agent import AgentRunResult, HybridCLIAgent
+from .agent import AgentRunResult, HybridCLIAgent, diagnose_cli_permissions
 from .guardian import GuardianPolicy
 from .orchestrator import ComputeMode, HybridOrchestrator
 from .profiler import HardwareProfiler
@@ -93,7 +93,12 @@ def _print_banner(
         f"  Mode     : {ansi.cyan(mode_str)}  ·  Cloud: {ansi.magenta(prov_str)}  ·  "
         + ansi.green(" · ".join(flags))
     )
-    print(ansi.dim("  Type a goal or /help for slash commands (/mode, /provider, /plan, /hardware, /quit).\n"))
+    print(
+        ansi.dim(
+            "  Type a goal or /help for slash commands "
+            "(/ls, /read, /search, /doctor, /mode, /provider, /plan, /hardware, /quit).\n"
+        )
+    )
 
 
 def _print_receipt(ansi: _ANSI, result: AgentRunResult, verbose: bool = False) -> None:
@@ -184,13 +189,38 @@ def _print_hardware_summary(ansi: _ANSI) -> None:
     print()
 
 
-def _interactive_tool_approval(ansi: _ANSI, tool_name: str, args: Dict[str, Any], preview: str) -> bool:
+def _print_doctor_report(
+    ansi: _ANSI,
+    workspace_root: str,
+    orchestrator: HybridOrchestrator,
+) -> List[Dict[str, Any]]:
+    checks = diagnose_cli_permissions(workspace_root=workspace_root, orchestrator=orchestrator)
+    print(ansi.bold("\nMacHybridAI CLI Permissions & Environment Doctor:"))
+    for item in checks:
+        badge = ansi.green("PASS") if item["ok"] else ansi.yellow("WARN")
+        print(f"  [{badge}] {ansi.bold(str(item['name']).ljust(22))} {item['detail']}")
+        if item.get("remediation"):
+            print(ansi.dim(f"         Fix: {item['remediation']}"))
+    print()
+    return checks
+
+
+def _interactive_tool_approval(
+    ansi: _ANSI,
+    tool_name: str,
+    args: Dict[str, Any],
+    preview: str,
+) -> Any:
     print(ansi.yellow(f"\n  [Approval Required] Tool `{tool_name}`"))
     print(ansi.dim(f"  {preview}"))
     try:
-        answer = input(ansi.bold("  Approve this local workspace action? [y/N]: ")).strip().lower()
+        answer = input(
+            ansi.bold("  Approve this local workspace action? [y]es / [a]lways (session) / [n]o [y/a/N]: ")
+        ).strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False
+    if answer in {"a", "always"}:
+        return "always"
     return answer in {"y", "yes"}
 
 
@@ -229,6 +259,11 @@ def handle_slash_command(
     if cmd == "/help":
         print(
             ansi.bold("\nMacHybridAI Agentic CLI Slash Commands:\n")
+            + "  /ls [path] [depth]         Instantly list files & folders in the workspace\n"
+            + "  /read <path> [start] [end] Instantly read a workspace file with line numbers\n"
+            + "  /search <query>            Instantly search code across workspace files\n"
+            + "  /run <command>             Run a shell command in workspace (respects Plan Mode & approvals)\n"
+            + "  /doctor                    Run macOS permissions, TCC, MLX/Metal & cache diagnostics\n"
             + "  /mode local|auto|hybrid    Switch Split-Compute execution mode\n"
             + "  /provider <id>             Switch Cloud AI (openai, anthropic, gemini, openrouter, xai, groq, deepseek, mistral, perplexity, together, m365_copilot, consensus)\n"
             + "  /providers                 List all supported Cloud AI providers & key status\n"
@@ -243,6 +278,61 @@ def handle_slash_command(
             + "  /clear                     Clear agent memory & local PIIVault\n"
             + "  /quit                      Unload local models, wipe RAM keys & exit\n"
         )
+        return True
+
+    if cmd == "/doctor":
+        _print_doctor_report(ansi, agent.workspace_root, orchestrator)
+        return True
+
+    if cmd == "/ls":
+        ls_tokens = raw_line.strip().split()
+        target_path = ls_tokens[1] if len(ls_tokens) >= 2 else "."
+        depth = 1
+        if len(ls_tokens) >= 3:
+            try:
+                depth = int(ls_tokens[2])
+            except ValueError:
+                depth = 1
+        out, _ = agent.toolbox.execute("list_files", {"path": target_path, "max_depth": depth})
+        print(f"\n{out}\n")
+        return True
+
+    if cmd == "/read":
+        read_tokens = raw_line.strip().split()
+        if len(read_tokens) < 2:
+            print(ansi.yellow("  Usage: /read <relative_path> [start_line] [end_line]"))
+            return True
+        read_args: Dict[str, Any] = {"path": read_tokens[1]}
+        if len(read_tokens) >= 3:
+            try:
+                read_args["start_line"] = int(read_tokens[2])
+            except ValueError:
+                pass
+        if len(read_tokens) >= 4:
+            try:
+                read_args["end_line"] = int(read_tokens[3])
+            except ValueError:
+                pass
+        out, _ = agent.toolbox.execute("read_file", read_args)
+        print(f"\n{out}\n")
+        return True
+
+    if cmd == "/search":
+        query = raw_line[len("/search") :].strip()
+        if not query:
+            print(ansi.yellow("  Usage: /search <text_pattern>"))
+            return True
+        out, _ = agent.toolbox.execute("search_code", {"query": query})
+        print(f"\n{out}\n")
+        return True
+
+    if cmd == "/run":
+        shell_cmd = raw_line[len("/run") :].strip()
+        if not shell_cmd:
+            print(ansi.yellow("  Usage: /run <command>"))
+            return True
+        out, _ = agent.toolbox.execute("run_command", {"command": shell_cmd})
+        print(f"\n{out}\n")
         return True
 
     if cmd == "/mode":
@@ -469,6 +559,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("providers", help="List all supported Cloud AI providers & key status")
     subparsers.add_parser("hardware", help="Inspect Apple Silicon SoC, Metal RAM & local model cache")
+    subparsers.add_parser(
+        "doctor",
+        help="Verify macOS filesystem/TCC permissions, MLX/Metal runtime, model cache & CLI PATH",
+    )
 
     p_bench = subparsers.add_parser("benchmark", help="Run Apple Silicon Metal inference benchmark")
     p_bench.add_argument("--local-model", default=None, help="Specific MLX model ID to benchmark")
@@ -489,7 +583,7 @@ def _normalize_shorthand_args(raw_args: List[str]) -> List[str]:
     Enables both `machybrid "Refactor auth.py"` and
     `machybrid --mode hybrid --provider anthropic "Refactor auth.py"`.
     """
-    known_subcommands = {"run", "inspect", "providers", "hardware", "benchmark", "proxy"}
+    known_subcommands = {"run", "inspect", "providers", "hardware", "doctor", "benchmark", "proxy"}
     value_flags = {
         "--mode",
         "--provider",
@@ -559,6 +653,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(json.dumps(prof.to_dict(), indent=2))
         else:
             _print_hardware_summary(ansi)
+        return 0
+
+    if args.subcommand == "doctor":
+        checks = diagnose_cli_permissions(workspace_root=args.workspace, orchestrator=orchestrator)
+        if args.json:
+            print(json.dumps({"workspace": os.path.realpath(os.path.abspath(args.workspace)), "checks": checks}, indent=2))
+        else:
+            _print_doctor_report(ansi, args.workspace, orchestrator)
         return 0
 
     if args.subcommand == "benchmark":
