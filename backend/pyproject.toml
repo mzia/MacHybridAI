@@ -38,6 +38,8 @@ dev = [
 ]
 
 [project.scripts]
+machybrid = "machybrid.cli:main"
+mh = "machybrid.cli:main"
 machybrid-daemon = "machybrid.server:main"
 
 [tool.pytest.ini_options]
