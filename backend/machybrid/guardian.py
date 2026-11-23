@@ -264,27 +264,46 @@ class PIIGuardian:
     ) -> None:
         self.policy = policy
         self.vault = vault or PIIVault()
-        self.custom_terms: List[str] = [
-            t.strip() for t in (custom_sensitive_terms or []) if t and t.strip()
-        ]
-        self.allowlist_terms: List[str] = [
-            t.strip() for t in (allowlist_terms or []) if t and t.strip()
-        ]
+        self.custom_terms: List[str] = []
+        self._custom_patterns: List[Tuple[str, re.Pattern[str]]] = []
+        self.allowlist_terms: List[str] = []
+        self._allowlist_lower: set[str] = set()
+        self.set_allowlist_terms(allowlist_terms or [])
+        self.set_custom_terms(custom_sensitive_terms or [])
 
     def set_custom_terms(self, terms: Iterable[str]) -> None:
-        self.custom_terms = [t.strip() for t in terms if t and t.strip()]
+        cleaned = [t.strip() for t in terms if t and t.strip()]
+        self.custom_terms = cleaned
+        self._custom_patterns = [
+            (term, re.compile(re.escape(term), re.IGNORECASE))
+            for term in sorted(cleaned, key=len, reverse=True)
+        ]
 
     def set_allowlist_terms(self, terms: Iterable[str]) -> None:
-        self.allowlist_terms = [t.strip() for t in terms if t and t.strip()]
+        cleaned = [t.strip() for t in terms if t and t.strip()]
+        self.allowlist_terms = cleaned
+        self._allowlist_lower = {t.lower() for t in cleaned}
 
     def _is_allowlisted(self, candidate: str) -> bool:
         cand_lower = candidate.strip().lower()
-        if not cand_lower:
-            return False
-        for safe in self.allowlist_terms:
-            if cand_lower == safe.lower():
-                return True
-        return False
+        return bool(cand_lower and cand_lower in self._allowlist_lower)
+
+    def detect_high_risk_categories(self, text: str) -> List[str]:
+        """Fast, zero-mutation check for high-risk credentials/identifiers (SECRET, SSN, CREDIT_CARD)."""
+        if not text:
+            return []
+        found: List[str] = []
+        for category, regex, _ in self._PATTERNS[:3]:
+            for match in regex.finditer(text):
+                candidate = match.group(0)
+                if self._is_allowlisted(candidate):
+                    continue
+                if category == "CREDIT_CARD" and not _passes_luhn(candidate):
+                    continue
+                if category not in found:
+                    found.append(category)
+                break
+        return found
 
     def redact(
         self,
@@ -298,11 +317,10 @@ class PIIGuardian:
 
         raw_matches: List[Tuple[int, int, str, str, float]] = []
 
-        # 1. Check user-supplied custom sensitive terms first
-        for term in sorted(self.custom_terms, key=len, reverse=True):
+        # 1. Check pre-compiled user-supplied custom sensitive terms first
+        for term, pattern in self._custom_patterns:
             if self._is_allowlisted(term):
                 continue
-            pattern = re.compile(re.escape(term), re.IGNORECASE)
             for match in pattern.finditer(text):
                 raw_matches.append(
                     (match.start(), match.end(), "CUSTOM", match.group(0), 1.0)

@@ -221,6 +221,13 @@ class HardwareProfiler:
     ]
 
     _static_cache: Optional[Dict[str, Any]] = None
+    _io_stats_cache: Optional[Tuple[float, Dict[str, Any]]] = None
+    _mem_stats_cache: Optional[Tuple[float, Tuple[int, float]]] = None
+    _therm_level_cache: Optional[Tuple[float, int]] = None
+    _hf_inspect_cache: Dict[Tuple[str, str], Tuple[float, Tuple[bool, bool, int, str, int]]] = {}
+    _SAFE_REPO_CHARS = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:"
+    )
 
     @classmethod
     def _sysctl_str(cls, key: str, default: str = "") -> str:
@@ -310,11 +317,14 @@ class HardwareProfiler:
         }
         return cls._static_cache
 
-    @staticmethod
-    def read_ioaccelerator_stats() -> Dict[str, Any]:
+    @classmethod
+    def read_ioaccelerator_stats(cls) -> Dict[str, Any]:
         """Reads Apple Silicon GPU utilization and Metal memory from IOKit `IOAccelerator` without root."""
         if platform.system() != "Darwin":
             return {}
+        now = time.monotonic()
+        if cls._io_stats_cache is not None and (now - cls._io_stats_cache[0]) < 2.0:
+            return cls._io_stats_cache[1]
         try:
             raw = subprocess.check_output(
                 ["/usr/sbin/ioreg", "-r", "-d", "1", "-c", "IOAccelerator", "-a"],
@@ -334,7 +344,7 @@ class HardwareProfiler:
                     tiler_util = int(perf.get("Tiler Utilization %", 0))
                     in_use_bytes = int(perf.get("In use system memory", 0))
                     alloc_bytes = int(perf.get("Alloc system memory", 0))
-                    return {
+                    res = {
                         "model": str(item.get("model", "")),
                         "gpu_cores": int(item.get("gpu-core-count", 0)),
                         "device_utilization": min(100, max(0, max(device_util, renderer_util))),
@@ -343,6 +353,8 @@ class HardwareProfiler:
                         "in_use_memory_gb": round(in_use_bytes / (1024**3), 2),
                         "alloc_memory_gb": round(alloc_bytes / (1024**3), 2),
                     }
+                    cls._io_stats_cache = (now, res)
+                    return res
         except Exception:
             pass
         return {}
@@ -359,11 +371,14 @@ class HardwareProfiler:
 
     @classmethod
     def read_memory_stats(cls) -> Tuple[int, float]:
-        """Returns `(memory_used_percent, available_memory_gb)` from `vm_stat`."""
+        """Returns `(memory_used_percent, available_memory_gb)` from `vm_stat` in a single pass with a 2s TTL cache."""
         static = cls.get_static_hardware_info()
         total_gb = float(static["unified_memory_gb"])
         if platform.system() != "Darwin":
             return 50, round(total_gb * 0.5, 2)
+        now = time.monotonic()
+        if cls._mem_stats_cache is not None and (now - cls._mem_stats_cache[0]) < 2.0:
+            return cls._mem_stats_cache[1]
         try:
             total_bytes = int(total_gb * (1024**3))
             vm_raw = subprocess.check_output(
@@ -373,6 +388,10 @@ class HardwareProfiler:
             ).decode("utf-8", errors="replace")
 
             page_size = 16384
+            free_pages = 0
+            spec_pages = 0
+            purgeable_pages = 0
+
             for line in vm_raw.splitlines():
                 if "page size of" in line:
                     parts = line.split("page size of")
@@ -380,37 +399,38 @@ class HardwareProfiler:
                         sz = parts[1].split()[0]
                         if sz.isdigit():
                             page_size = int(sz)
-                    break
+                elif line.startswith("Pages free:"):
+                    val = line.split(":", 1)[1].strip().rstrip(".")
+                    if val.isdigit():
+                        free_pages = int(val)
+                elif line.startswith("Pages speculative:"):
+                    val = line.split(":", 1)[1].strip().rstrip(".")
+                    if val.isdigit():
+                        spec_pages = int(val)
+                elif line.startswith("Pages purgeable:"):
+                    val = line.split(":", 1)[1].strip().rstrip(".")
+                    if val.isdigit():
+                        purgeable_pages = int(val)
 
-            def _pages(label: str) -> int:
-                for line in vm_raw.splitlines():
-                    if line.startswith(label):
-                        val = line.split(":")[1].strip().rstrip(".")
-                        if val.isdigit():
-                            return int(val)
-                return 0
-
-            free_pages = _pages("Pages free:")
-            spec_pages = _pages("Pages speculative:")
-            purgeable_pages = _pages("Pages purgeable:")
             total_pages = max(1, total_bytes // page_size)
             avail_pages = free_pages + spec_pages + purgeable_pages
             used_pages = max(0, total_pages - (free_pages + spec_pages))
             used_pct = min(100, max(0, int((used_pages / total_pages) * 100)))
             avail_gb = round((avail_pages * page_size) / (1024**3), 2)
-            return used_pct, max(1.0, avail_gb)
+            out = (used_pct, max(1.0, avail_gb))
+            cls._mem_stats_cache = (now, out)
+            return out
         except Exception:
             return 50, round(total_gb * 0.5, 2)
 
-    @staticmethod
-    def _is_safe_repo_id(repo_id: str) -> bool:
+    @classmethod
+    def _is_safe_repo_id(cls, repo_id: str) -> bool:
         """Validates that a model identifier contains no path traversal or unsafe characters."""
         if not repo_id or ".." in repo_id or "\\" in repo_id or "\x00" in repo_id:
             return False
         if repo_id.startswith("/") or repo_id.endswith("/"):
             return False
-        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:")
-        return all(ch in allowed for ch in repo_id)
+        return all(ch in cls._SAFE_REPO_CHARS for ch in repo_id)
 
     @classmethod
     def inspect_hf_model_cache(
@@ -435,11 +455,23 @@ class HardwareProfiler:
                 os.path.expanduser("~/.cache/huggingface/hub"),
             )
         )
+        cache_key = (str(hub_root), repo_id) if hf_hub_dir is None else None
+        now = time.monotonic()
+        if cache_key is not None:
+            cached_entry = cls._hf_inspect_cache.get(cache_key)
+            if cached_entry is not None and (now - cached_entry[0]) < 5.0:
+                return cached_entry[1]
+
+        def _store(result: Tuple[bool, bool, int, str, int]) -> Tuple[bool, bool, int, str, int]:
+            if cache_key is not None:
+                cls._hf_inspect_cache[cache_key] = (now, result)
+            return result
+
         try:
             if not hub_root.is_dir():
-                return False, False, 0, "", 0
+                return _store((False, False, 0, "", 0))
         except OSError:
-            return False, False, 0, "", 0
+            return _store((False, False, 0, "", 0))
 
         folder_name = "models--" + repo_id.replace("/", "--")
         model_dir: Optional[Path] = None
@@ -449,14 +481,14 @@ class HardwareProfiler:
                     model_dir = child
                     break
         except OSError:
-            return False, False, 0, "", 0
+            return _store((False, False, 0, "", 0))
 
         if model_dir is None:
-            return False, False, 0, "", 0
+            return _store((False, False, 0, "", 0))
 
         snapshots_dir = model_dir / "snapshots"
         if not snapshots_dir.is_dir():
-            return True, False, 0, str(model_dir), 1
+            return _store((True, False, 0, str(model_dir), 1))
 
         try:
             snap_dirs = [p for p in snapshots_dir.iterdir() if p.is_dir()]
@@ -464,7 +496,7 @@ class HardwareProfiler:
             snap_dirs = []
 
         if not snap_dirs:
-            return True, False, 0, str(model_dir), 1
+            return _store((True, False, 0, str(model_dir), 1))
 
         # Prefer snapshot pointed to by refs/main if present
         target_snap: Optional[Path] = None
@@ -490,11 +522,11 @@ class HardwareProfiler:
         try:
             snap_files = {p.name: p for p in target_snap.iterdir() if p.is_file()}
         except OSError:
-            return True, False, 0, str(target_snap), 1
+            return _store((True, False, 0, str(target_snap), 1))
 
         # Check config.json
         if "config.json" not in snap_files:
-            return True, False, 0, str(target_snap), 1
+            return _store((True, False, 0, str(target_snap), 1))
 
         # Verify weight shards via single model.safetensors OR model.safetensors.index.json
         single_weight = snap_files.get("model.safetensors")
@@ -538,7 +570,7 @@ class HardwareProfiler:
                         pass
 
         is_complete = missing_shards == 0 and total_bytes > 0
-        return True, is_complete, total_bytes, str(target_snap), missing_shards
+        return _store((True, is_complete, total_bytes, str(target_snap), missing_shards))
 
     @classmethod
     def scan_cached_models(cls, hf_hub_dir: Optional[Path] = None) -> List[CachedModelStatus]:
@@ -622,6 +654,7 @@ class HardwareProfiler:
         cls,
         hf_hub_dir: Optional[Path] = None,
         prefer_cached_only: bool = True,
+        cached_models: Optional[List[CachedModelStatus]] = None,
     ) -> Tuple[str, str, Optional[int], List[ModelRecommendation]]:
         """Selects `(primary_model_id, fast_model_id, recommended_kv_bits, recommendations)` based on hardware & cache."""
         static = cls.get_static_hardware_info()
@@ -629,7 +662,11 @@ class HardwareProfiler:
         # Keep ~12% of Metal working set reserved for KV cache & macOS WindowServer
         safe_model_budget_gb = working_set_gb * 0.88
 
-        cached_list = cls.scan_cached_models(hf_hub_dir=hf_hub_dir)
+        cached_list = (
+            cached_models
+            if cached_models is not None
+            else cls.scan_cached_models(hf_hub_dir=hf_hub_dir)
+        )
         complete_map = {m.model_id: m for m in cached_list if m.is_complete}
 
         recommendations: List[ModelRecommendation] = []
@@ -697,7 +734,12 @@ class HardwareProfiler:
         if env_thermal in {"nominal", "fair", "serious", "critical"}:
             thermal = env_thermal
         else:
-            thermal_lvl = cls._sysctl_int("machdep.xcpm.therm_level", 0)
+            now = time.monotonic()
+            if cls._therm_level_cache is not None and (now - cls._therm_level_cache[0]) < 2.0:
+                thermal_lvl = cls._therm_level_cache[1]
+            else:
+                thermal_lvl = cls._sysctl_int("machdep.xcpm.therm_level", 0)
+                cls._therm_level_cache = (now, thermal_lvl)
             if thermal_lvl >= 70 or (cpu_busy >= 95 and gpu_busy >= 95):
                 thermal = "serious"
             elif thermal_lvl >= 40 or (cpu_busy >= 88 and gpu_busy >= 85):
@@ -817,6 +859,7 @@ class HardwareProfiler:
                     revision="main",
                     local_files_only=False,
                 )
+                cls._hf_inspect_cache.clear()
                 is_cached, is_complete, size_bytes, snap_path, missing = cls.inspect_hf_model_cache(
                     canonical_id, hf_hub_dir=hf_hub_dir
                 )
@@ -979,6 +1022,7 @@ class HardwareProfiler:
         selected_primary, selected_fast, kv_bits, recs = cls.select_optimal_models(
             hf_hub_dir=hf_hub_dir,
             prefer_cached_only=True,
+            cached_models=cached_models,
         )
         guarded_primary, guardrail_triggered, guardrail_reason = cls.evaluate_guardrail(
             requested_model=selected_primary,

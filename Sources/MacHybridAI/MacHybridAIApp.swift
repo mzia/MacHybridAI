@@ -5,8 +5,14 @@ import AppKit
 /// so the app and menu bar look unmistakably like a Hybrid Compute AI Studio
 /// (Apple Silicon [M] Chip + Privacy Gate Lock + Cloud [AI] Node).
 public enum HybridBrandIconGenerator {
+    @MainActor private static var cachedDockIcon: NSImage?
+    @MainActor private static var cachedMenuBarIcon: NSImage?
+
     @MainActor
     public static func makeDockIcon(size: CGFloat = 512) -> NSImage {
+        if size == 512, let cachedDockIcon {
+            return cachedDockIcon
+        }
         let img = NSImage(size: NSSize(width: size, height: size))
         img.lockFocus()
         guard let ctx = NSGraphicsContext.current?.cgContext else {
@@ -80,6 +86,9 @@ public enum HybridBrandIconGenerator {
         ctx.strokeEllipse(in: gateRect)
 
         img.unlockFocus()
+        if size == 512 {
+            cachedDockIcon = img
+        }
         return img
     }
 
@@ -87,6 +96,9 @@ public enum HybridBrandIconGenerator {
     /// so the menu bar icon never resembles a shield or posture app.
     @MainActor
     public static func makeMenuBarIcon() -> NSImage {
+        if let cachedMenuBarIcon {
+            return cachedMenuBarIcon
+        }
         let size = NSSize(width: 24, height: 18)
         let img = NSImage(size: size)
         img.lockFocus()
@@ -127,6 +139,7 @@ public enum HybridBrandIconGenerator {
 
         img.unlockFocus()
         img.isTemplate = true
+        cachedMenuBarIcon = img
         return img
     }
 }
@@ -275,11 +288,7 @@ final class HybridAppViewModel: ObservableObject {
         runInspector()
         updateComposerLiveAudit()
         // Start the persistent Python daemon eagerly so the first chat send has no cold-start delay.
-        if let backendDir = BackendBridge.shared.resolveBackendDirectory() {
-            let pythonCandidates = ["/opt/homebrew/bin/python3", "/usr/bin/python3"]
-            let py = pythonCandidates.first { FileManager.default.fileExists(atPath: $0) } ?? "/usr/bin/python3"
-            DaemonManager.shared.ensureRunning(backendDir: backendDir, pythonPath: py)
-        }
+        BackendBridge.shared.ensureDaemonStarted()
         refreshHardwareProfile()
         if conversations.isEmpty {
             startNewChat()
@@ -390,22 +399,14 @@ final class HybridAppViewModel: ObservableObject {
             activeConversationId = conversations.first?.id ?? ""
         }
         historyStore.saveConversations(conversations, to: historyStorage)
-        _ = BackendBridge.shared.invokePythonJSON(
-            method: "POST",
-            path: "/v1/history",
-            body: ["action": "delete_session", "session_id": id]
-        )
+        BackendBridge.shared.sendHistoryActionAsync(["action": "delete_session", "session_id": id])
     }
 
     func clearAllHistory() {
         conversations.removeAll()
         activeConversationId = ""
         historyStore.saveConversations([], to: historyStorage)
-        _ = BackendBridge.shared.invokePythonJSON(
-            method: "POST",
-            path: "/v1/history",
-            body: ["action": "clear_all"]
-        )
+        BackendBridge.shared.sendHistoryActionAsync(["action": "clear_all"])
         startNewChat()
     }
 
@@ -418,11 +419,7 @@ final class HybridAppViewModel: ObservableObject {
         if !conversations.contains(where: { $0.id == activeConversationId }) {
             activeConversationId = conversations.first?.id ?? ""
         }
-        _ = BackendBridge.shared.invokePythonJSON(
-            method: "POST",
-            path: "/v1/history",
-            body: ["action": "prune_expired"]
-        )
+        BackendBridge.shared.sendHistoryActionAsync(["action": "prune_expired"])
     }
 
     func updateHistorySettings() {
@@ -431,15 +428,11 @@ final class HybridAppViewModel: ObservableObject {
             conversations: conversations,
             location: historyStorage
         )
-        _ = BackendBridge.shared.invokePythonJSON(
-            method: "POST",
-            path: "/v1/history",
-            body: [
-                "action": "configure",
-                "storage_location": historyStorage.rawValue,
-                "retention_policy": historyRetention.rawValue,
-            ]
-        )
+        BackendBridge.shared.sendHistoryActionAsync([
+            "action": "configure",
+            "storage_location": historyStorage.rawValue,
+            "retention_policy": historyRetention.rawValue,
+        ])
     }
 
     func updateComposerLiveAudit() {
@@ -619,14 +612,6 @@ final class HybridAppViewModel: ObservableObject {
                 }
             }
         }
-    }
-
-    func executeTask() {
-        if promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           let lastPrompt = activeConversation?.messages.last(where: { $0.role == "user" })?.content {
-            promptText = lastPrompt
-        }
-        sendChatMessage()
     }
 
     func runInspector() {
@@ -1169,6 +1154,7 @@ struct HybridChatTabView: View {
                     if let conv = vm.activeConversation, !conv.messages.isEmpty {
                         ForEach(conv.messages) { msg in
                             ChatBubbleRowView(message: msg)
+                                .equatable()
                         }
                     } else {
                         VStack(spacing: 10) {
@@ -1518,7 +1504,7 @@ struct MarkdownMessageView: View {
     }
 }
 
-struct ChatBubbleRowView: View {
+struct ChatBubbleRowView: View, Equatable {
     let message: ChatMessageModel
 
     var body: some View {

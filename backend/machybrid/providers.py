@@ -18,9 +18,13 @@ Includes:
 from __future__ import annotations
 
 import asyncio
+import gc
 import http.client
 import json
 import os
+import re
+import threading
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Generator, List, Optional
@@ -30,6 +34,7 @@ from .profiler import HardwareProfiler
 
 # Deprecated Gemini model guard per gemini-api-dev skill rules
 _DEPRECATED_GEMINI_PREFIXES = ("gemini-2.5", "gemini-2.0", "gemini-1.5", "gemini-1.0")
+_STANDIN_TOKEN_RE = re.compile(r"\[[A-Z_]+_\d+\]")
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 DEFAULT_ANTIGRAVITY_AGENT = "antigravity-preview-05-2026"
 DEFAULT_AGY_SDK_MODEL = "gemini-3.7-flash"
@@ -145,15 +150,18 @@ class MLXProvider:
     # Public helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def is_available() -> bool:
-        """Returns True when mlx and mlx-lm are importable (installed)."""
+    @classmethod
+    def is_available(cls) -> bool:
+        """Returns True when mlx and mlx-lm are importable (cached per process)."""
+        if cls._mlx_available_cache is not None:
+            return cls._mlx_available_cache
         try:
             import mlx.core  # noqa: F401
             import mlx_lm  # noqa: F401
-            return True
+            cls._mlx_available_cache = True
         except ImportError:
-            return False
+            cls._mlx_available_cache = False
+        return cls._mlx_available_cache
 
     @staticmethod
     def unified_memory_gb() -> int:
@@ -282,62 +290,27 @@ class MLXProvider:
 
         sys_inst = system_instruction or self.system_instruction
 
-        import time as _time
-        t0 = _time.monotonic()
+        t0 = time.monotonic()
 
         try:
-            from mlx_lm import stream_generate
-            from mlx_lm.sample_utils import make_sampler
+            prev_sys = self.system_instruction
+            self.system_instruction = sys_inst
+            try:
+                output = "".join(self.generate_stream(full_prompt))
+            finally:
+                self.system_instruction = prev_sys
 
-            model, tokenizer = self._load_model()
-
-            # Apply chat template
-            messages: List[Dict[str, str]] = []
-            if sys_inst:
-                messages.append({"role": "system", "content": sys_inst})
-            messages.append({"role": "user", "content": full_prompt})
-
-            if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:  # type: ignore[union-attr]
-                formatted = tokenizer.apply_chat_template(  # type: ignore[union-attr]
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-            else:
-                formatted = full_prompt
-
-            sampler = make_sampler(temp=self.temperature, top_p=0.95)
-            gen_kwargs: Dict[str, Any] = {
-                "max_tokens": self.max_tokens,
-                "sampler": sampler,
-            }
-            if self.kv_bits is not None:
-                gen_kwargs["kv_bits"] = self.kv_bits
-                gen_kwargs["kv_group_size"] = 64
-                gen_kwargs["quantized_kv_start"] = 2048
-
-            chunks: List[str] = []
-            last_resp = None
-            with MLXProvider._inference_lock:
-                for resp in stream_generate(
-                    model,
-                    tokenizer,
-                    prompt=formatted,
-                    **gen_kwargs,
-                ):
-                    last_resp = resp
-                    chunks.append(getattr(resp, "text", ""))
-
-            output = "".join(chunks)
-            elapsed_s = _time.monotonic() - t0
-            gen_tokens = int(getattr(last_resp, "generation_tokens", 0)) if last_resp else 0
-            prompt_tokens = int(getattr(last_resp, "prompt_tokens", 0)) if last_resp else 0
+            elapsed_s = time.monotonic() - t0
+            stats = self.last_generation_stats
+            gen_tokens = int(stats.get("generation_tokens", 0))
+            prompt_tokens = int(stats.get("prompt_tokens", 0))
             tok_per_s = round(
-                float(getattr(last_resp, "generation_tps", 0.0))
-                if last_resp
-                else (gen_tokens / max(elapsed_s, 0.001)),
+                float(stats.get("generation_tps", 0.0))
+                or (gen_tokens / max(elapsed_s, 0.001)),
                 1,
             )
-            prompt_tps = round(float(getattr(last_resp, "prompt_tps", 0.0)), 1) if last_resp else 0.0
-            peak_mem_gb = round(float(getattr(last_resp, "peak_memory", 0.0)), 2) if last_resp else 0.0
+            prompt_tps = round(float(stats.get("prompt_tps", 0.0)), 1)
+            peak_mem_gb = round(float(stats.get("peak_memory_gb", 0.0)), 2)
 
             return ProviderResponse(
                 provider="local_mlx",
@@ -432,7 +405,8 @@ class MLXProvider:
 
     # Module-level cache and lock so the model is loaded once per process and Metal streams don't race.
     _model_cache: Dict[str, Any] = {}
-    _inference_lock = __import__("threading").Lock()
+    _mlx_available_cache: Optional[bool] = None
+    _inference_lock = threading.Lock()
     _wired_limit_configured: bool = False
 
     def _load_model(self) -> Any:
@@ -459,8 +433,6 @@ class MLXProvider:
     @classmethod
     def unload_all(cls) -> List[str]:
         """Unloads all cached MLX models, runs garbage collection, and clears Metal GPU cache."""
-        import gc
-
         with cls._inference_lock:
             unloaded = list(cls._model_cache.keys())
             cls._model_cache.clear()
@@ -562,16 +534,14 @@ class GeminiProvider:
     ) -> ProviderResponse:
         # Preserve any stand-in tokens like [PERSON_1], [EMAIL_1] in synthesized output
         # so the local Privacy Gate can restore them seamlessly!
-        import re
-
-        tokens_in_prompt = re.findall(r"\[[A-Z_]+_\d+\]", prompt)
-        token_Echo = ""
+        tokens_in_prompt = _STANDIN_TOKEN_RE.findall(prompt)
+        token_echo = ""
         if tokens_in_prompt:
             unique_tokens = list(dict.fromkeys(tokens_in_prompt))
-            token_Echo = f" Prepared for {', '.join(unique_tokens)}."
+            token_echo = f" Prepared for {', '.join(unique_tokens)}."
 
         summary = (
-            f"[{mode_note} · {model}] Cloud research & reasoning complete.{token_Echo} "
+            f"[{mode_note} · {model}] Cloud research & reasoning complete.{token_echo} "
             f"Benchmarked comparable market multiples, evaluated risk-adjusted return profiles, "
             f"and synthesized findings for: {prompt[:220]}"
         )

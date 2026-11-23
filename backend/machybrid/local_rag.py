@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 from dataclasses import asdict, dataclass
-from typing import Any, Counter, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-_STOPWORDS = {
+_STOPWORDS = frozenset({
     "a",
     "an",
     "and",
@@ -44,16 +45,17 @@ _STOPWORDS = {
     "please",
     "can",
     "you",
-}
+})
 
-_TOKEN_RE = re.compile(r"[A-Za-z0-9_@.\-]{2,}")
+_TOKEN_RE = re.compile(r"[a-z0-9_@.\-]{2,}")
+_SECTION_RE = re.compile(r"^---\s+(.+?)\s+---\s*$", re.MULTILINE)
 
 
 def _tokenize(text: str) -> List[str]:
     return [
-        tok.lower()
-        for tok in _TOKEN_RE.findall(text)
-        if tok.lower() not in _STOPWORDS
+        tok
+        for tok in _TOKEN_RE.findall(text.lower())
+        if tok not in _STOPWORDS
     ]
 
 
@@ -78,21 +80,31 @@ class LocalWorkspaceRAG:
         self.chunk_chars = max(250, chunk_chars)
         self.overlap_chars = max(0, min(overlap_chars, self.chunk_chars // 2))
         self._chunks: List[RAGChunk] = []
+        self._chunk_tfs: List[Counter[str]] = []
+        self._df: Dict[str, int] = {}
+        self._avg_dl: float = 1.0
+        self._last_indexed_text: Optional[str] = None
 
     def index_inline_context(
         self,
         inline_context: str,
         default_label: str = "attached_context",
     ) -> int:
-        """Splits `inline_context` (including `--- filename ---` sections) into chunks."""
-        self._chunks.clear()
+        """Splits `inline_context` (including `--- filename ---` sections) into chunks and pre-computes BM25 statistics."""
         raw = (inline_context or "").strip()
+        if raw and raw == self._last_indexed_text and self._chunks:
+            return len(self._chunks)
+
+        self._chunks.clear()
+        self._chunk_tfs.clear()
+        self._df.clear()
+        self._avg_dl = 1.0
+        self._last_indexed_text = raw
         if not raw:
             return 0
 
         # Parse `--- label ---` sections if present
-        section_re = re.compile(r"^---\s+(.+?)\s+---\s*$", re.MULTILINE)
-        matches = list(section_re.finditer(raw))
+        matches = list(_SECTION_RE.finditer(raw))
         sections: List[tuple[str, str]] = []
         if matches:
             for idx, match in enumerate(matches):
@@ -106,6 +118,7 @@ class LocalWorkspaceRAG:
             sections.append((default_label, raw))
 
         chunk_counter = 0
+        total_tokens = 0
         for label, body in sections:
             cursor = 0
             n = len(body)
@@ -115,19 +128,27 @@ class LocalWorkspaceRAG:
                 if snippet:
                     chunk_counter += 1
                     tokens = _tokenize(snippet)
+                    tf = Counter(tokens)
+                    dl = len(tokens)
+                    total_tokens += dl
+                    for unique_tok in tf:
+                        self._df[unique_tok] = self._df.get(unique_tok, 0) + 1
+                    self._chunk_tfs.append(tf)
                     self._chunks.append(
                         RAGChunk(
                             chunk_id=f"chunk_{chunk_counter}",
                             source_label=label,
                             text=snippet,
                             score=0.0,
-                            token_count=len(tokens),
+                            token_count=dl,
                         )
                     )
                 if end >= n:
                     break
                 cursor = max(cursor + 1, end - self.overlap_chars)
 
+        if self._chunks:
+            self._avg_dl = max(1.0, total_tokens / len(self._chunks))
         return len(self._chunks)
 
     def retrieve(
@@ -136,7 +157,7 @@ class LocalWorkspaceRAG:
         top_k: int = 4,
         inline_context: Optional[str] = None,
     ) -> List[RAGChunk]:
-        """Retrieves the top-k most relevant chunks for `query` using BM25 scoring."""
+        """Retrieves the top-k most relevant chunks for `query` using pre-computed BM25 statistics."""
         if inline_context is not None:
             self.index_inline_context(inline_context)
 
@@ -147,23 +168,16 @@ class LocalWorkspaceRAG:
         if not query_tokens:
             return self._chunks[: max(1, top_k)]
 
-        doc_tokens_list = [_tokenize(c.text) for c in self._chunks]
         num_docs = len(self._chunks)
-        avg_dl = max(1.0, sum(len(dt) for dt in doc_tokens_list) / num_docs)
-
-        # Document frequencies
-        df: Dict[str, int] = {}
-        for dt in doc_tokens_list:
-            for unique_tok in set(dt):
-                df[unique_tok] = df.get(unique_tok, 0) + 1
+        avg_dl = self._avg_dl
+        df = self._df
 
         k1 = 1.5
         b = 0.75
         scored: List[RAGChunk] = []
 
-        for chunk, dt in zip(self._chunks, doc_tokens_list):
-            tf = Counter(dt)
-            dl = len(dt)
+        for chunk, tf in zip(self._chunks, self._chunk_tfs):
+            dl = chunk.token_count
             score = 0.0
             for q_tok in query_tokens:
                 term_tf = tf.get(q_tok, 0)
@@ -180,7 +194,7 @@ class LocalWorkspaceRAG:
                     source_label=chunk.source_label,
                     text=chunk.text,
                     score=round(score, 4),
-                    token_count=chunk.token_count,
+                    token_count=dl,
                 )
             )
 

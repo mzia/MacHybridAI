@@ -16,6 +16,9 @@ Features:
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import time
@@ -249,8 +252,11 @@ class PromptHistoryManager:
 
     def is_icloud_available(self) -> bool:
         """Checks whether the macOS iCloud Drive root folder is available."""
-        cloud_docs = self._icloud_dir.parent
-        return cloud_docs.exists() or self._icloud_dir.exists()
+        try:
+            cloud_docs = self._icloud_dir.parent
+            return cloud_docs.exists() or self._icloud_dir.exists()
+        except OSError:
+            return False
 
     def _compute_expiry(self, base_timestamp: float) -> Optional[float]:
         ttl = self.retention_policy.ttl_seconds
@@ -260,26 +266,24 @@ class PromptHistoryManager:
 
     @staticmethod
     def _xor_keystream(data: bytes, key: bytes, nonce: bytes) -> bytes:
-        import hashlib
-
-        out = bytearray(len(data))
+        chunks: List[bytes] = []
         block_index = 0
         offset = 0
-        while offset < len(data):
-            counter_bytes = block_index.to_bytes(8, "big")
-            digest = hashlib.sha256(key + nonce + counter_bytes).digest()
-            chunk_len = min(len(digest), len(data) - offset)
-            for i in range(chunk_len):
-                out[offset + i] = data[offset + i] ^ digest[i]
+        prefix = key + nonce
+        data_len = len(data)
+        while offset < data_len:
+            digest = hashlib.sha256(prefix + block_index.to_bytes(8, "big")).digest()
+            block = data[offset : offset + 32]
+            chunk_len = len(block)
+            xored_int = int.from_bytes(block, "big") ^ int.from_bytes(
+                digest[:chunk_len], "big"
+            )
+            chunks.append(xored_int.to_bytes(chunk_len, "big"))
             offset += chunk_len
             block_index += 1
-        return bytes(out)
+        return b"".join(chunks)
 
     def _seal_json_bytes(self, plaintext: bytes) -> Dict[str, Any]:
-        import base64
-        import hashlib
-        import hmac
-
         nonce = os.urandom(16)
         ciphertext = self._xor_keystream(plaintext, self._encryption_key, nonce)
         mac = hmac.new(self._encryption_key, nonce + ciphertext, hashlib.sha256).digest()
@@ -295,10 +299,6 @@ class PromptHistoryManager:
         }
 
     def _open_json_envelope(self, envelope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        import base64
-        import hashlib
-        import hmac
-
         if not envelope.get("encrypted"):
             return envelope
         try:
@@ -318,9 +318,9 @@ class PromptHistoryManager:
 
     def _read_raw_sessions(self) -> List[ChatSessionRecord]:
         target = self.active_file_path
-        if not target.is_file():
-            return []
         try:
+            if not target.is_file():
+                return []
             raw_text = target.read_text(encoding="utf-8")
             outer = json.loads(raw_text)
             if not isinstance(outer, dict):

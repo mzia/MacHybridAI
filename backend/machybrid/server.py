@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,7 +27,12 @@ from .history import HistoryRetentionPolicy, HistoryStorageLocation
 from .m365_proxy import M365ToolEmulator
 from .orchestrator import ComputeMode, HybridOrchestrator
 from .profiler import HardwareProfiler
-from .providers import MLXProvider
+from .providers import (
+    MLX_DEFAULT_MODEL,
+    MLX_FALLBACK_MODEL,
+    MLX_LARGE_MODEL_MIN_MEMORY_GB,
+    MLXProvider,
+)
 
 MAX_REQUEST_BYTES = 1_048_576  # 1 MiB limit against payload DoS
 
@@ -34,7 +40,7 @@ MAX_REQUEST_BYTES = 1_048_576  # 1 MiB limit against payload DoS
 class HybridRequestHandler(BaseHTTPRequestHandler):
     """HTTP request handler backed by a shared `HybridOrchestrator`."""
 
-    orchestrator: HybridOrchestrator = HybridOrchestrator()
+    orchestrator: HybridOrchestrator
 
     def log_message(self, format: str, *args: Any) -> None:
         # Suppress noisy access logs or sensitive query logging
@@ -100,8 +106,6 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_openai_stream(self, body: Dict[str, Any]) -> None:
         """OpenAI-compatible SSE streaming endpoint for `POST /v1/chat/completions`."""
-        import time as _time
-
         status, payload = dispatch_request(
             self.orchestrator,
             "POST",
@@ -125,9 +129,9 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
             if isinstance(msg, dict):
                 text = str(msg.get("content", ""))
 
-        chunk_id = str(payload.get("id", f"chatcmpl_{int(_time.time())}"))
+        chunk_id = str(payload.get("id", f"chatcmpl_{int(time.time())}"))
         model_name = str(payload.get("model", "machybrid-hybrid"))
-        created_ts = int(payload.get("created", int(_time.time())))
+        created_ts = int(payload.get("created", int(time.time())))
 
         try:
             words = text.split(" ")
@@ -235,8 +239,7 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
         inline_context = str(body.get("inline_file_context", ""))
 
         if use_local_only and MLXProvider.is_available():
-            import time as _time
-            t0 = _time.monotonic()
+            t0 = time.monotonic()
             mlx_model = body.get("mlx_model") or self.orchestrator.config.local_model or None
             provider = MLXProvider(model=mlx_model)
             _, is_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(provider.model_id)
@@ -263,7 +266,7 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
                     sse(json.dumps({"type": "token", "text": chunk}))
                     token_count += 1
 
-            elapsed_ms = max(1, int((_time.monotonic() - t0) * 1000))
+            elapsed_ms = max(1, int((time.monotonic() - t0) * 1000))
             local_stations = [
                 {
                     "station_index": 1,
@@ -436,14 +439,14 @@ def dispatch_request(
         if path == "/v1/m365/status":
             return HTTPStatus.OK, orchestrator.m365_manager.status_dict()
         if path == "/v1/mlx/status":
-            available = MLXProvider.is_available()
-            mem_gb = MLXProvider.unified_memory_gb() if available else 0
-            from .providers import MLX_DEFAULT_MODEL, MLX_FALLBACK_MODEL, MLX_LARGE_MODEL_MIN_MEMORY_GB
+            static_hw = HardwareProfiler.get_static_hardware_info()
+            available = bool(static_hw.get("mlx_available", False))
+            mem_gb = int(static_hw.get("unified_memory_gb", 0)) if available else 0
             return HTTPStatus.OK, {
                 "mlx_available": available,
-                "metal_available": available and _metal_available(),
+                "metal_available": available and bool(static_hw.get("metal_available", False)),
                 "unified_memory_gb": mem_gb,
-                "active_model": MLXProvider()._pick_model() if available else None,
+                "active_model": MLXProvider._pick_model() if available else None,
                 "large_model": MLX_DEFAULT_MODEL,
                 "fallback_model": MLX_FALLBACK_MODEL,
                 "large_model_min_memory_gb": MLX_LARGE_MODEL_MIN_MEMORY_GB,
@@ -624,8 +627,6 @@ def dispatch_request(
             return HTTPStatus.OK, result.to_dict()
 
         if path == "/v1/chat/completions":
-            import time as _time
-
             messages = payload_in.get("messages")
             if not isinstance(messages, list) or not messages:
                 return HTTPStatus.BAD_REQUEST, {"error": "messages list is required"}
@@ -663,7 +664,7 @@ def dispatch_request(
                 save_to_history=bool(payload_in.get("save_to_history", False)),
             )
             res_dict = task_res.to_dict()
-            created_ts = int(_time.time())
+            created_ts = int(time.time())
             tok_used = int(res_dict.get("telemetry", {}).get("tokens_processed", 32))
             return HTTPStatus.OK, {
                 "id": f"chatcmpl_{task_res.task_id}",
@@ -773,15 +774,6 @@ def dispatch_request(
     return HTTPStatus.METHOD_NOT_ALLOWED, {"error": f"Unsupported method: {upper_method}"}
 
 
-def _metal_available() -> bool:
-    """Returns True when MLX can see a Metal GPU."""
-    try:
-        import mlx.core as mx
-        return mx.metal.is_available()
-    except Exception:
-        return False
-
-
 def create_server(
     host: str = "127.0.0.1",
     port: int = 8765,
@@ -856,7 +848,6 @@ def main() -> None:
     import atexit as _atexit
     import os as _os
     import signal as _signal
-    import time as _time
 
     _atexit.register(orchestrator.shutdown_all_local_resources)
 
@@ -872,7 +863,7 @@ def main() -> None:
 
         def _watch_parent() -> None:
             while True:
-                _time.sleep(1.5)
+                time.sleep(1.5)
                 try:
                     _os.kill(parent_pid, 0)
                 except ProcessLookupError:

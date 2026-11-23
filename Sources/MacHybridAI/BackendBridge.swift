@@ -249,6 +249,19 @@ public final class DaemonManager: ObservableObject, @unchecked Sendable {
 
 // MARK: - SwiftNativeGuardian
 public struct SwiftNativeGuardian: Sendable {
+    private static let compiledPatterns: [(category: String, regex: NSRegularExpression, confidence: Double)] = {
+        let rawPatterns: [(String, String, Double)] = [
+            ("SECRET", #"\b(?:AIza[0-9A-Za-z\-_]{35}|sk-[A-Za-z0-9\-_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})\b"#, 0.99),
+            ("SSN", #"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"#, 0.99),
+            ("EMAIL", #"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"#, 0.99),
+            ("PHONE", #"(?:\+?1[-.\s]?)?(?:\(\d{3}\)[-.\s]?|\b\d{3}[-.\s])\d{3}[-.\s]\d{4}\b"#, 0.95),
+        ]
+        return rawPatterns.compactMap { cat, pat, conf in
+            guard let rx = try? NSRegularExpression(pattern: pat) else { return nil }
+            return (cat, rx, conf)
+        }
+    }()
+
     public init() {}
 
     public func redactAndRestorePreview(
@@ -259,6 +272,8 @@ public struct SwiftNativeGuardian: Sendable {
             return ("", "", [], [:])
         }
 
+        let nsText = text as NSString
+        let fullLength = nsText.length
         var entities: [PIIEntityModel] = []
         var vault: [String: String] = [:]
         var counters: [String: Int] = [:]
@@ -300,20 +315,13 @@ public struct SwiftNativeGuardian: Sendable {
             return true
         }
 
-        // 2. High-precision regex for patterns NLTagger doesn't cover (Secrets, SSNs, etc.)
-        let patterns: [(category: String, regex: String, confidence: Double)] = [
-            ("SECRET", #"\b(?:AIza[0-9A-Za-z\-_]{35}|sk-[A-Za-z0-9\-_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})\b"#, 0.99),
-            ("SSN", #"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"#, 0.99),
-            ("EMAIL", #"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"#, 0.99),
-            ("PHONE", #"(?:\+?1[-.\s]?)?(?:\(\d{3}\)[-.\s]?|\b\d{3}[-.\s])\d{3}[-.\s]\d{4}\b"#, 0.95),
-        ]
-
-        for item in patterns {
-            guard let regex = try? NSRegularExpression(pattern: item.regex) else { continue }
-            let matches = regex.matches(in: text, range: NSRange(location: 0, length: (text as NSString).length))
+        // 2. Pre-compiled high-precision regex for patterns NLTagger doesn't cover (Secrets, SSNs, etc.)
+        let fullRange = NSRange(location: 0, length: fullLength)
+        for item in Self.compiledPatterns {
+            let matches = item.regex.matches(in: text, range: fullRange)
             for m in matches {
-                let val = (text as NSString).substring(with: m.range)
-                
+                let val = nsText.substring(with: m.range)
+
                 // Avoid overlapping with NLTagger entities
                 if entities.contains(where: { $0.start < m.range.location + m.range.length && $0.end > m.range.location }) {
                     continue
@@ -345,18 +353,18 @@ public struct SwiftNativeGuardian: Sendable {
         var cursor = 0
         for entity in entities {
             if entity.start > cursor {
-                result += (text as NSString).substring(with: NSRange(location: cursor, length: entity.start - cursor))
+                result += nsText.substring(with: NSRange(location: cursor, length: entity.start - cursor))
             }
             result += entity.replacementToken
             cursor = entity.end
         }
 
-        if cursor < (text as NSString).length {
-            result += (text as NSString).substring(from: cursor)
+        if cursor < fullLength {
+            result += nsText.substring(from: cursor)
         }
 
         var restored = "Cloud processed request for \(result)"
-        for (token, original) in vault {
+        for (token, original) in vault.sorted(by: { $0.key.count > $1.key.count }) {
             restored = restored.replacingOccurrences(of: token, with: original)
         }
         return (result, restored, entities, vault)
@@ -553,18 +561,38 @@ public final class BackendBridge: Sendable {
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) } ?? "/usr/bin/python3"
     }
 
+    public func ensureDaemonStarted() {
+        guard let backendDir = resolveBackendDirectory() else { return }
+        DaemonManager.shared.ensureRunning(backendDir: backendDir, pythonPath: pythonPath)
+    }
+
+    public func sendHistoryActionAsync(_ body: [String: String]) {
+        Task.detached(priority: .utility) {
+            _ = self.invoke(method: "POST", path: "/v1/history", body: body)
+        }
+    }
+
+    private static func prepareAttachedFileContext(_ attachedFiles: [String]) -> (labels: [String], inlineContext: String) {
+        var excerpts: [String] = []
+        var fileLabels: [String] = []
+        for path in attachedFiles {
+            let fileURL = URL(fileURLWithPath: path)
+            fileLabels.append(fileURL.lastPathComponent)
+            if let text = LocalVisionOCRScrubber.extractFileContentOnDevice(from: fileURL) {
+                let snippet = String(text.prefix(12288))
+                excerpts.append("--- \(fileURL.lastPathComponent) ---\n\(snippet)")
+            }
+        }
+        return (fileLabels, excerpts.joined(separator: "\n\n"))
+    }
+
     // MARK: – HTTP transport (persistent daemon)
 
     /// Send a JSON request to the persistent daemon via HTTP.
     /// Called from a background thread — blocks until the response arrives.
     private func invokeHTTP(method: String, path: String, body: [String: Any]) -> Data? {
         // Ensure the daemon is running. This is a no-op when it's already up.
-        if let backendDir = resolveBackendDirectory() {
-            let py = pythonPath
-            DispatchQueue.main.async {
-                DaemonManager.shared.ensureRunning(backendDir: backendDir, pythonPath: py)
-            }
-        }
+        ensureDaemonStarted()
 
         // Wait (blocking, called off main thread) until the daemon signals ready.
         guard let port = DaemonManager.shared.waitUntilReady(timeout: 8) else { return nil }
@@ -668,23 +696,13 @@ public final class BackendBridge: Sendable {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
 
-        var excerpts: [String] = []
-        var fileLabels: [String] = []
-        for path in attachedFiles {
-            let fileURL = URL(fileURLWithPath: path)
-            fileLabels.append(fileURL.lastPathComponent)
-            if let text = LocalVisionOCRScrubber.extractFileContentOnDevice(from: fileURL) {
-                let snippet = String(text.prefix(12288))
-                excerpts.append("--- \(fileURL.lastPathComponent) ---\n\(snippet)")
-            }
-        }
-
+        let (fileLabels, inlineContext) = Self.prepareAttachedFileContext(attachedFiles)
         var body: [String: Any] = [
             "prompt": prompt,
             "mode": mode.rawValue,
             "cloud_provider": cloudProvider.rawValue,
             "file_paths": fileLabels,
-            "inline_file_context": excerpts.joined(separator: "\n\n"),
+            "inline_file_context": inlineContext,
         ]
         if let sessionId { body["session_id"] = sessionId }
         if let approvedSanitizedPrompt, !approvedSanitizedPrompt.isEmpty {
@@ -710,22 +728,13 @@ public final class BackendBridge: Sendable {
         sessionId: String? = nil,
         approvedSanitizedPrompt: String? = nil
     ) -> TaskResultModel {
-        var excerpts: [String] = []
-        var fileLabels: [String] = []
-        for path in attachedFiles {
-            let url = URL(fileURLWithPath: path)
-            fileLabels.append(url.lastPathComponent)
-            if let text = LocalVisionOCRScrubber.extractFileContentOnDevice(from: url) {
-                let snippet = String(text.prefix(12288))
-                excerpts.append("--- \(url.lastPathComponent) ---\n\(snippet)")
-            }
-        }
+        let (fileLabels, inlineContext) = Self.prepareAttachedFileContext(attachedFiles)
         var body: [String: Any] = [
             "prompt": prompt,
             "mode": mode.rawValue,
             "cloud_provider": cloudProvider.rawValue,
             "file_paths": fileLabels,
-            "inline_file_context": excerpts.joined(separator: "\n\n"),
+            "inline_file_context": inlineContext,
         ]
         if let sessionId {
             body["session_id"] = sessionId
