@@ -67,7 +67,7 @@ struct MacHybridSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("Prompt History Storage & Auto-Delete") {
+            Section("Prompt History Storage, Cloud Sharing & Auto-Delete") {
                 Picker("Save Conversations To", selection: $vm.historyStorage) {
                     ForEach(HistoryStorageOption.allCases, id: \.self) { opt in
                         Label(opt.title, systemImage: opt.iconName).tag(opt)
@@ -75,6 +75,34 @@ struct MacHybridSettingsView: View {
                 }
                 .onChange(of: vm.historyStorage) { _, _ in
                     vm.updateHistorySettings()
+                }
+
+                if vm.historyStorage == .googleDrive {
+                    HStack {
+                        Text(vm.googleDrivePathDisplay)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Button("Choose Folder…") {
+                            vm.chooseCustomGoogleDriveFolder()
+                        }
+                        .controlSize(.small)
+                    }
+                }
+
+                Toggle("Redact PII Automatically Before Sharing", isOn: $vm.redactPIIOnShare)
+
+                HStack {
+                    Text("Shared Exports Folder")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Open in Finder") {
+                        vm.openSharedFolderInFinder()
+                    }
+                    .controlSize(.small)
                 }
 
                 Picker("Auto-Delete Retention", selection: $vm.historyRetention) {
@@ -93,10 +121,13 @@ struct MacHybridSettingsView: View {
                 }
             }
 
-            Section("Background Engine") {
-                LabeledContent("Local Loopback Daemon") {
+            Section("Native Compute Engine") {
+                LabeledContent("Runtime Architecture") {
                     DaemonStatusView()
                 }
+                Text("MacHybridAI.app runs 100% natively in Swift on macOS with zero Python background daemon.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)

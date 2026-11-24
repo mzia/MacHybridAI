@@ -234,12 +234,16 @@ final class HybridAppViewModel: ObservableObject {
     @Published var cloudProvider: CloudProviderOption = .gemini
     @Published var guardianPolicy: GuardianPolicyOption = .reversibleMask
 
-    // Prompt History Storage (Local Mac vs iCloud Drive) & Auto-Delete Policy
+    // Prompt History Storage (Local Mac vs iCloud Drive vs Google Drive) & Auto-Delete Policy
     @Published var historyStorage: HistoryStorageOption = .localMac
     @Published var historyRetention: HistoryRetentionOption = .days30
     @Published var conversations: [ChatConversationModel] = []
     @Published var activeConversationId: String = ""
     @Published var historySearchQuery: String = ""
+    @Published var redactPIIOnShare: Bool = true
+    @Published var lastSharedFileURL: URL? = nil
+    @Published var lastShareStatusMessage: String = ""
+    @Published var googleDrivePathDisplay: String = ""
 
     // Provider configuration fields
     @Published var localBackend: LocalBackendOption = AppleFoundationModelsEngine.checkAvailability().available ? .appleFoundationModels : .mlx
@@ -296,6 +300,7 @@ final class HybridAppViewModel: ObservableObject {
 
     init() {
         NSApplication.shared.applicationIconImage = HybridBrandIconGenerator.makeDockIcon()
+        self.googleDrivePathDisplay = historyStore.googleDriveDirectoryURL.path
         loadSavedHistory()
         runInspector()
         updateComposerLiveAudit()
@@ -514,6 +519,168 @@ final class HybridAppViewModel: ObservableObject {
         historyStore.fileURL(for: historyStorage).path
     }
 
+    var activeSharedFolderPath: String {
+        historyStore.sharedDirectoryURL(for: historyStorage).path
+    }
+
+    var isICloudAvailable: Bool {
+        historyStore.isICloudAvailable()
+    }
+
+    var isGoogleDriveAvailable: Bool {
+        historyStore.isGoogleDriveAvailable()
+    }
+
+    func chooseCustomGoogleDriveFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.title = "Choose Google Drive (or Cloud Drive) Folder"
+        panel.message = "Select your synced Google Drive / My Drive folder to store and share MacHybridAI prompts."
+        let cloudStorage = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/CloudStorage", isDirectory: true)
+        if FileManager.default.fileExists(atPath: cloudStorage.path) {
+            panel.directoryURL = cloudStorage
+        }
+        if panel.runModal() == .OK, let selectedURL = panel.url {
+            historyStore.setCustomGoogleDriveDirectory(selectedURL)
+            googleDrivePathDisplay = historyStore.googleDriveDirectoryURL.path
+            historyStorage = .googleDrive
+            updateHistorySettings()
+        }
+    }
+
+    func resetGoogleDriveFolderToAutoDetect() {
+        historyStore.setCustomGoogleDriveDirectory(nil)
+        googleDrivePathDisplay = historyStore.googleDriveDirectoryURL.path
+        if historyStorage == .googleDrive {
+            updateHistorySettings()
+        }
+    }
+
+    /// Presents the native macOS Share sheet (with iCloud Collaborate / AirDrop / Mail / Messages / Google Drive) for an exported cloud file.
+    func presentNativeSharePicker(for fileURL: URL, preferICloudCollaborate: Bool = false) {
+        if preferICloudCollaborate,
+           let cloudService = NSSharingService(named: .cloudSharing),
+           cloudService.canPerform(withItems: [fileURL]) {
+            cloudService.perform(withItems: [fileURL])
+            return
+        }
+        let picker = NSSharingServicePicker(items: [fileURL])
+        if let anchorView = NSApp.keyWindow?.contentView {
+            let anchorRect = NSRect(
+                x: max(20, anchorView.bounds.midX - 40),
+                y: max(20, anchorView.bounds.maxY - 60),
+                width: 80,
+                height: 24
+            )
+            picker.show(relativeTo: anchorRect, of: anchorView, preferredEdge: .minY)
+        } else {
+            NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+        }
+    }
+
+    /// Exports a full conversation to the selected cloud drive (`iCloud Drive`, `Google Drive`, or `Local`) and opens native sharing.
+    func shareConversation(
+        _ conversation: ChatConversationModel,
+        destination: HistoryStorageOption? = nil,
+        redactPII: Bool? = nil,
+        preferICloudCollaborate: Bool = false,
+        revealInFinderOnly: Bool = false
+    ) {
+        let targetStorage = destination ?? historyStorage
+        let shouldRedact = redactPII ?? redactPIIOnShare
+        guard let exportedURL = historyStore.exportShareableConversation(
+            conversation,
+            to: targetStorage,
+            redactPII: shouldRedact
+        ) else {
+            lastShareStatusMessage = "Could not write shareable file to \(targetStorage.title)."
+            return
+        }
+        lastSharedFileURL = exportedURL
+        let privacyTag = shouldRedact ? "PII-redacted" : "full"
+        lastShareStatusMessage = "Saved \(privacyTag) Markdown to \(targetStorage.title): \(exportedURL.lastPathComponent)"
+
+        if revealInFinderOnly {
+            NSWorkspace.shared.activateFileViewerSelecting([exportedURL])
+        } else {
+            presentNativeSharePicker(
+                for: exportedURL,
+                preferICloudCollaborate: preferICloudCollaborate && targetStorage == .iCloudDrive
+            )
+        }
+    }
+
+    /// Exports a single prompt or response bubble to the active cloud drive and opens native macOS sharing.
+    func shareMessage(
+        _ message: ChatMessageModel,
+        conversationTitle: String,
+        destination: HistoryStorageOption? = nil,
+        redactPII: Bool? = nil
+    ) {
+        let targetStorage = destination ?? historyStorage
+        let shouldRedact = redactPII ?? redactPIIOnShare
+        guard let exportedURL = historyStore.exportShareableMessage(
+            message,
+            conversationTitle: conversationTitle,
+            to: targetStorage,
+            redactPII: shouldRedact
+        ) else {
+            lastShareStatusMessage = "Could not export message to \(targetStorage.title)."
+            return
+        }
+        lastSharedFileURL = exportedURL
+        let privacyTag = shouldRedact ? "PII-redacted" : "full"
+        lastShareStatusMessage = "Saved \(privacyTag) snippet to \(targetStorage.title): \(exportedURL.lastPathComponent)"
+        presentNativeSharePicker(for: exportedURL, preferICloudCollaborate: false)
+    }
+
+    func copyConversationMarkdown(_ conversation: ChatConversationModel, redactPII: Bool? = nil) {
+        let shouldRedact = redactPII ?? redactPIIOnShare
+        let md = historyStore.renderMarkdown(for: conversation, redactPII: shouldRedact)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(md, forType: .string)
+        lastShareStatusMessage = "Copied \(shouldRedact ? "PII-redacted" : "full") Markdown to clipboard."
+    }
+
+    func revealSharedFileInFinder(_ fileURL: URL? = nil) {
+        if let url = fileURL ?? lastSharedFileURL {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            openSharedFolderInFinder()
+        }
+    }
+
+    func openSharedFolderInFinder() {
+        let dir = historyStore.sharedDirectoryURL(for: historyStorage)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(dir)
+    }
+
+    func openInGoogleDriveWeb(conversation: ChatConversationModel? = nil) {
+        let targetURL: URL?
+        if let conv = conversation {
+            targetURL = historyStore.exportShareableConversation(
+                conv,
+                to: .googleDrive,
+                redactPII: redactPIIOnShare
+            )
+            if let exported = targetURL {
+                lastSharedFileURL = exported
+                lastShareStatusMessage = "Synced to Google Drive: \(exported.lastPathComponent) — opening Google Drive web search."
+            }
+        } else {
+            targetURL = lastSharedFileURL
+        }
+        if let fileURL = targetURL, let webURL = PromptHistoryStore.googleDriveWebSearchURL(for: fileURL) {
+            NSWorkspace.shared.open(webURL)
+        } else if let rootURL = URL(string: "https://drive.google.com/drive/my-drive") {
+            NSWorkspace.shared.open(rootURL)
+        }
+    }
+
     func loadSavedHistory() {
         let loaded = historyStore.loadConversations(from: historyStorage)
         self.conversations = loaded
@@ -669,12 +836,13 @@ final class HybridAppViewModel: ObservableObject {
         attachedFiles.removeAll()
         updateComposerLiveAudit()
 
-        // Stream tokens on a background task, update the placeholder bubble in real time
+        // Stream tokens natively in Pure Swift on a background task, updating the placeholder bubble in real time
         Task.detached(priority: .userInitiated) {
             BackendBridge.shared.streamTask(
                 prompt: trimmed,
                 mode: mode,
                 cloudProvider: provider,
+                guardianPolicy: policy,
                 attachedFiles: files,
                 sessionId: currentSessionId,
                 approvedSanitizedPrompt: approvedPrompt,
@@ -859,6 +1027,7 @@ struct DaemonStatusView: View {
 
     private var statusColor: Color {
         switch daemon.state {
+        case .nativeSwift: return .green
         case .running: return .cyan
         case .starting: return .yellow
         case .failed: return .red
@@ -868,6 +1037,7 @@ struct DaemonStatusView: View {
 
     private var statusLabel: String {
         switch daemon.state {
+        case .nativeSwift: return "Engine: Pure Swift Native"
         case .running(let port): return "Engine: ready (:\(port))"
         case .starting: return "Engine: starting…"
         case .failed(let msg): return "Engine: \(msg.prefix(28))"
@@ -884,7 +1054,7 @@ struct MainDashboardView: View {
         case .chat:
             return vm.activeConversation?.title ?? "MacHybridAI"
         case .history:
-            return "History & iCloud"
+            return "History & Cloud"
         case .privacyGate:
             return "Privacy Gate"
         }
@@ -954,6 +1124,29 @@ struct MainDashboardView: View {
                                 vm.selectConversation(conv.id)
                             }
                             Divider()
+                            Button("\(vm.historyStorage.shareActionLabel) (Redacted)") {
+                                vm.shareConversation(conv, redactPII: true)
+                            }
+                            Button("\(vm.historyStorage.shareActionLabel) (Full)") {
+                                vm.shareConversation(conv, redactPII: false)
+                            }
+                            if vm.isICloudAvailable {
+                                Button("Share iCloud Drive Link…") {
+                                    vm.shareConversation(conv, destination: .iCloudDrive, redactPII: vm.redactPIIOnShare, preferICloudCollaborate: true)
+                                }
+                            }
+                            if vm.isGoogleDriveAvailable {
+                                Button("Save & Reveal in Google Drive") {
+                                    vm.shareConversation(conv, destination: .googleDrive, redactPII: vm.redactPIIOnShare, revealInFinderOnly: true)
+                                }
+                                Button("Open in Google Drive Web…") {
+                                    vm.openInGoogleDriveWeb(conversation: conv)
+                                }
+                            }
+                            Button("Copy Redacted Markdown") {
+                                vm.copyConversationMarkdown(conv, redactPII: true)
+                            }
+                            Divider()
                             Button("Delete Conversation", role: .destructive) {
                                 vm.deleteConversation(conv.id)
                             }
@@ -1019,6 +1212,71 @@ struct MainDashboardView: View {
                         .foregroundStyle(vm.allowUnverifiedHuggingFace ? .orange : .green)
                     }
                     .help("Model Supply-Chain Security & Preferences (⌘,)")
+
+                    if let activeConv = vm.activeConversation, !activeConv.messages.isEmpty {
+                        Menu {
+                            Button {
+                                vm.shareConversation(activeConv, redactPII: true)
+                            } label: {
+                                Label("\(vm.historyStorage.shareActionLabel) (PII Redacted)", systemImage: "lock.shield")
+                            }
+
+                            Button {
+                                vm.shareConversation(activeConv, redactPII: false)
+                            } label: {
+                                Label("\(vm.historyStorage.shareActionLabel) (Full Content)", systemImage: "doc.text")
+                            }
+
+                            Divider()
+
+                            if vm.isICloudAvailable {
+                                Button {
+                                    vm.shareConversation(
+                                        activeConv,
+                                        destination: .iCloudDrive,
+                                        redactPII: vm.redactPIIOnShare,
+                                        preferICloudCollaborate: true
+                                    )
+                                } label: {
+                                    Label("Share via iCloud Drive Link…", systemImage: "icloud.and.arrow.up")
+                                }
+                            }
+
+                            Button {
+                                vm.shareConversation(
+                                    activeConv,
+                                    destination: .googleDrive,
+                                    redactPII: vm.redactPIIOnShare,
+                                    revealInFinderOnly: true
+                                )
+                            } label: {
+                                Label("Save & Reveal in Google Drive", systemImage: "folder.badge.person.crop")
+                            }
+
+                            Button {
+                                vm.openInGoogleDriveWeb(conversation: activeConv)
+                            } label: {
+                                Label("Open & Share in Google Drive Web…", systemImage: "safari")
+                            }
+
+                            Divider()
+
+                            Button {
+                                vm.copyConversationMarkdown(activeConv, redactPII: true)
+                            } label: {
+                                Label("Copy Redacted Markdown", systemImage: "doc.on.doc")
+                            }
+
+                            Button {
+                                vm.openSharedFolderInFinder()
+                            } label: {
+                                Label("Open Shared Cloud Folder in Finder", systemImage: "folder")
+                            }
+                        } label: {
+                            Label("Share", systemImage: "square.and.arrow.up")
+                        }
+                        .help("Share conversation via \(vm.historyStorage.title) (⇧⌘S)")
+                    }
 
                     Button {
                         vm.startNewChat()
@@ -1267,21 +1525,72 @@ struct HybridChatTabView: View {
             // Multi-Turn Chat Stream
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    if !vm.lastShareStatusMessage.isEmpty {
+                        HStack(spacing: 8) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                            Text(vm.lastShareStatusMessage)
+                                .font(.caption)
+                                .lineLimit(1)
+                            Spacer()
+                            if let sharedURL = vm.lastSharedFileURL {
+                                Button("Share Sheet…") {
+                                    vm.presentNativeSharePicker(for: sharedURL)
+                                }
+                                .controlSize(.small)
+                                Button("Reveal in Finder") {
+                                    vm.revealSharedFileInFinder(sharedURL)
+                                }
+                                .controlSize(.small)
+                                if vm.historyStorage == .googleDrive {
+                                    Button("Google Drive Web") {
+                                        vm.openInGoogleDriveWeb()
+                                    }
+                                    .controlSize(.small)
+                                }
+                            }
+                            Button {
+                                vm.lastShareStatusMessage = ""
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.caption2)
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 10).fill(Color.green.opacity(0.10)))
+                    }
+
                     if let conv = vm.activeConversation, !conv.messages.isEmpty {
                         ForEach(conv.messages) { msg in
                             ChatBubbleRowView(message: msg)
                                 .equatable()
+                                .contextMenu {
+                                    Button("Share \(msg.role == "user" ? "Prompt" : "Response") via \(vm.historyStorage.title) (Redacted)…") {
+                                        vm.shareMessage(msg, conversationTitle: conv.title, redactPII: true)
+                                    }
+                                    Button("Share \(msg.role == "user" ? "Prompt" : "Response") (Full)…") {
+                                        vm.shareMessage(msg, conversationTitle: conv.title, redactPII: false)
+                                    }
+                                    Divider()
+                                    Button("Copy Text") {
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(msg.content, forType: .string)
+                                    }
+                                }
                         }
                     } else {
                         VStack(spacing: 10) {
                             HybridBrandEmblemView()
                             Text("Start a Hybrid or Local Chat")
                                 .font(.title3.bold())
-                            Text("Your prompts can be saved locally on your Mac or in iCloud Drive with your chosen auto-delete schedule. Cloud AI calls always run with store=false so nothing remains in any Cloud AI provider's history.")
+                            Text("Your prompts can be saved locally on your Mac, in iCloud Drive, or in Google Drive—and shared directly from MacHybridAI with automatic Privacy Gate PII redaction. Cloud AI calls always run with store=false.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .multilineTextAlignment(.center)
-                                .frame(maxWidth: 480)
+                                .frame(maxWidth: 500)
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 60)
@@ -1797,22 +2106,97 @@ struct PromptHistoryAndICloudTabView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                Text("Prompt History, iCloud Drive Sync & Auto-Delete")
+                Text("Prompt History, Cloud Drive Sync & Sharing")
                     .font(.title2.bold())
-                Text("Save your prompt and chat history locally on this Mac or in your personal iCloud Drive, with automatic expiration or permanent retention. Cloud AI providers never retain your prompts.")
+                Text("Save your prompts locally on this Mac, in iCloud Drive, or in Google Drive—and share individual prompts or full conversations directly through your cloud drive with optional Privacy Gate PII redaction. Cloud AI providers never retain your prompts.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
 
-                // Storage & Retention Configuration Card
+                // Storage, Cloud Sharing & Retention Configuration Card
                 VStack(alignment: .leading, spacing: 14) {
                     Picker("Save Prompt History To:", selection: $vm.historyStorage) {
                         ForEach(HistoryStorageOption.allCases, id: \.self) { loc in
-                            Text("\(loc.title) (\(loc.subtitle))").tag(loc)
+                            let badge: String = {
+                                switch loc {
+                                case .localMac: return "Always Available"
+                                case .iCloudDrive: return vm.isICloudAvailable ? "Detected" : "Not Signed In"
+                                case .googleDrive: return vm.isGoogleDriveAvailable ? "Detected" : "Folder Picker Available"
+                                }
+                            }()
+                            Text("\(loc.title) — \(badge)").tag(loc)
                         }
                     }
                     .pickerStyle(.radioGroup)
                     .onChange(of: vm.historyStorage) { _, _ in
                         vm.updateHistorySettings()
+                    }
+
+                    if vm.historyStorage == .googleDrive {
+                        HStack(spacing: 10) {
+                            Image(systemName: "folder.badge.person.crop")
+                                .foregroundStyle(.cyan)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Google Drive Sync Folder")
+                                    .font(.caption.bold())
+                                Text(vm.googleDrivePathDisplay)
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                            }
+                            Spacer()
+                            Button("Choose Folder…") {
+                                vm.chooseCustomGoogleDriveFolder()
+                            }
+                            .controlSize(.small)
+                            Button("Auto-Detect") {
+                                vm.resetGoogleDriveFolderToAutoDetect()
+                            }
+                            .controlSize(.small)
+                        }
+                        .padding(10)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.cyan.opacity(0.08)))
+                    }
+
+                    Divider()
+
+                    HStack(spacing: 12) {
+                        Toggle("Redact PII Before Sharing (Privacy Gate)", isOn: $vm.redactPIIOnShare)
+                            .font(.caption.bold())
+                        Spacer()
+                        Button {
+                            vm.openSharedFolderInFinder()
+                        } label: {
+                            Label("Open Shared Folder in Finder", systemImage: "folder")
+                        }
+                        .controlSize(.small)
+                    }
+
+                    if !vm.lastShareStatusMessage.isEmpty {
+                        HStack(spacing: 8) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                            Text(vm.lastShareStatusMessage)
+                                .font(.caption)
+                            Spacer()
+                            if let url = vm.lastSharedFileURL {
+                                Button("Share Sheet…") {
+                                    vm.presentNativeSharePicker(for: url)
+                                }
+                                .controlSize(.small)
+                                Button("Reveal in Finder") {
+                                    vm.revealSharedFileInFinder(url)
+                                }
+                                .controlSize(.small)
+                                if vm.historyStorage == .googleDrive {
+                                    Button("Open Google Drive Web") {
+                                        vm.openInGoogleDriveWeb()
+                                    }
+                                    .controlSize(.small)
+                                }
+                            }
+                        }
+                        .padding(10)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.green.opacity(0.10)))
                     }
 
                     Divider()
@@ -1891,7 +2275,7 @@ struct PromptHistoryAndICloudTabView: View {
                 }
 
                 ForEach(vm.filteredConversations) { conv in
-                    HStack {
+                    HStack(spacing: 10) {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(conv.title)
                                 .font(.headline)
@@ -1900,6 +2284,34 @@ struct PromptHistoryAndICloudTabView: View {
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
+                        Menu {
+                            Button("\(vm.historyStorage.shareActionLabel) (PII Redacted)") {
+                                vm.shareConversation(conv, redactPII: true)
+                            }
+                            Button("\(vm.historyStorage.shareActionLabel) (Full Content)") {
+                                vm.shareConversation(conv, redactPII: false)
+                            }
+                            Divider()
+                            if vm.isICloudAvailable {
+                                Button("Share via iCloud Drive Link…") {
+                                    vm.shareConversation(conv, destination: .iCloudDrive, redactPII: vm.redactPIIOnShare, preferICloudCollaborate: true)
+                                }
+                            }
+                            Button("Save & Reveal in Google Drive") {
+                                vm.shareConversation(conv, destination: .googleDrive, redactPII: vm.redactPIIOnShare, revealInFinderOnly: true)
+                            }
+                            Button("Open & Share in Google Drive Web…") {
+                                vm.openInGoogleDriveWeb(conversation: conv)
+                            }
+                            Divider()
+                            Button("Copy Redacted Markdown") {
+                                vm.copyConversationMarkdown(conv, redactPII: true)
+                            }
+                        } label: {
+                            Label("Share", systemImage: "square.and.arrow.up")
+                        }
+                        .controlSize(.small)
+
                         Button("Open in Chat") {
                             vm.selectConversation(conv.id)
                         }
@@ -2280,6 +2692,16 @@ struct MacHybridAIApp: App {
                     viewModel.importAndScrubFileViaVisionOCR()
                 }
                 .keyboardShortcut("o", modifiers: [.command, .shift])
+
+                Divider()
+
+                Button("Share Active Conversation…") {
+                    if let active = viewModel.activeConversation {
+                        viewModel.shareConversation(active)
+                    }
+                }
+                .keyboardShortcut("s", modifiers: [.command, .shift])
+                .disabled(viewModel.activeConversation?.messages.isEmpty ?? true)
             }
 
             CommandMenu("Compute") {
@@ -2319,7 +2741,7 @@ struct MacHybridAIApp: App {
                 }
                 .keyboardShortcut("1", modifiers: [.command, .option])
 
-                Button("History & iCloud") {
+                Button("History & Cloud") {
                     viewModel.selectedSection = .history
                 }
                 .keyboardShortcut("2", modifiers: [.command, .option])

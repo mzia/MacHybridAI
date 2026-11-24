@@ -21,6 +21,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -34,6 +35,7 @@ class HistoryStorageLocation(str, Enum):
 
     LOCAL = "local"
     ICLOUD = "icloud"
+    GDRIVE = "gdrive"
 
 
 class HistoryRetentionPolicy(str, Enum):
@@ -174,6 +176,7 @@ class PromptHistoryManager:
         retention_policy: HistoryRetentionPolicy = HistoryRetentionPolicy.DAYS_30,
         custom_local_dir: Optional[str] = None,
         custom_icloud_dir: Optional[str] = None,
+        custom_gdrive_dir: Optional[str] = None,
         encrypt_at_rest: bool = False,
         redacted_only: bool = False,
         encryption_key: Optional[bytes] = None,
@@ -198,6 +201,25 @@ class PromptHistoryManager:
                 "~/Library/Mobile Documents/com~apple~CloudDocs/MacHybridAI"
             )
         )
+        self._gdrive_dir = Path(
+            custom_gdrive_dir or str(self._detect_gdrive_dir())
+        )
+
+    @staticmethod
+    def _detect_gdrive_dir() -> Path:
+        """Auto-detects macOS Google Drive for Desktop mount via directory enumeration."""
+        cloud_storage = Path(os.path.expanduser("~/Library/CloudStorage"))
+        try:
+            if cloud_storage.is_dir():
+                for child in sorted(cloud_storage.iterdir(), key=lambda p: p.name):
+                    if child.is_dir() and child.name.startswith("GoogleDrive-"):
+                        my_drive = child / "My Drive"
+                        if my_drive.is_dir():
+                            return my_drive / "MacHybridAI"
+                        return child / "MacHybridAI"
+        except OSError:
+            pass
+        return Path(os.path.expanduser("~/Google Drive/My Drive/MacHybridAI"))
 
     @property
     def _key_file_path(self) -> Path:
@@ -244,7 +266,13 @@ class PromptHistoryManager:
     def active_directory(self) -> Path:
         if self.storage_location == HistoryStorageLocation.ICLOUD:
             return self._icloud_dir
+        if self.storage_location == HistoryStorageLocation.GDRIVE:
+            return self._gdrive_dir
         return self._local_dir
+
+    @property
+    def shared_directory(self) -> Path:
+        return self.active_directory / "Shared"
 
     @property
     def active_file_path(self) -> Path:
@@ -255,6 +283,14 @@ class PromptHistoryManager:
         try:
             cloud_docs = self._icloud_dir.parent
             return cloud_docs.exists() or self._icloud_dir.exists()
+        except OSError:
+            return False
+
+    def is_gdrive_available(self) -> bool:
+        """Checks whether a synced Google Drive folder is available."""
+        try:
+            parent = self._gdrive_dir.parent
+            return parent.exists() or self._gdrive_dir.exists()
         except OSError:
             return False
 
@@ -514,6 +550,42 @@ class PromptHistoryManager:
                 return "\n".join(lines)
         return None
 
+    def export_session_to_shared_folder(
+        self,
+        session_id: str,
+        use_sanitized: bool = True,
+    ) -> Optional[Path]:
+        """Writes a shareable Markdown transcript into `<ActiveDrive>/MacHybridAI/Shared/`."""
+        target_session: Optional[ChatSessionRecord] = None
+        for session in self.load_sessions():
+            if session.session_id == session_id:
+                target_session = session
+                break
+        if target_session is None:
+            return None
+
+        markdown = self.export_session_markdown(session_id=session_id, use_sanitized=use_sanitized)
+        if markdown is None:
+            return None
+
+        slug = re.sub(r"[^A-Za-z0-9_-]+", "-", target_session.title).strip("-")[:48] or "prompt"
+        safe_id = re.sub(r"[^A-Za-z0-9_-]+", "", target_session.session_id)[:10] or "chat"
+        suffix = "redacted" if use_sanitized else "full"
+        file_name = f"{slug}-{safe_id}-{suffix}.md"
+
+        shared_root = os.path.normpath(os.path.realpath(str(self.shared_directory)))
+        os.makedirs(shared_root, exist_ok=True)
+        out_str = os.path.normpath(os.path.join(shared_root, file_name))
+        if not out_str.startswith(shared_root + os.sep):
+            return None
+        out_path = Path(out_str)
+        out_path.write_text(markdown, encoding="utf-8")
+        try:
+            os.chmod(out_path, 0o644)
+        except OSError:
+            pass
+        return out_path
+
     def delete_session(self, session_id: str) -> bool:
         sessions = self.load_sessions()
         filtered = [s for s in sessions if s.session_id != session_id]
@@ -548,7 +620,9 @@ class PromptHistoryManager:
             "encrypt_at_rest": self.encrypt_at_rest,
             "redacted_only": self.redacted_only,
             "active_file_path": str(self.active_file_path),
+            "shared_directory": str(self.shared_directory),
             "icloud_available": self.is_icloud_available(),
+            "gdrive_available": self.is_gdrive_available(),
             "cloud_ai_zero_retention": True,
             "session_count": len(sessions),
             "sessions": [s.to_dict() for s in sessions],
