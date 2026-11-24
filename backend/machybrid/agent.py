@@ -24,14 +24,17 @@ import re
 import shlex
 import subprocess  # nosec B404
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .m365_proxy import M365ToolEmulator
+from .model_security import load_model_lockfile
 from .orchestrator import ComputeMode, ExecutionReceipt, HybridOrchestrator
 from .profiler import HardwareProfiler
-from .providers import LocalModelProvider, ProviderResponse
+from .providers import AppleFoundationModelsProvider, LocalModelProvider, ProviderResponse
 
 _IGNORED_DIRS = frozenset(
     {
@@ -239,8 +242,49 @@ def diagnose_cli_permissions(
         }
     )
 
-    # 8. Cloud AI provider credential readiness (reads presence metadata only, never secrets)
+    # 8. Apple-signed OS Foundation Models availability (zero Hugging Face)
     orch = orchestrator or HybridOrchestrator()
+    fm_ok, fm_reason = AppleFoundationModelsProvider.check_availability()
+    checks.append(
+        {
+            "name": "apple_foundation_models",
+            "ok": fm_ok,
+            "detail": fm_reason if fm_reason else ("Apple-signed FoundationModels ready" if fm_ok else "Unavailable"),
+            "remediation": (
+                ""
+                if fm_ok
+                else "Requires macOS 26+ with Apple Intelligence enabled and a compiled MacHybridAI binary (`swift build -c release`)."
+            ),
+        }
+    )
+
+    # 9. Local model supply-chain protection posture
+    sec = orch.get_model_security_settings()
+    lock_entries = load_model_lockfile(Path(sec.lockfile_path) if sec.lockfile_path else None)
+    if sec.allow_unverified_huggingface:
+        sc_ok = False
+        sc_detail = (
+            f"BYPASS ENABLED (policy={sec.policy.value}) — unverified Hugging Face community repos allowed "
+            f"(trust_remote_code=False & pickle/python files still blocked; {len(lock_entries)} pinned model(s))"
+        )
+        sc_fix = "Run `machybrid security revoke-hf` or switch to `--local-backend apple_fm` / `--local-model-dir <path>` to restore strict protection."
+    else:
+        sc_ok = True
+        sc_detail = (
+            f"Strict protection ACTIVE (policy={sec.policy.value}, trust_remote_code=False, "
+            f"pickle/python blocked, {len(lock_entries)} SHA-256 pinned model(s))"
+        )
+        sc_fix = ""
+    checks.append(
+        {
+            "name": "model_supply_chain",
+            "ok": sc_ok,
+            "detail": sc_detail,
+            "remediation": sc_fix,
+        }
+    )
+
+    # 10. Cloud AI provider readiness (reads presence metadata only, never secrets)
     ready_providers = [p["id"] for p in orch.list_cloud_providers() if p.get("configured")]
     checks.append(
         {
@@ -310,9 +354,11 @@ class AgentRunResult:
     plan_mode: bool = False
     total_tool_calls: int = 0
     total_duration_ms: int = 0
+    conversation_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "conversation_id": self.conversation_id,
             "goal": self.goal,
             "workspace": self.workspace,
             "final_output": self.final_output,
@@ -322,6 +368,145 @@ class AgentRunResult:
             "steps": [s.to_dict() for s in self.steps],
             "receipt": asdict(self.receipt),
         }
+
+
+class CLISessionStore:
+    """Local-only on-device CLI conversation store enabling `-c` and `--conversation=<uuid>` resume.
+
+    All conversations stay strictly on this Mac (`~/Library/Application Support/MacHybridAI/cli_sessions`
+    or `$MACHYBRID_SESSIONS_DIR`). Conversation IDs are strictly validated as canonical UUIDs and resolved
+    against enumerated directory entries to prevent CWE-22 path injection.
+    """
+
+    def __init__(self, sessions_dir: Optional[Path] = None) -> None:
+        raw_dir = (
+            str(sessions_dir)
+            if sessions_dir is not None
+            else (
+                os.environ.get("MACHYBRID_SESSIONS_DIR", "").strip()
+                or os.path.expanduser("~/Library/Application Support/MacHybridAI/cli_sessions")
+            )
+        )
+        self.sessions_dir = Path(os.path.realpath(os.path.abspath(os.path.expanduser(raw_dir))))
+
+    @staticmethod
+    def new_conversation_id() -> str:
+        return str(uuid.uuid4())
+
+    @staticmethod
+    def validate_conversation_id(raw_id: str) -> str:
+        """Validates and normalizes a conversation UUID; raises ValueError on invalid input."""
+        cleaned = (raw_id or "").strip()
+        if not cleaned:
+            raise ValueError("Conversation ID must not be empty.")
+        try:
+            parsed = uuid.UUID(cleaned)
+        except ValueError as exc:
+            raise ValueError(f"Invalid conversation ID '{cleaned}' (expected UUID format).") from exc
+        return str(parsed)
+
+    def _find_session_file(self, conversation_id: str) -> Optional[Path]:
+        canonical = self.validate_conversation_id(conversation_id)
+        try:
+            if not self.sessions_dir.is_dir():
+                return None
+            for entry in self.sessions_dir.iterdir():
+                if entry.is_file() and entry.suffix == ".json" and entry.stem == canonical:
+                    return entry
+        except OSError:
+            return None
+        return None
+
+    def load_session(self, conversation_id: str) -> Optional[Dict[str, Any]]:
+        session_file = self._find_session_file(conversation_id)
+        if session_file is None:
+            return None
+        try:
+            data = json.loads(session_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("conversation_id"):
+                return data
+        except Exception:
+            return None
+        return None
+
+    def save_session(
+        self,
+        conversation_id: str,
+        workspace: str,
+        mode: str,
+        cloud_provider: str,
+        local_backend: str,
+        turns: List[Dict[str, str]],
+        created_at: Optional[str] = None,
+    ) -> bool:
+        canonical = self.validate_conversation_id(conversation_id)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "conversation_id": canonical,
+            "workspace": workspace,
+            "mode": mode,
+            "cloud_provider": cloud_provider,
+            "local_backend": local_backend,
+            "created_at": created_at or now_iso,
+            "updated_at": now_iso,
+            "turns": turns[-50:],
+        }
+        try:
+            self.sessions_dir.mkdir(parents=True, exist_ok=True)
+            # Filename is strictly derived from canonical uuid.UUID output (hex + dashes only)
+            target_path = self.sessions_dir / f"{canonical}.json"
+            target_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            return True
+        except OSError:
+            return False
+
+    def list_sessions(self, limit: int = 20) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        try:
+            if not self.sessions_dir.is_dir():
+                return rows
+            for entry in self.sessions_dir.iterdir():
+                if not entry.is_file() or entry.suffix != ".json":
+                    continue
+                try:
+                    data = json.loads(entry.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if not isinstance(data, dict) or not data.get("conversation_id"):
+                    continue
+                turns = data.get("turns") if isinstance(data.get("turns"), list) else []
+                first_goal = str(turns[0].get("goal", "")) if turns and isinstance(turns[0], dict) else ""
+                rows.append(
+                    {
+                        "conversation_id": str(data["conversation_id"]),
+                        "workspace": str(data.get("workspace", "")),
+                        "mode": str(data.get("mode", "auto")),
+                        "cloud_provider": str(data.get("cloud_provider", "")),
+                        "local_backend": str(data.get("local_backend", "")),
+                        "created_at": str(data.get("created_at", "")),
+                        "updated_at": str(data.get("updated_at", "")),
+                        "turn_count": len(turns),
+                        "preview": first_goal[:90],
+                    }
+                )
+        except OSError:
+            return []
+        rows.sort(key=lambda r: r.get("updated_at", ""), reverse=True)
+        return rows[: max(1, limit)]
+
+    def find_latest_session(self, workspace: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Returns the most recent session (preferring the current workspace if available)."""
+        sessions = self.list_sessions(limit=50)
+        if not sessions:
+            return None
+        if workspace:
+            norm_ws = os.path.realpath(os.path.abspath(os.path.expanduser(workspace)))
+            for row in sessions:
+                if row.get("workspace") == norm_ws:
+                    loaded = self.load_session(row["conversation_id"])
+                    if loaded is not None:
+                        return loaded
+        return self.load_session(sessions[0]["conversation_id"])
 
 
 class WorkspaceToolbox:
@@ -759,6 +944,8 @@ class HybridCLIAgent:
         approval_callback: Optional[Callable[[str, Dict[str, Any], str], Any]] = None,
         cloud_approval_callback: Optional[Callable[[str, int, List[str]], Optional[str]]] = None,
         event_callback: Optional[Callable[[str, str], None]] = None,
+        conversation_id: Optional[str] = None,
+        session_store: Optional[CLISessionStore] = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.workspace_root = os.path.realpath(os.path.abspath(os.path.expanduser(workspace_root)))
@@ -772,14 +959,61 @@ class HybridCLIAgent:
             auto_approve=auto_approve,
             approval_callback=approval_callback,
         )
+        self.session_store = session_store or CLISessionStore()
+        self._created_at: Optional[str] = None
+        self._turn_history: List[Dict[str, str]] = []
         self._conversation_turns: List[str] = []
+        self.resumed_turn_count: int = 0
+
+        if conversation_id:
+            self.conversation_id = CLISessionStore.validate_conversation_id(conversation_id)
+            existing = self.session_store.load_session(self.conversation_id)
+            if existing is not None:
+                self._created_at = str(existing.get("created_at") or "") or None
+                saved_turns = existing.get("turns") if isinstance(existing.get("turns"), list) else []
+                for item in saved_turns:
+                    if isinstance(item, dict) and item.get("goal"):
+                        g = str(item.get("goal", ""))
+                        a = str(item.get("final_output", ""))
+                        ts = str(item.get("timestamp", ""))
+                        self._turn_history.append({"goal": g, "final_output": a, "timestamp": ts})
+                        self._conversation_turns.append(f"USER: {g}\nASSISTANT: {a[:600]}")
+                self.resumed_turn_count = len(self._turn_history)
+        else:
+            self.conversation_id = CLISessionStore.new_conversation_id()
 
     def _emit(self, stage: str, message: str) -> None:
         if self.event_callback is not None:
             self.event_callback(stage, message)
 
+    def _record_and_persist_turn(self, goal: str, final_answer: str) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if not self._created_at:
+            self._created_at = now_iso
+        self._turn_history.append(
+            {
+                "goal": goal,
+                "final_output": final_answer[:4000],
+                "timestamp": now_iso,
+            }
+        )
+        self._conversation_turns.append(f"USER: {goal}\nASSISTANT: {final_answer[:600]}")
+        self.session_store.save_session(
+            conversation_id=self.conversation_id,
+            workspace=self.workspace_root,
+            mode=self.orchestrator.config.compute_mode.value,
+            cloud_provider=self.orchestrator.config.cloud_provider,
+            local_backend=self.orchestrator.config.local_backend,
+            turns=self._turn_history,
+            created_at=self._created_at,
+        )
+
     def reset_memory(self) -> None:
+        self._turn_history.clear()
         self._conversation_turns.clear()
+        self.resumed_turn_count = 0
+        self._created_at = None
+        self.conversation_id = CLISessionStore.new_conversation_id()
         self.orchestrator.guardian.vault.clear()
 
     def _gather_workspace_overview(self) -> str:
@@ -829,14 +1063,26 @@ class HybridCLIAgent:
         Returns `(response, outbound_sha256, pii_flagged_count, pii_categories, nothing_left_mac)`.
         """
         local_system_instruction = self._build_local_system_instruction(tools)
+        sec_settings = self.orchestrator.get_model_security_settings()
 
         if active_mode == ComputeMode.LOCAL:
-            self._emit("station1", f"Running 100% locally on Apple Silicon ({effective_local_model or 'auto'})")
+            if self.orchestrator.config.local_backend == "apple_fm":
+                self._emit(
+                    "station1",
+                    "Running 100% locally via Apple-Signed Foundation Models (Zero Hugging Face)",
+                )
+            else:
+                self._emit(
+                    "station1",
+                    f"Running 100% locally on Apple Silicon ({effective_local_model or 'auto'})",
+                )
             local_provider = LocalModelProvider(
                 backend_type=self.orchestrator.config.local_backend,
                 model=effective_local_model,
                 base_url=self.orchestrator.config.local_base_url,
                 litert_model_path=self.orchestrator.config.litert_model_path,
+                security_settings=sec_settings,
+                local_model_dir=self.orchestrator.config.local_model_dir,
             )
             resp = local_provider.generate(
                 prompt=prompt_text,
@@ -858,6 +1104,8 @@ class HybridCLIAgent:
                 model=effective_local_model,
                 base_url=self.orchestrator.config.local_base_url,
                 litert_model_path=self.orchestrator.config.litert_model_path,
+                security_settings=sec_settings,
+                local_model_dir=self.orchestrator.config.local_model_dir,
             )
             resp = local_provider.generate(
                 prompt=prompt_text,
@@ -883,6 +1131,8 @@ class HybridCLIAgent:
                     model=effective_local_model,
                     base_url=self.orchestrator.config.local_base_url,
                     litert_model_path=self.orchestrator.config.litert_model_path,
+                    security_settings=sec_settings,
+                    local_model_dir=self.orchestrator.config.local_model_dir,
                 )
                 resp = local_provider.generate(
                     prompt=prompt_text,
@@ -1023,7 +1273,7 @@ class HybridCLIAgent:
                 outbound_sanitized_sha256="local_only_no_outbound_payload",
                 pii_flagged_count=0,
             )
-            self._conversation_turns.append(f"USER: {goal}\nASSISTANT: {final_answer[:600]}")
+            self._record_and_persist_turn(goal, final_answer)
             receipt = ExecutionReceipt(
                 mode_executed=ComputeMode.LOCAL.value,
                 local_model_used="station1-grounded-tool (on this Mac)",
@@ -1046,6 +1296,7 @@ class HybridCLIAgent:
                 plan_mode=self.toolbox.plan_mode,
                 total_tool_calls=1,
                 total_duration_ms=total_ms,
+                conversation_id=self.conversation_id,
             )
 
         requested_mode = mode or self.orchestrator.config.compute_mode
@@ -1200,7 +1451,7 @@ class HybridCLIAgent:
         if not final_answer and steps:
             final_answer = steps[-1].assistant_text
 
-        self._conversation_turns.append(f"USER: {goal}\nASSISTANT: {final_answer[:600]}")
+        self._record_and_persist_turn(goal, final_answer)
 
         receipt = ExecutionReceipt(
             mode_executed=active_mode.value,
@@ -1225,4 +1476,5 @@ class HybridCLIAgent:
             plan_mode=self.toolbox.plan_mode,
             total_tool_calls=total_tool_calls,
             total_duration_ms=total_ms,
+            conversation_id=self.conversation_id,
         )

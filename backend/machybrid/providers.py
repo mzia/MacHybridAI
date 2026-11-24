@@ -23,13 +23,22 @@ import http.client
 import json
 import os
 import re
+import subprocess  # nosec B404
+import sys
 import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Generator, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
 from .m365_proxy import M365ModelCatalog, M365ToolEmulator
+from .model_security import (
+    ModelAuditResult,
+    ModelSecuritySettings,
+    audit_model_directory,
+    sanitize_local_model_dir,
+)
 from .profiler import HardwareProfiler
 
 # Deprecated Gemini model guard per gemini-api-dev skill rules
@@ -113,6 +122,166 @@ class ProviderResponse:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+class AppleFoundationModelsProvider:
+    """Native Apple-Signed On-Device Foundation Models Provider (macOS 26+ Apple Intelligence).
+
+    Delegates to the compiled Swift `MacHybridAI` binary (`--apple-fm-check` / `--apple-fm-generate`)
+    which calls Apple's OS-bundled, code-signed `FoundationModels` framework (`SystemLanguageModel`).
+    Zero Hugging Face dependency, zero third-party weights, zero network calls.
+    """
+
+    _availability_cache: Optional[Tuple[bool, str]] = None
+
+    @classmethod
+    def _find_swift_binary(cls) -> Optional[str]:
+        """Locates the compiled MacHybridAI Swift binary from fixed trusted paths only.
+
+        Prefers the newest build in the active repository over an older installed `/Applications` copy.
+        """
+        repo_root = Path(__file__).resolve().parents[2]
+        candidates = (
+            repo_root / ".build" / "release" / "MacHybridAI",
+            repo_root / ".build" / "arm64-apple-macosx" / "release" / "MacHybridAI",
+            repo_root / "MacHybridAI.app" / "Contents" / "MacOS" / "MacHybridAI",
+            repo_root / ".build" / "debug" / "MacHybridAI",
+            Path("/Applications/MacHybridAI.app/Contents/MacOS/MacHybridAI"),
+        )
+        for cand in candidates:
+            if cand.is_file() and os.access(cand, os.X_OK):
+                try:
+                    # Verify the binary actually supports headless `--apple-fm-check`
+                    # so we never accidentally launch an older GUI-only MacHybridAI.app bundle.
+                    if b"--apple-fm-check" in cand.read_bytes():
+                        return str(cand)
+                except OSError:
+                    continue
+        return None
+
+    @classmethod
+    def check_availability(cls, force_refresh: bool = False) -> Tuple[bool, str]:
+        if cls._availability_cache is not None and not force_refresh:
+            return cls._availability_cache
+        binary = cls._find_swift_binary()
+        if not binary:
+            res = (
+                False,
+                "MacHybridAI Swift binary not built/installed yet (run `swift build -c release` or install MacHybridAI.app).",
+            )
+            cls._availability_cache = res
+            return res
+        try:
+            proc = subprocess.run(  # nosec B603
+                [binary, "--apple-fm-check"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                data = json.loads(proc.stdout.strip().splitlines()[-1])
+                res = (bool(data.get("available", False)), str(data.get("reason", "")))
+                cls._availability_cache = res
+                return res
+            res = (False, (proc.stderr or "Apple Foundation Models probe failed").strip()[:180])
+        except Exception as exc:
+            res = (False, f"Apple Foundation Models unavailable: {exc}")
+        cls._availability_cache = res
+        return res
+
+    @classmethod
+    def is_available(cls) -> bool:
+        avail, _ = cls.check_availability()
+        return avail
+
+    def generate(
+        self,
+        prompt: str,
+        local_files_context: str = "",
+        system_instruction: Optional[str] = None,
+    ) -> ProviderResponse:
+        binary = self._find_swift_binary()
+        if not binary:
+            return ProviderResponse(
+                provider="apple_foundation_models",
+                model="Apple On-Device Foundation Model (Apple-Signed)",
+                output_text=(
+                    "[Apple Foundation Models Unavailable] Build MacHybridAI (`swift build -c release`) "
+                    "on macOS 26+ with Apple Intelligence enabled, or switch to `--local-model-dir` / `--local-backend ollama`."
+                ),
+                locality="local",
+                tokens_used=24,
+                metadata={"backend": "apple_fm", "available": False, "apple_signed": True},
+            )
+
+        full_prompt = prompt
+        if local_files_context:
+            full_prompt = f"{prompt}\n\n[Local Private Files on This Mac]:\n{local_files_context}"
+
+        payload = json.dumps(
+            {
+                "prompt": full_prompt,
+                "system_instruction": system_instruction or "",
+            }
+        )
+        t0 = time.monotonic()
+        try:
+            proc = subprocess.run(  # nosec B603
+                [binary, "--apple-fm-generate"],
+                input=payload,
+                capture_output=True,
+                text=True,
+                timeout=60.0,
+                check=False,
+            )
+            elapsed_s = round(time.monotonic() - t0, 2)
+            raw_out = (proc.stdout or "").strip()
+            if raw_out:
+                data = json.loads(raw_out.splitlines()[-1])
+                if data.get("ok"):
+                    text = str(data.get("output_text", ""))
+                    return ProviderResponse(
+                        provider="apple_foundation_models",
+                        model=str(data.get("model_name", "Apple On-Device Foundation Model (Apple-Signed)")),
+                        output_text=text,
+                        locality="local",
+                        tokens_used=max(16, len(full_prompt.split()) + len(text.split())),
+                        metadata={
+                            "backend": "Apple FoundationModels (Apple-Signed)",
+                            "signer": str(data.get("signer", "Apple Inc.")),
+                            "apple_signed": True,
+                            "huggingface_used": False,
+                            "on_device": True,
+                            "elapsed_s": elapsed_s,
+                        },
+                    )
+                err_msg = str(data.get("error", "Apple Foundation Models returned an error"))
+                return ProviderResponse(
+                    provider="apple_foundation_models",
+                    model="Apple On-Device Foundation Model (Apple-Signed)",
+                    output_text=f"[Apple Foundation Models Unavailable] {err_msg}",
+                    locality="local",
+                    tokens_used=20,
+                    metadata={"backend": "apple_fm", "available": False, "error": err_msg},
+                )
+        except Exception as exc:
+            return ProviderResponse(
+                provider="apple_foundation_models",
+                model="Apple On-Device Foundation Model (Apple-Signed)",
+                output_text=f"[Apple Foundation Models Error] {exc}",
+                locality="local",
+                tokens_used=20,
+                metadata={"backend": "apple_fm", "available": False, "error": str(exc)},
+            )
+        return ProviderResponse(
+            provider="apple_foundation_models",
+            model="Apple On-Device Foundation Model (Apple-Signed)",
+            output_text="[Apple Foundation Models Unavailable] Ensure macOS 26+ and Apple Intelligence are enabled.",
+            locality="local",
+            tokens_used=20,
+            metadata={"backend": "apple_fm", "available": False},
+        )
+
+
 class MLXProvider:
     """Apple Silicon native local inference via `mlx-lm`.
 
@@ -138,13 +307,24 @@ class MLXProvider:
         temperature: float = 0.2,
         system_instruction: Optional[str] = None,
         kv_bits: Optional[int] = None,
+        security_settings: Optional[ModelSecuritySettings] = None,
+        local_model_dir: str = "",
     ) -> None:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.system_instruction = system_instruction
-        self._model_id = self._resolve_model(model)
+        self.security_settings = security_settings or ModelSecuritySettings.load()
+        raw_local_dir = (local_model_dir or self.security_settings.local_model_dir or "").strip()
+        safe_local_dir = sanitize_local_model_dir(raw_local_dir) if raw_local_dir else None
+        self.local_model_dir = str(safe_local_dir) if safe_local_dir is not None else ""
+        self._model_id = (
+            self.local_model_dir
+            if self.local_model_dir
+            else self._resolve_model(model)
+        )
         self.kv_bits = kv_bits
         self.last_generation_stats: Dict[str, Any] = {}
+        self.last_audit: Optional[ModelAuditResult] = None
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -274,16 +454,59 @@ class MLXProvider:
 
         # Verify that the selected model's weights are actually cached locally
         # before calling mlx_lm.load() so we never hang trying to download 30+ GB shards.
-        _, is_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(self._model_id)
-        if not is_complete:
-            fallback_primary, _, _, _ = HardwareProfiler.select_optimal_models(prefer_cached_only=True)
-            _, fb_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(fallback_primary)
-            if fb_complete:
-                self._model_id = fallback_primary
-            else:
+        target_dir: Optional[Path] = None
+        is_local_dir = bool(self.local_model_dir)
+        if is_local_dir:
+            target_dir = sanitize_local_model_dir(self.local_model_dir)
+            if target_dir is None or not target_dir.is_dir():
                 return self._local_fallback_response(
-                    prompt, local_files_context, reason="model_weights_not_cached"
+                    prompt, local_files_context, reason="local_model_dir_not_found"
                 )
+        else:
+            _, is_complete, _, local_path, _ = HardwareProfiler.inspect_hf_model_cache(self._model_id)
+            if not is_complete:
+                fallback_primary, _, _, _ = HardwareProfiler.select_optimal_models(prefer_cached_only=True)
+                _, fb_complete, _, fb_path, _ = HardwareProfiler.inspect_hf_model_cache(fallback_primary)
+                if fb_complete:
+                    self._model_id = fallback_primary
+                    local_path = fb_path
+                else:
+                    return self._local_fallback_response(
+                        prompt, local_files_context, reason="model_weights_not_cached"
+                    )
+            if local_path:
+                target_dir = sanitize_local_model_dir(local_path)
+
+        # Supply-chain security verification BEFORE loading weights into memory
+        audit = audit_model_directory(
+            model_id=self._model_id,
+            model_dir=target_dir,
+            settings=self.security_settings,
+            is_local_dir=is_local_dir,
+        )
+        self.last_audit = audit
+        if not audit.allowed:
+            blocked_msg = (
+                f"[Supply-Chain Protection Blocked `{self._model_id}`]\n"
+                + "\n".join(f"- {err}" for err in audit.errors)
+            )
+            return ProviderResponse(
+                provider="local_mlx",
+                model=self._model_id,
+                output_text=blocked_msg,
+                locality="local",
+                tokens_used=max(20, len(blocked_msg.split())),
+                metadata={
+                    "backend": "Apple MLX (Blocked by Supply-Chain Policy)",
+                    "on_device": True,
+                    "supply_chain_blocked": True,
+                    "publisher_trust": audit.publisher_trust,
+                    "policy_applied": audit.policy_applied,
+                    "audit_errors": list(audit.errors),
+                },
+            )
+        if audit.override_used and audit.warnings:
+            print(f"\n[MacHybridAI] {audit.warnings[0]}\n", file=sys.stderr)
 
         sys_inst = system_instruction or self.system_instruction
 
@@ -323,6 +546,10 @@ class MLXProvider:
                     "peak_memory_gb": peak_mem_gb,
                     "elapsed_s": round(elapsed_s, 2),
                     "unified_memory_gb": self.unified_memory_gb(),
+                    "publisher_trust": audit.publisher_trust,
+                    "huggingface_override_used": audit.override_used,
+                    "supply_chain_warning": audit.warnings[0] if audit.warnings else "",
+                    "trust_remote_code": False,
                 },
             )
 
@@ -434,11 +661,36 @@ class MLXProvider:
                     disable_progress_bars()
                 except Exception:
                     pass
-                _, is_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(self._model_id)
-                if is_complete:
+                is_local_dir = bool(self.local_model_dir)
+                target_dir: Optional[Path] = None
+                if is_local_dir:
+                    target_dir = sanitize_local_model_dir(self.local_model_dir)
                     os.environ["HF_HUB_OFFLINE"] = "1"
+                else:
+                    _, is_complete, _, local_path, _ = HardwareProfiler.inspect_hf_model_cache(self._model_id)
+                    if is_complete:
+                        os.environ["HF_HUB_OFFLINE"] = "1"
+                    if local_path:
+                        target_dir = sanitize_local_model_dir(local_path)
+
+                audit = audit_model_directory(
+                    model_id=self._model_id,
+                    model_dir=target_dir,
+                    settings=self.security_settings,
+                    is_local_dir=is_local_dir,
+                )
+                self.last_audit = audit
+                if not audit.allowed:
+                    raise PermissionError("; ".join(audit.errors))
+
+                # Always load from resolved local snapshot/dir when available & lock trust_remote_code=False
+                safe_load_dir = sanitize_local_model_dir(str(target_dir)) if target_dir is not None else None
+                load_target = str(safe_load_dir) if (safe_load_dir is not None and safe_load_dir.is_dir()) else self._model_id
                 try:
-                    model, tokenizer = load(self._model_id)
+                    model, tokenizer = load(
+                        load_target,
+                        tokenizer_config={"trust_remote_code": False},
+                    )
                 finally:
                     if prev_disable_bars is None:
                         os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
@@ -701,15 +953,21 @@ class LocalModelProvider:
 
     def __init__(
         self,
-        backend_type: str = "mlx",  # "mlx" | "litert" | "ollama" | "lmstudio"
-        model: str = "",            # empty = auto-select best MLX model
+        backend_type: str = "mlx",  # "apple_fm" | "mlx" | "litert" | "ollama" | "lmstudio"
+        model: str = "",            # empty = auto-select best local model
         base_url: str = "http://127.0.0.1:11434/v1",
         litert_model_path: str = "~/.litert-lm/models/gemma4-26b/model.litertlm",
+        security_settings: Optional[ModelSecuritySettings] = None,
+        local_model_dir: str = "",
     ) -> None:
         self.backend_type = backend_type
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.litert_model_path = os.path.abspath(os.path.expanduser(litert_model_path))
+        self.security_settings = security_settings or ModelSecuritySettings.load()
+        raw_dir = (local_model_dir or self.security_settings.local_model_dir or "").strip()
+        safe_dir = sanitize_local_model_dir(raw_dir) if raw_dir else None
+        self.local_model_dir = str(safe_dir) if safe_dir is not None else ""
 
     def generate(
         self,
@@ -721,10 +979,22 @@ class LocalModelProvider:
         if local_files_context:
             full_prompt = f"{prompt}\n\n[Local Private Files on This Mac]:\n{local_files_context}"
 
-        # 0. Apple MLX — native ANE + Metal, fastest path on M-series Macs
+        # 0a. Apple-Signed OS Foundation Models (macOS 26+ Apple Intelligence — zero Hugging Face)
+        if self.backend_type == "apple_fm":
+            return AppleFoundationModelsProvider().generate(
+                prompt=prompt,
+                local_files_context=local_files_context,
+                system_instruction=system_instruction,
+            )
+
+        # 0b. Apple MLX — native ANE + Metal (gated by ModelSecuritySettings supply-chain audit)
         if self.backend_type == "mlx" and MLXProvider.is_available():
             mlx_model_id = self.model if self.model else None  # None = auto-select
-            return MLXProvider(model=mlx_model_id).generate(
+            return MLXProvider(
+                model=mlx_model_id,
+                security_settings=self.security_settings,
+                local_model_dir=self.local_model_dir,
+            ).generate(
                 prompt=prompt,
                 local_files_context=local_files_context,
                 system_instruction=system_instruction,

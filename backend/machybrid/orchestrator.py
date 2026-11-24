@@ -32,6 +32,7 @@ from .history import (
 )
 from .local_rag import LocalWorkspaceRAG
 from .m365_proxy import M365CopilotProxyManager, M365ModelCatalog, M365ProxySettings
+from .model_security import ModelSecuritySettings, sanitize_local_model_dir
 from .profiler import HardwareProfiler
 from .providers import (
     CLOUD_PROVIDER_PRESETS,
@@ -70,10 +71,16 @@ class HybridConfig:
     antigravity_agent: str = DEFAULT_ANTIGRAVITY_AGENT
     anthropic_model: str = DEFAULT_ANTHROPIC_MODEL
     anthropic_base_url: str = "https://api.anthropic.com/v1"
-    local_backend: str = "mlx"       # "mlx" | "litert" | "ollama" | "lmstudio"
+    local_backend: str = "mlx"       # "apple_fm" | "mlx" | "litert" | "ollama" | "lmstudio"
     local_model: str = ""            # empty = auto-select best MLX model by available RAM
     local_base_url: str = "http://127.0.0.1:11434/v1"
     litert_model_path: str = "~/.litert-lm/models/gemma4-26b/model.litertlm"
+    allow_unverified_huggingface: bool = False
+    huggingface_override_acknowledged: bool = False
+    apple_signed_only: bool = False
+    local_model_dir: str = ""
+    model_lockfile_path: str = ""
+    require_lockfile_match: bool = False
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = DEFAULT_OPENAI_MODEL
     custom_provider_protocol: str = "openai"  # "openai" | "anthropic"
@@ -104,6 +111,12 @@ class HybridConfig:
             "local_model": self.local_model,
             "local_base_url": self.local_base_url,
             "litert_model_path": self.litert_model_path,
+            "allow_unverified_huggingface": self.allow_unverified_huggingface,
+            "huggingface_override_acknowledged": self.huggingface_override_acknowledged,
+            "apple_signed_only": self.apple_signed_only,
+            "local_model_dir": self.local_model_dir,
+            "model_lockfile_path": self.model_lockfile_path,
+            "require_lockfile_match": self.require_lockfile_match,
             "openai_base_url": self.openai_base_url,
             "openai_model": self.openai_model,
             "custom_provider_protocol": self.custom_provider_protocol,
@@ -222,6 +235,17 @@ class HybridOrchestrator:
         history_manager: Optional[PromptHistoryManager] = None,
     ) -> None:
         self.config = config or HybridConfig()
+        # Hydrate persisted user supply-chain security settings when using default config
+        if config is None:
+            saved_policy = ModelSecuritySettings.load()
+            self.config.allow_unverified_huggingface = saved_policy.allow_unverified_huggingface
+            self.config.huggingface_override_acknowledged = saved_policy.huggingface_override_acknowledged
+            self.config.apple_signed_only = saved_policy.apple_signed_only
+            if saved_policy.local_model_dir:
+                self.config.local_model_dir = saved_policy.local_model_dir
+            if saved_policy.lockfile_path:
+                self.config.model_lockfile_path = saved_policy.lockfile_path
+            self.config.require_lockfile_match = saved_policy.require_lockfile_match
         self.guardian = PIIGuardian(
             policy=self.config.guardian_policy,
             custom_sensitive_terms=self.config.custom_sensitive_terms,
@@ -247,6 +271,17 @@ class HybridOrchestrator:
             os.path.abspath(os.path.expanduser(r))
             for r in (allowed_roots or [os.path.expanduser("~")])
         ]
+
+    def get_model_security_settings(self) -> ModelSecuritySettings:
+        """Returns the active local model supply-chain security settings."""
+        return ModelSecuritySettings(
+            allow_unverified_huggingface=self.config.allow_unverified_huggingface,
+            huggingface_override_acknowledged=self.config.huggingface_override_acknowledged,
+            apple_signed_only=self.config.apple_signed_only,
+            local_model_dir=self.config.local_model_dir,
+            lockfile_path=self.config.model_lockfile_path,
+            require_lockfile_match=self.config.require_lockfile_match,
+        )
 
     def list_cloud_providers(self) -> List[Dict[str, Any]]:
         """Returns all built-in and custom cloud AI provider presets with live readiness metadata."""
@@ -274,6 +309,36 @@ class HybridOrchestrator:
             self.config.local_base_url = str(updates["local_base_url"])
         if "litert_model_path" in updates:
             self.config.litert_model_path = str(updates["litert_model_path"])
+        security_changed = False
+        if "allow_unverified_huggingface" in updates:
+            self.config.allow_unverified_huggingface = bool(updates["allow_unverified_huggingface"])
+            security_changed = True
+        if "huggingface_override_acknowledged" in updates:
+            self.config.huggingface_override_acknowledged = bool(updates["huggingface_override_acknowledged"])
+            security_changed = True
+        if "apple_signed_only" in updates:
+            self.config.apple_signed_only = bool(updates["apple_signed_only"])
+            security_changed = True
+        if "local_model_dir" in updates:
+            raw_dir = str(updates["local_model_dir"] or "").strip()
+            if not raw_dir:
+                self.config.local_model_dir = ""
+            else:
+                safe_dir = sanitize_local_model_dir(raw_dir)
+                if safe_dir is None:
+                    raise ValueError(
+                        "Invalid local_model_dir: directory must reside inside your home or temp folder."
+                    )
+                self.config.local_model_dir = str(safe_dir)
+            security_changed = True
+        if "require_lockfile_match" in updates:
+            self.config.require_lockfile_match = bool(updates["require_lockfile_match"])
+            security_changed = True
+        if security_changed and bool(updates.get("persist_security_settings", False)):
+            try:
+                self.get_model_security_settings().save()
+            except OSError:
+                pass
         if "openai_base_url" in updates:
             self.config.openai_base_url = str(updates["openai_base_url"])
         if "openai_model" in updates:
@@ -507,6 +572,8 @@ class HybridOrchestrator:
             model=effective_local_model,
             base_url=self.config.local_base_url,
             litert_model_path=self.config.litert_model_path,
+            security_settings=self.get_model_security_settings(),
+            local_model_dir=self.config.local_model_dir,
         )
 
         # =====================================================================

@@ -242,6 +242,11 @@ final class HybridAppViewModel: ObservableObject {
     @Published var historySearchQuery: String = ""
 
     // Provider configuration fields
+    @Published var localBackend: LocalBackendOption = AppleFoundationModelsEngine.checkAvailability().available ? .appleFoundationModels : .mlx
+    @Published var allowUnverifiedHuggingFace: Bool = false
+    @Published var isShowingHuggingFaceWarningAlert: Bool = false
+    @Published var localModelDir: String = ""
+    @Published var appleFMStatus: AppleFoundationModelsEngine.AvailabilityReport = AppleFoundationModelsEngine.checkAvailability()
     @Published var geminiModel: String = "gemini-3.8-flash"
     @Published var antigravityAgent: String = "antigravity-preview-05-2026"
     @Published var anthropicModel: String = "claude-sonnet-4-5"
@@ -279,12 +284,13 @@ final class HybridAppViewModel: ObservableObject {
     @Published var quickAskPrompt: String = ""
     @Published var isVoiceDictating: Bool = false
 
-    @Published var selectedTab: Int = 0
+    @Published var selectedSection: MainWorkspaceSection = .chat
     @Published var hardwareProfile: MacHardwareProfileModel?
     @Published var latestBenchmark: HardwareBenchmarkResultModel?
     @Published var isBenchmarking: Bool = false
     @Published var lastPullResult: ModelPullResultModel?
     @Published var isPullingModelId: String?
+    @Published var customPullModelId: String = "google/gemma-3-4b-it"
 
     private let historyStore = PromptHistoryStore()
 
@@ -318,6 +324,88 @@ final class HybridAppViewModel: ObservableObject {
         self.localModel = modelId
         Task.detached(priority: .utility) {
             BackendBridge.shared.updateBackendConfig(body: ["local_model": modelId])
+        }
+    }
+
+    func setLocalBackend(_ backend: LocalBackendOption) {
+        self.localBackend = backend
+        let raw = backend.rawValue
+        Task.detached(priority: .utility) {
+            BackendBridge.shared.updateBackendConfig(body: ["local_backend": raw])
+        }
+    }
+
+    func setLocalModelDir(_ dirPath: String) {
+        self.localModelDir = dirPath
+        let trimmed = dirPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task.detached(priority: .utility) {
+            BackendBridge.shared.updateBackendConfig(body: ["local_model_dir": trimmed])
+        }
+    }
+
+    func setAllowUnverifiedHuggingFace(_ allow: Bool) {
+        self.allowUnverifiedHuggingFace = allow
+        Task.detached(priority: .utility) {
+            BackendBridge.shared.updateBackendConfig(
+                body: [
+                    "allow_unverified_huggingface": allow,
+                    "huggingface_override_acknowledged": allow,
+                    "persist_security_settings": true,
+                ]
+            )
+            let updatedProfile = BackendBridge.shared.fetchHardwareProfile()
+            await MainActor.run {
+                self.hardwareProfile = updatedProfile
+            }
+        }
+    }
+
+    func activateDownloadedModel(_ model: CachedModelStatusModel) {
+        if model.backend == "mlx_local_dir" {
+            self.localBackend = .mlx
+            self.localModelDir = model.localPath
+            self.localModel = model.modelId
+            Task.detached(priority: .utility) {
+                BackendBridge.shared.updateBackendConfig(
+                    body: [
+                        "local_backend": "mlx",
+                        "local_model_dir": model.localPath,
+                        "local_model": model.modelId,
+                    ]
+                )
+            }
+        } else {
+            self.localBackend = .mlx
+            self.localModelDir = ""
+            self.localModel = model.modelId
+            Task.detached(priority: .utility) {
+                BackendBridge.shared.updateBackendConfig(
+                    body: [
+                        "local_backend": "mlx",
+                        "local_model_dir": "",
+                        "local_model": model.modelId,
+                    ]
+                )
+            }
+        }
+    }
+
+    func convertFirstPartyModel(_ repoId: String, qBits: Int = 4) {
+        let cleaned = repoId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty, isPullingModelId == nil else { return }
+        isPullingModelId = cleaned
+        Task.detached(priority: .userInitiated) {
+            let res = BackendBridge.shared.convertFirstPartyLocalModel(repoId: cleaned, qBits: qBits)
+            let updatedProfile = BackendBridge.shared.fetchHardwareProfile()
+            await MainActor.run {
+                self.lastPullResult = res
+                self.hardwareProfile = updatedProfile
+                self.isPullingModelId = nil
+                if res.ok {
+                    self.localBackend = .mlx
+                    self.setLocalModelDir(res.modelId)
+                }
+            }
         }
     }
 
@@ -452,7 +540,7 @@ final class HybridAppViewModel: ObservableObject {
 
     func selectConversation(_ id: String) {
         activeConversationId = id
-        selectedTab = 0
+        selectedSection = .chat
     }
 
     func deleteConversation(_ id: String) {
@@ -747,7 +835,7 @@ final class HybridAppViewModel: ObservableObject {
         promptText = "\(instructionPrefix)\n\n\(baseText)"
         quickAskPrompt = ""
         isShowingQuickAskSpotlight = false
-        selectedTab = 0
+        selectedSection = .chat
         sendChatMessage()
     }
 }
@@ -791,180 +879,168 @@ struct DaemonStatusView: View {
 struct MainDashboardView: View {
     @ObservedObject var vm: HybridAppViewModel
 
+    private var activeWindowTitle: String {
+        switch vm.selectedSection {
+        case .chat:
+            return vm.activeConversation?.title ?? "MacHybridAI"
+        case .history:
+            return "History & iCloud"
+        case .privacyGate:
+            return "Privacy Gate"
+        }
+    }
+
+    private var activeWindowSubtitle: String {
+        switch vm.selectedSection {
+        case .chat:
+            return "\(vm.localBackend.trustBadge) · \(vm.historyStorage.title) · Zero Cloud History"
+        case .history:
+            return "\(vm.conversations.count) saved conversation\(vm.conversations.count == 1 ? "" : "s") · \(vm.historyRetention.displayName)"
+        case .privacyGate:
+            return "On-Device PII Guardian (\(vm.guardianPolicy.displayName))"
+        }
+    }
+
     var body: some View {
         NavigationSplitView {
-            VStack(alignment: .leading, spacing: 12) {
-                // Distinct MacHybridAI Split-Compute Brand Header
-                HStack(spacing: 10) {
-                    HybridBrandEmblemView()
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("MacHybridAI")
-                            .font(.headline.bold())
-                        Text("Local Chip + Privacy Gate + Cloud")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+            List {
+                Section("Workspace") {
+                    ForEach(MainWorkspaceSection.allCases, id: \.self) { section in
+                        Button {
+                            vm.selectedSection = section
+                        } label: {
+                            Label(section.title, systemImage: section.iconName)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.vertical, 2)
+                        }
+                        .buttonStyle(.plain)
+                        .listRowBackground(
+                            vm.selectedSection == section
+                                ? RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.accentColor.opacity(0.22))
+                                : RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.clear)
+                        )
                     }
                 }
-                .padding(.bottom, 2)
 
-                Button {
-                    vm.startNewChat()
-                    vm.selectedTab = 0
-                } label: {
-                    Label("New Hybrid Chat", systemImage: "plus.bubble.fill")
-                        .symbolRenderingMode(.hierarchical)
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .tint(Color(red: 0.18, green: 0.62, blue: 0.74))
-                .keyboardShortcut("n", modifiers: .command)
-                .help("Start a new Local or Hybrid conversation (⌘N)")
-
-                Button {
-                    vm.isShowingQuickAskSpotlight = true
-                } label: {
-                    Label("Quick Ask Spotlight (⌘K)", systemImage: "sparkle.magnifyingglass")
-                        .symbolRenderingMode(.hierarchical)
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.regular)
-                .keyboardShortcut("k", modifiers: .command)
-                .help("Open Floating Spotlight Quick Ask HUD (⌘K)")
-
-                Picker("View", selection: $vm.selectedTab) {
-                    Label("Hybrid Chat", systemImage: "bubble.left.and.text.bubble.right.fill").tag(0)
-                    Label("History & iCloud Sync", systemImage: "clock.arrow.circlepath").tag(1)
-                    Label("Privacy Gate (PII)", systemImage: "key.viewfinder").tag(2)
-                    Label("AI Providers & M365", systemImage: "memorychip").tag(3)
-                }
-                .pickerStyle(.radioGroup)
-                .symbolRenderingMode(.hierarchical)
-
-                Divider()
-
-                // Saved Prompt History Sidebar List
-                HStack {
-                    Label("Saved Chats (\(vm.conversations.count))", systemImage: vm.historyStorage.iconName)
-                        .font(.caption.bold())
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Text(vm.historyRetention.shortBadge)
-                        .font(.system(size: 10, weight: .semibold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(Color.cyan.opacity(0.18)))
-                }
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(vm.filteredConversations) { conv in
-                            HStack(spacing: 6) {
-                                Button {
-                                    vm.selectConversation(conv.id)
-                                } label: {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(conv.title)
-                                            .font(.caption.bold())
-                                            .lineLimit(1)
-                                            .foregroundStyle(.primary)
-                                        HStack(spacing: 4) {
-                                            Image(systemName: conv.storageLocation.iconName)
-                                                .font(.system(size: 9))
-                                            Text(conv.expirationSummary)
-                                                .font(.system(size: 9))
-                                        }
-                                        .foregroundStyle(.secondary)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                Section("Conversations (\(vm.conversations.count))") {
+                    ForEach(vm.filteredConversations) { conv in
+                        Button {
+                            vm.selectConversation(conv.id)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(conv.title)
+                                    .font(.callout)
+                                    .lineLimit(1)
+                                    .foregroundStyle(.primary)
+                                HStack(spacing: 4) {
+                                    Image(systemName: conv.storageLocation.iconName)
+                                        .font(.caption2)
+                                    Text(conv.expirationSummary)
+                                        .font(.caption2)
                                 }
-                                .buttonStyle(.plain)
-
-                                Button {
-                                    vm.deleteConversation(conv.id)
-                                } label: {
-                                    Image(systemName: "trash")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(.secondary)
-                                }
-                                .buttonStyle(.plain)
-                                .help("Delete this conversation from \(conv.storageLocation.title)")
+                                .foregroundStyle(.secondary)
                             }
-                            .padding(8)
-                            .background(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .fill(
-                                        conv.id == vm.activeConversationId
-                                            ? Color.cyan.opacity(0.18)
-                                            : Color.white.opacity(0.03)
-                                    )
-                            )
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 2)
+                        }
+                        .buttonStyle(.plain)
+                        .listRowBackground(
+                            (vm.selectedSection == .chat && conv.id == vm.activeConversationId)
+                                ? RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.accentColor.opacity(0.22))
+                                : RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.clear)
+                        )
+                        .contextMenu {
+                            Button("Open Conversation") {
+                                vm.selectConversation(conv.id)
+                            }
+                            Divider()
+                            Button("Delete Conversation", role: .destructive) {
+                                vm.deleteConversation(conv.id)
+                            }
                         }
                     }
                 }
-
-                Spacer(minLength: 4)
-
-                // Quick History Storage & Auto-Delete Controls Card
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Image(systemName: "externaldrive.badge.icloud")
-                            .foregroundStyle(.cyan)
-                        Text("History Storage & Auto-Delete")
-                            .font(.caption2.bold())
-                    }
-
-                    Picker("Save To", selection: $vm.historyStorage) {
-                        ForEach(HistoryStorageOption.allCases, id: \.self) { opt in
-                            Text(opt.title).tag(opt)
-                        }
-                    }
-                    .controlSize(.small)
-                    .onChange(of: vm.historyStorage) { _, _ in
-                        vm.updateHistorySettings()
-                    }
-
-                    Picker("Retention", selection: $vm.historyRetention) {
-                        ForEach(HistoryRetentionOption.allCases, id: \.self) { ret in
-                            Text(ret.displayName).tag(ret)
-                        }
-                    }
-                    .controlSize(.small)
-                    .onChange(of: vm.historyRetention) { _, _ in
-                        vm.updateHistorySettings()
-                    }
-
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(Color.green)
-                            .frame(width: 6, height: 6)
-                        Text("Cloud AI History: ZERO (store=false)")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(.green)
-                    }
-
-                    // Daemon status indicator
-                    DaemonStatusView()
-                }
-                .padding(10)
-                .appleLiquidGlassCard(cornerRadius: 12, tint: .cyan, tintOpacity: 0.05, borderOpacity: 0.14)
             }
-            .padding(12)
-            .frame(minWidth: 260)
+            .listStyle(.sidebar)
+            .searchable(text: $vm.historySearchQuery, placement: .sidebar, prompt: "Filter conversations")
+            .safeAreaInset(edge: .bottom) {
+                VStack(spacing: 0) {
+                    Divider()
+                    HStack(spacing: 8) {
+                        DaemonStatusView()
+                        Spacer()
+                        SettingsLink {
+                            Label("Settings…", systemImage: "gearshape")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Open MacHybridAI Settings (⌘,)")
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                }
+                .background(.bar)
+            }
+            .navigationSplitViewColumnWidth(min: 220, ideal: 250, max: 320)
         } detail: {
             Group {
-                if vm.selectedTab == 0 {
+                switch vm.selectedSection {
+                case .chat:
                     HybridChatTabView(vm: vm)
-                } else if vm.selectedTab == 1 {
+                case .history:
                     PromptHistoryAndICloudTabView(vm: vm)
-                } else if vm.selectedTab == 2 {
+                case .privacyGate:
                     PrivacyGateTabView(vm: vm)
-                } else {
-                    ProvidersConfigTabView(vm: vm)
                 }
             }
-            .frame(minWidth: 780, minHeight: 620)
+            .frame(minWidth: 740, minHeight: 580)
+            .navigationTitle(activeWindowTitle)
+            .navigationSubtitle(activeWindowSubtitle)
+            .toolbar {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    Picker("Compute Mode", selection: $vm.computeMode) {
+                        ForEach(ComputeModeOption.allCases, id: \.self) { option in
+                            Text(option.title).tag(option)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 240)
+                    .help("Switch between Fully Local (⌘1), Smart Auto (⌘2), and Hybrid (⌘3)")
+
+                    SettingsLink {
+                        Label(
+                            vm.allowUnverifiedHuggingFace
+                                ? "HF Bypass"
+                                : (vm.localBackend == .appleFoundationModels ? "Apple-Signed" : "Strict"),
+                            systemImage: vm.allowUnverifiedHuggingFace
+                                ? "exclamationmark.triangle.fill"
+                                : (vm.localBackend == .appleFoundationModels ? "checkmark.seal.fill" : "lock.shield.fill")
+                        )
+                        .foregroundStyle(vm.allowUnverifiedHuggingFace ? .orange : .green)
+                    }
+                    .help("Model Supply-Chain Security & Preferences (⌘,)")
+
+                    Button {
+                        vm.startNewChat()
+                        vm.selectedSection = .chat
+                    } label: {
+                        Label("New Chat", systemImage: "square.and.pencil")
+                    }
+                    .help("New Conversation (⌘N)")
+
+                    Button {
+                        vm.isShowingQuickAskSpotlight = true
+                    } label: {
+                        Label("Quick Ask", systemImage: "sparkle.magnifyingglass")
+                    }
+                    .help("Quick Ask Spotlight (⌘K)")
+
+                    SettingsLink {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                    .help("Open Preferences (⌘,)")
+                }
+            }
         }
         .sheet(isPresented: $vm.isShowingSanitizationApproval) {
             SanitizationApprovalSheetView(vm: vm)
@@ -1156,57 +1232,35 @@ struct HybridChatTabView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Top Chat Header Bar
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(vm.activeConversation?.title ?? "Hybrid Compute Chat")
-                        .font(.headline.bold())
-                    HStack(spacing: 8) {
-                        Label(
-                            "Saved to: \(vm.historyStorage.title)",
-                            systemImage: vm.historyStorage.iconName
-                        )
-                        .font(.caption2)
-                        .foregroundStyle(.cyan)
-
-                        Text("·")
-                            .foregroundStyle(.secondary)
-
-                        Text(vm.historyRetention.displayName)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-
-                        Text("·")
-                            .foregroundStyle(.secondary)
-
-                        Label("Nothing saved in Cloud AI history", systemImage: "nosign")
-                            .font(.caption2.bold())
-                            .foregroundStyle(.green)
-                    }
-                }
+            // Slim macOS Context Strip (Title & Compute Mode live in the native window toolbar)
+            HStack(spacing: 10) {
+                Label(
+                    vm.computeMode == .local
+                        ? "100% On-Device (\(vm.localBackend.trustBadge))"
+                        : "Privacy Gate Active · Zero Cloud History",
+                    systemImage: vm.computeMode == .local ? "lock.shield.fill" : "checkmark.shield.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.green)
 
                 Spacer()
 
                 if vm.computeMode != .local {
-                    Picker("Cloud", selection: $vm.cloudProvider) {
+                    Picker("Cloud Provider", selection: $vm.cloudProvider) {
                         ForEach(CloudProviderOption.allCases, id: \.self) { provider in
                             Text(provider.displayName).tag(provider)
                         }
                     }
-                    .frame(width: 270)
-                }
-
-                Picker("Mode", selection: $vm.computeMode) {
-                    ForEach(ComputeModeOption.allCases, id: \.self) { option in
-                        Text(option.title).tag(option)
+                    .controlSize(.small)
+                    .frame(width: 280)
+                    .onChange(of: vm.cloudProvider) { _, newProvider in
+                        vm.applyCloudProviderPreset(newProvider)
                     }
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 260)
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
-            .background(Color.white.opacity(0.03))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(.bar)
 
             Divider()
 
@@ -1975,349 +2029,6 @@ struct PrivacyGateTabView: View {
     }
 }
 
-struct ProvidersConfigTabView: View {
-    @ObservedObject var vm: HybridAppViewModel
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Apple Silicon Hardware Profiler & AI Providers")
-                            .font(.title2.bold())
-                        Text("Live Metal working-set profiler, local model cache validator, and hardware-matched model sizing.")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button {
-                        vm.refreshHardwareProfile()
-                    } label: {
-                        Label("Re-Profile Mac Hardware", systemImage: "cpu.fill")
-                    }
-                }
-
-                if let hw = vm.hardwareProfile {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack(spacing: 12) {
-                            Image(systemName: "memorychip.fill")
-                                .font(.title2)
-                                .foregroundStyle(.cyan)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("\(hw.chipBrand) · \(hw.unifiedMemoryGb) GB Unified Memory")
-                                    .font(.headline.bold())
-                                Text("\(hw.cpuCoresTotal) CPU Cores (\(hw.cpuCoresPerformance)P + \(hw.cpuCoresEfficiency)E) · \(hw.gpuCores)-Core GPU (\(hw.gpuArchitecture)) · Tier: \(hw.hardwareTier)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Text(String(format: "Metal Working Set: %.1f GB", hw.metalWorkingSetGb))
-                                .font(.caption.bold())
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 4)
-                                .background(Capsule().fill(Color.cyan.opacity(0.2)))
-                                .foregroundStyle(.cyan)
-                        }
-
-                        HStack(spacing: 16) {
-                            Label("CPU Busy: \(hw.cpuBusyPercent)%", systemImage: "gauge.medium")
-                                .font(.caption)
-                            Label("GPU Busy: \(hw.gpuBusyPercent)% (Renderer \(hw.gpuRendererPercent)%)", systemImage: "sparkles.tv")
-                                .font(.caption)
-                            Label(String(format: "RAM Used: %d%% (%.1f GB free)", hw.memoryUsedPercent, hw.availableMemoryGb), systemImage: "memorychip")
-                                .font(.caption)
-                            Label("Thermal: \(hw.thermalState.capitalized)", systemImage: "thermometer.medium")
-                                .font(.caption)
-                                .foregroundStyle(hw.thermalState == "nominal" ? .green : .orange)
-                            if let kv = hw.recommendedKvBits {
-                                Label("Recommended KV Cache: \(kv)-bit", systemImage: "bolt.horizontal.fill")
-                                    .font(.caption.bold())
-                                    .foregroundStyle(.green)
-                            }
-                        }
-
-                        if hw.guardrailTriggered {
-                            HStack(spacing: 8) {
-                                Image(systemName: "exclamationmark.shield.fill")
-                                    .foregroundStyle(.orange)
-                                Text(hw.guardrailReason)
-                                    .font(.caption2.bold())
-                                    .foregroundStyle(.orange)
-                                Spacer()
-                            }
-                            .padding(8)
-                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.15)))
-                        }
-
-                        // 1-Click Apple Silicon Hardware Benchmark Card
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Label("Apple Silicon Metal Benchmark (TTFT · Prefill · Decode · Peak Memory)", systemImage: "speedometer")
-                                    .font(.caption.bold())
-                                Spacer()
-                                Button(vm.isBenchmarking ? "Benchmarking..." : "Run 1-Click Benchmark") {
-                                    vm.runBenchmark(for: vm.localModel)
-                                }
-                                .controlSize(.small)
-                                .buttonStyle(.borderedProminent)
-                                .disabled(vm.isBenchmarking)
-                            }
-
-                            if let bench = vm.latestBenchmark {
-                                HStack(spacing: 16) {
-                                    Label(String(format: "TTFT: %.1f ms", bench.ttftMs), systemImage: "timer")
-                                        .font(.caption2.bold())
-                                    Label(String(format: "Prefill: %.1f tok/s", bench.prefillTps), systemImage: "bolt.fill")
-                                        .font(.caption2.bold())
-                                        .foregroundStyle(.cyan)
-                                    Label(String(format: "Decode: %.1f tok/s", bench.decodeTps), systemImage: "gauge.with.dots.needle.67percent")
-                                        .font(.caption2.bold())
-                                        .foregroundStyle(.green)
-                                    Label(String(format: "Peak Metal: %.2f GB", bench.peakMemoryGb), systemImage: "memorychip.fill")
-                                        .font(.caption2.bold())
-                                    Text(bench.backend)
-                                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(Capsule().fill(Color.blue.opacity(0.2)))
-                                }
-                            }
-                        }
-                        .padding(10)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.22)))
-
-                        Divider()
-
-                        HStack {
-                            Text("Hardware-Matched Model Sizing & Local Cache Status")
-                                .font(.subheadline.bold())
-                            Spacer()
-                            Button("Refresh Cache") {
-                                vm.refreshHardwareProfile()
-                            }
-                            .controlSize(.mini)
-                        }
-
-                        if let pullRes = vm.lastPullResult {
-                            HStack(spacing: 8) {
-                                Image(systemName: pullRes.isComplete ? "checkmark.circle.fill" : "arrow.down.circle.fill")
-                                    .foregroundStyle(pullRes.isComplete ? .green : .cyan)
-                                Text(pullRes.message)
-                                    .font(.caption2)
-                                Spacer()
-                                if !pullRes.cliCommand.isEmpty {
-                                    Button("Copy CLI Command") {
-                                        NSPasteboard.general.clearContents()
-                                        NSPasteboard.general.setString(pullRes.cliCommand, forType: .string)
-                                    }
-                                    .controlSize(.mini)
-                                }
-                            }
-                            .padding(8)
-                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.cyan.opacity(0.12)))
-                        }
-
-                        ForEach(hw.recommendations) { rec in
-                            HStack(alignment: .top, spacing: 10) {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    HStack(spacing: 6) {
-                                        Text(rec.modelId)
-                                            .font(.system(.caption, design: .monospaced).bold())
-                                        Text("\(rec.parameterCount) · \(rec.quantization)")
-                                            .font(.caption2.bold())
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 2)
-                                            .background(Capsule().fill(Color.purple.opacity(0.2)))
-                                        Text(String(format: "~%.1f GB · %@", rec.estimatedMemoryGb, rec.expectedTpsRange))
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                        if rec.isReadyLocally {
-                                            Text("Cached & Verified")
-                                                .font(.system(size: 9, weight: .bold))
-                                                .padding(.horizontal, 6)
-                                                .padding(.vertical, 2)
-                                                .background(Capsule().fill(Color.green.opacity(0.22)))
-                                                .foregroundStyle(.green)
-                                        } else {
-                                            Text("Weights Not Downloaded")
-                                                .font(.system(size: 9, weight: .semibold))
-                                                .padding(.horizontal, 6)
-                                                .padding(.vertical, 2)
-                                                .background(Capsule().fill(Color.orange.opacity(0.2)))
-                                                .foregroundStyle(.orange)
-                                        }
-                                    }
-                                    Text(rec.rationale)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                if !rec.isReadyLocally {
-                                    Button(vm.isPullingModelId == rec.modelId ? "Pulling..." : "Download / Verify") {
-                                        vm.verifyOrPullModel(rec.modelId, allowDownload: true)
-                                    }
-                                    .controlSize(.small)
-                                    .disabled(vm.isPullingModelId != nil)
-                                }
-                                Button(vm.localModel == rec.modelId ? "Active" : "Use Model") {
-                                    vm.selectRecommendedModel(rec.modelId)
-                                }
-                                .controlSize(.small)
-                                .disabled(!rec.fitsInMetalBudget)
-                            }
-                            .padding(8)
-                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.03)))
-                        }
-                    }
-                    .padding(14)
-                    .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.05)))
-                }
-
-                // Developer OpenAI-Compatible Local Proxy Endpoint Card
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Label("Drop-In OpenAI-Compatible Local Proxy (/v1/chat/completions & /v1/models)", systemImage: "network.badge.shield.half.filled")
-                            .font(.subheadline.bold())
-                            .foregroundStyle(.cyan)
-                        Spacer()
-                        Button("Copy OpenAI Base URL") {
-                            let portStr: String
-                            if case .running(let p) = DaemonManager.shared.state {
-                                portStr = "\(p)"
-                            } else {
-                                portStr = "8765"
-                            }
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString("http://127.0.0.1:\(portStr)/v1", forType: .string)
-                        }
-                        .controlSize(.small)
-                    }
-                    Text("Point Cursor, Continue.dev, Zed, or any OpenAI SDK client to MacHybridAI's local loopback proxy for automatic Station 2 PII scrubbing, PIIVault rehydration, and cryptographic SHA-256 receipts.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    HStack(spacing: 8) {
-                        ForEach(["machybrid-auto", "machybrid-local", "machybrid-openai", "machybrid-claude", "machybrid-consensus"], id: \.self) { m in
-                            Text(m)
-                                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 3)
-                                .background(Capsule().fill(Color.cyan.opacity(0.16)))
-                                .foregroundStyle(.cyan)
-                        }
-                    }
-                }
-                .padding(14)
-                .appleLiquidGlassCard(cornerRadius: 12, tint: .cyan, tintOpacity: 0.05, borderOpacity: 0.14)
-
-                // Universal Cloud AI Service Hub (OpenAI, Claude, Gemini, OpenRouter, xAI, Groq, DeepSeek, Mistral, Perplexity, Together, Azure/Custom)
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Label("Universal Cloud AI Hub — Connect Any Cloud AI Service Behind Privacy Gate", systemImage: "cloud.bolt.fill")
-                            .font(.subheadline.bold())
-                            .foregroundStyle(.purple)
-                        Spacer()
-                        Button("Apply & Sync Cloud Provider") {
-                            vm.syncCloudProviderConfiguration()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                        .tint(.purple)
-                    }
-                    Text("Click any cloud AI service preset below (or enter a custom OpenAI / Anthropic / Azure endpoint). Station 2 Privacy Gate automatically scrubs PII on-device before calling the selected cloud provider and restores real values at Station 4.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
-                            ForEach(CloudProviderOption.allCases, id: \.self) { provider in
-                                Button {
-                                    vm.applyCloudProviderPreset(provider)
-                                } label: {
-                                    Text(provider.shortName)
-                                        .font(.system(size: 11, weight: .semibold))
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 5)
-                                        .background(
-                                            Capsule().fill(
-                                                vm.cloudProvider == provider
-                                                    ? Color.purple.opacity(0.45)
-                                                    : Color.white.opacity(0.08)
-                                            )
-                                        )
-                                        .overlay(
-                                            Capsule().strokeBorder(
-                                                vm.cloudProvider == provider ? Color.purple : Color.clear,
-                                                lineWidth: 1
-                                            )
-                                        )
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                    }
-
-                    HStack(spacing: 8) {
-                        SecureField("Optional In-Memory API Key for \(vm.cloudProvider.shortName) (or set \(vm.cloudProvider.apiKeyEnvName))", text: $vm.cloudApiKeyInput)
-                            .textFieldStyle(.roundedBorder)
-                        Button("Load Key (RAM Only)") {
-                            vm.syncCloudProviderConfiguration()
-                        }
-                        .controlSize(.small)
-                    }
-
-                    if !vm.providerSyncStatus.isEmpty {
-                        Label(vm.providerSyncStatus, systemImage: "checkmark.circle.fill")
-                            .font(.caption2.bold())
-                            .foregroundStyle(.green)
-                    }
-                }
-                .padding(14)
-                .appleLiquidGlassCard(cornerRadius: 12, tint: .purple, tintOpacity: 0.06, borderOpacity: 0.16)
-
-                Form {
-                    Section("On-Device Local Model (This Mac — Apple Silicon Metal / MLX)") {
-                        TextField("Active Local Model Identifier (MLX / LiteRT / Ollama)", text: $vm.localModel)
-                            .onChange(of: vm.localModel) { _, newValue in
-                                vm.selectRecommendedModel(newValue)
-                            }
-                        TextField("Local OpenAI-Compatible Endpoint", text: $vm.localEndpoint)
-                    }
-
-                    Section("OpenAI, OpenRouter, xAI Grok, Groq, DeepSeek, Mistral, Perplexity, Together & Custom Cloud AI") {
-                        Picker("API Wire Protocol", selection: $vm.customProviderProtocol) {
-                            ForEach(CustomCloudProtocolOption.allCases, id: \.self) { proto in
-                                Text(proto.displayName).tag(proto)
-                            }
-                        }
-                        TextField("Cloud Service Base URL (e.g. https://api.openai.com/v1 or Azure URL)", text: $vm.openAIBaseURL)
-                        TextField("Model Identifier (e.g. gpt-4.1, o3-mini, grok-3, deepseek-reasoner)", text: $vm.openAIModel)
-                        TextField("Auth Header (Authorization, x-api-key, or api-key for Azure)", text: $vm.customProviderAuthHeader)
-                    }
-
-                    Section("Anthropic Claude (Native Messages API — /v1/messages)") {
-                        TextField("Claude Model (e.g. claude-sonnet-4-5, claude-opus-4-1, claude-haiku-4-5)", text: $vm.anthropicModel)
-                        TextField("Anthropic Base URL (default: https://api.anthropic.com/v1)", text: $vm.anthropicBaseURL)
-                    }
-
-                    Section("Google Gemini & Antigravity (Stateless store=false)") {
-                        TextField("Gemini Model (Interactions API)", text: $vm.geminiModel)
-                        TextField("Antigravity Managed Agent ID", text: $vm.antigravityAgent)
-                    }
-
-                    Section("Microsoft 365 Copilot Proxy (cramt/m365-copilot-proxy · Temporary Chat Locked)") {
-                        TextField("Proxy Loopback Port", text: $vm.m365Port)
-                        TextField("M365 Tone / Model (Recommended: gpt-5.5-think-deeper)", text: $vm.m365Model)
-                        Toggle("Interactive Browser SSO/MFA Approval (M365_ENABLE_INTERACTIVE_APPROVAL=1)", isOn: $vm.m365InteractiveApproval)
-                        Toggle("Avoid PerUserThrottled Reserve Guard (M365_AVOID_THROTTLING=1)", isOn: $vm.m365AvoidThrottling)
-                    }
-                }
-                .formStyle(.grouped)
-            }
-            .padding(20)
-        }
-    }
-}
-
 /// Distinct Menu Bar Quick-Chat & Hybrid Compute Control Panel
 struct MenuBarHybridPanelView: View {
     @ObservedObject var vm: HybridAppViewModel
@@ -2473,13 +2184,18 @@ struct MenuBarHybridPanelView: View {
             HStack {
                 Button("New Chat") {
                     vm.startNewChat()
+                    vm.selectedSection = .chat
                 }
                 Spacer()
-                Button("Open Studio") {
+                SettingsLink {
+                    Text("Settings…")
+                }
+                Spacer()
+                Button("Open Window") {
                     NSApplication.shared.activate(ignoringOtherApps: true)
                 }
                 Spacer()
-                Button("Quit MacHybridAI") {
+                Button("Quit") {
                     DaemonManager.shared.stop()
                     NSApplication.shared.terminate(nil)
                 }
@@ -2496,22 +2212,133 @@ final class MacHybridAppDelegate: NSObject, NSApplicationDelegate {
         // Ensure all local MLX / Ollama models, Metal caches, m365-proxy, and the Python daemon quit with the app
         DaemonManager.shared.stop()
     }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            for window in sender.windows {
+                window.makeKeyAndOrderFront(nil)
+            }
+        }
+        return true
+    }
 }
 
 @main
+enum MacHybridAIEntrypoint {
+    static func main() {
+        if let exitCode = AppleFoundationModelsEngine.handleHeadlessCommandIfPresent(
+            arguments: CommandLine.arguments
+        ) {
+            exit(exitCode)
+        }
+        MacHybridAIApp.main()
+    }
+}
+
 struct MacHybridAIApp: App {
     @NSApplicationDelegateAdaptor(MacHybridAppDelegate.self) private var appDelegate
     @StateObject private var viewModel = HybridAppViewModel()
+    @AppStorage("appAppearance") private var appAppearanceRaw: String = AppAppearanceOption.system.rawValue
+
+    private var preferredColorScheme: ColorScheme? {
+        switch AppAppearanceOption(rawValue: appAppearanceRaw) ?? .system {
+        case .system: return nil
+        case .light: return .light
+        case .dark: return .dark
+        }
+    }
 
     var body: some Scene {
-        WindowGroup("MacHybridAI — Hybrid Compute Chat & Privacy Gate") {
+        WindowGroup("MacHybridAI") {
             MainDashboardView(vm: viewModel)
-                .preferredColorScheme(.dark)
+                .preferredColorScheme(preferredColorScheme)
         }
         .windowStyle(.titleBar)
+        .windowToolbarStyle(.unified)
+        .defaultSize(width: 1120, height: 740)
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("New Conversation") {
+                    viewModel.startNewChat()
+                    viewModel.selectedSection = .chat
+                }
+                .keyboardShortcut("n", modifiers: .command)
+
+                Button("Quick Ask Spotlight…") {
+                    viewModel.isShowingQuickAskSpotlight = true
+                }
+                .keyboardShortcut("k", modifiers: .command)
+
+                Divider()
+
+                Button("Attach Local File…") {
+                    viewModel.attachFileViaPanel()
+                }
+                .keyboardShortcut("o", modifiers: .command)
+
+                Button("Import & Scrub PDF / Image (Vision OCR)…") {
+                    viewModel.importAndScrubFileViaVisionOCR()
+                }
+                .keyboardShortcut("o", modifiers: [.command, .shift])
+            }
+
+            CommandMenu("Compute") {
+                Button("Fully Local Mode") {
+                    viewModel.computeMode = .local
+                }
+                .keyboardShortcut("1", modifiers: .command)
+
+                Button("Smart Auto Mode") {
+                    viewModel.computeMode = .auto
+                }
+                .keyboardShortcut("2", modifiers: .command)
+
+                Button("Hybrid Mode (Privacy Gate + Cloud)") {
+                    viewModel.computeMode = .hybrid
+                }
+                .keyboardShortcut("3", modifiers: .command)
+
+                Divider()
+
+                Toggle(
+                    "Approve Sanitized Prompt Before Cloud Dispatch",
+                    isOn: $viewModel.approveBeforeCloudDispatch
+                )
+
+                Divider()
+
+                Button("Re-Profile Apple Silicon Hardware") {
+                    viewModel.refreshHardwareProfile()
+                }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+            }
+
+            CommandMenu("Navigate") {
+                Button("Hybrid Chat") {
+                    viewModel.selectedSection = .chat
+                }
+                .keyboardShortcut("1", modifiers: [.command, .option])
+
+                Button("History & iCloud") {
+                    viewModel.selectedSection = .history
+                }
+                .keyboardShortcut("2", modifiers: [.command, .option])
+
+                Button("Privacy Gate Inspector") {
+                    viewModel.selectedSection = .privacyGate
+                }
+                .keyboardShortcut("3", modifiers: [.command, .option])
+            }
+        }
+
+        Settings {
+            MacHybridSettingsView(vm: viewModel)
+                .preferredColorScheme(preferredColorScheme)
+        }
 
         MenuBarExtra {
             MenuBarHybridPanelView(vm: viewModel)
+                .preferredColorScheme(preferredColorScheme)
         } label: {
             HStack(spacing: 4) {
                 Image(nsImage: HybridBrandIconGenerator.makeMenuBarIcon())

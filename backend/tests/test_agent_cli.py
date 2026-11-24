@@ -382,6 +382,64 @@ class TestHybridCLIAgentAndEndToEnd(unittest.TestCase):
             HardwareProfiler._mlx_lm_module = orig_lm
             HardwareProfiler._mlx_probe_error = orig_err
 
+    def test_cli_continue_and_conversation_uuid_resume_and_sessions_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "repo"
+            ws.mkdir()
+            (ws / "README.md").write_text("# Demo\n", encoding="utf-8")
+            sessions_dir = Path(tmp) / "cli_sessions"
+
+            with patch.dict(os.environ, {"MACHYBRID_SESSIONS_DIR": str(sessions_dir)}):
+                # 1. First turn creates a persisted conversation UUID and prints resume hint
+                buf_human = io.StringIO()
+                with redirect_stdout(buf_human):
+                    rc = main(["--workspace", str(ws), "list the files in this directory"])
+                self.assertEqual(rc, 0)
+                human_out = buf_human.getvalue()
+                self.assertIn("Resume with -c (or command below):", human_out)
+                self.assertIn("machybrid --conversation=", human_out)
+
+                # Extract conversation ID via `machybrid sessions --json`
+                buf_sess = io.StringIO()
+                with redirect_stdout(buf_sess):
+                    rc = main(["--json", "sessions"])
+                self.assertEqual(rc, 0)
+                sess_data = json.loads(buf_sess.getvalue())
+                self.assertEqual(len(sess_data["sessions"]), 1)
+                conv_id = sess_data["sessions"][0]["conversation_id"]
+                self.assertEqual(sess_data["sessions"][0]["turn_count"], 1)
+
+                # 2. Resume latest via `-c`
+                buf_c = io.StringIO()
+                with redirect_stdout(buf_c):
+                    rc = main(["-c", "--workspace", str(ws), "--json", "ls"])
+                self.assertEqual(rc, 0)
+                res_c = json.loads(buf_c.getvalue())
+                self.assertEqual(res_c["conversation_id"], conv_id)
+
+                # 3. Resume explicitly via `--conversation=<uuid>`
+                buf_explicit = io.StringIO()
+                with redirect_stdout(buf_explicit):
+                    rc = main([f"--conversation={conv_id}", "--workspace", str(ws), "--json", "list files"])
+                self.assertEqual(rc, 0)
+                res_exp = json.loads(buf_explicit.getvalue())
+                self.assertEqual(res_exp["conversation_id"], conv_id)
+
+                # Verify all 3 turns are persisted in the same conversation
+                buf_sess2 = io.StringIO()
+                with redirect_stdout(buf_sess2):
+                    rc = main(["--json", "sessions"])
+                self.assertEqual(rc, 0)
+                sess_data2 = json.loads(buf_sess2.getvalue())
+                self.assertEqual(sess_data2["sessions"][0]["turn_count"], 3)
+
+                # 4. Path-traversal or invalid conversation ID is strictly rejected
+                buf_bad = io.StringIO()
+                with redirect_stdout(buf_bad):
+                    rc = main(["--conversation=../../etc/passwd", "--json", "ls"])
+                self.assertEqual(rc, 1)
+                self.assertIn("Invalid conversation ID", buf_bad.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

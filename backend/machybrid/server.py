@@ -25,12 +25,14 @@ from . import __version__
 from .guardian import GuardianPolicy
 from .history import HistoryRetentionPolicy, HistoryStorageLocation
 from .m365_proxy import M365ToolEmulator
+from .model_security import load_model_lockfile
 from .orchestrator import ComputeMode, HybridOrchestrator
 from .profiler import HardwareProfiler
 from .providers import (
     MLX_DEFAULT_MODEL,
     MLX_FALLBACK_MODEL,
     MLX_LARGE_MODEL_MIN_MEMORY_GB,
+    AppleFoundationModelsProvider,
     MLXProvider,
 )
 
@@ -241,7 +243,11 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
         if use_local_only and MLXProvider.is_available():
             t0 = time.monotonic()
             mlx_model = body.get("mlx_model") or self.orchestrator.config.local_model or None
-            provider = MLXProvider(model=mlx_model)
+            provider = MLXProvider(
+                model=mlx_model,
+                security_settings=self.orchestrator.get_model_security_settings(),
+                local_model_dir=self.orchestrator.config.local_model_dir,
+            )
             _, is_complete, _, _, _ = HardwareProfiler.inspect_hf_model_cache(provider.model_id)
 
             full_local_prompt = redaction.sanitized_text
@@ -453,7 +459,9 @@ def dispatch_request(
                 "backend": "Apple MLX (ANE + Metal)" if available else "unavailable",
             }
         if path == "/v1/hardware/profile":
-            return HTTPStatus.OK, HardwareProfiler.profile().to_dict()
+            return HTTPStatus.OK, HardwareProfiler.profile(
+                security_settings=orchestrator.get_model_security_settings()
+            ).to_dict()
         if path == "/v1/providers":
             return HTTPStatus.OK, {
                 "active_provider": orchestrator.config.cloud_provider,
@@ -506,6 +514,18 @@ def dispatch_request(
                         "description": "Multi-Cloud Consensus Arena (Gemini + Claude + OpenAI) with On-Device PII Guardian",
                     },
                 ],
+            }
+        if path == "/v1/security/models":
+            policy_cfg = orchestrator.get_model_security_settings()
+            fm_ok, fm_reason = AppleFoundationModelsProvider.check_availability()
+            locked = load_model_lockfile()
+            return HTTPStatus.OK, {
+                "security": policy_cfg.to_dict(),
+                "apple_foundation_models": {
+                    "available": fm_ok,
+                    "reason": fm_reason,
+                },
+                "pinned_models": sorted(locked.keys()),
             }
         return HTTPStatus.NOT_FOUND, {"error": f"Unknown path: {path}"}
 
@@ -799,11 +819,26 @@ def dispatch_request(
             if not req_model:
                 return HTTPStatus.BAD_REQUEST, {"error": "model_id is required"}
             allow_dl = bool(payload_in.get("allow_download", False))
+            auto_pin = bool(payload_in.get("auto_pin", True))
             pull_res = HardwareProfiler.pull_or_verify_model(
                 model_id=req_model,
                 allow_network_download=allow_dl,
+                security_settings=orchestrator.get_model_security_settings(),
+                auto_pin=auto_pin,
             )
             return HTTPStatus.OK, pull_res
+
+        if path == "/v1/hardware/models/convert":
+            req_model = str(payload_in.get("model_id", "")).strip()
+            if not req_model:
+                return HTTPStatus.BAD_REQUEST, {"error": "model_id is required"}
+            q_bits = int(payload_in.get("q_bits", 4))
+            conv_res = HardwareProfiler.convert_first_party_to_local_mlx(
+                repo_id=req_model,
+                q_bits=q_bits,
+                security_settings=orchestrator.get_model_security_settings(),
+            )
+            return HTTPStatus.OK, conv_res
 
         if path == "/v1/shutdown":
             return HTTPStatus.OK, orchestrator.shutdown_all_local_resources()
