@@ -814,10 +814,15 @@ public final class BackendBridge: Sendable {
         )
     }
 
-    public func pullOrVerifyLocalModel(modelId: String, allowDownload: Bool = false) -> ModelPullResultModel {
+    public func pullOrVerifyLocalModel(
+        modelId: String,
+        allowDownload: Bool = false,
+        autoPin: Bool = true
+    ) -> ModelPullResultModel {
         let body: [String: Any] = [
             "model_id": modelId,
             "allow_download": allowDownload,
+            "auto_pin": autoPin,
         ]
         if let data = invoke(method: "POST", path: "/v1/hardware/models/pull", body: body),
            let decoded = try? JSONDecoder().decode(ModelPullResultModel.self, from: data) {
@@ -832,8 +837,46 @@ public final class BackendBridge: Sendable {
             sizeGb: 4.0,
             missingShards: 1,
             status: "not_cached",
-            message: "Run: huggingface-cli download \(modelId)",
-            cliCommand: "huggingface-cli download \(modelId)"
+            message: "Run: machybrid pull \(modelId)",
+            cliCommand: "machybrid pull \(modelId)"
+        )
+    }
+
+    public func convertFirstPartyLocalModel(repoId: String, qBits: Int = 4) -> ModelPullResultModel {
+        let body: [String: Any] = [
+            "model_id": repoId,
+            "q_bits": qBits,
+        ]
+        if let data = invoke(method: "POST", path: "/v1/hardware/models/convert", body: body),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            let ok = (json["ok"] as? Bool) ?? false
+            let outModel = (json["model_id"] as? String) ?? repoId
+            let status = (json["status"] as? String) ?? (ok ? "ready_local_quantized" : "convert_failed")
+            let msg = (json["message"] as? String) ?? ""
+            return ModelPullResultModel(
+                ok: ok,
+                modelId: outModel,
+                backend: "mlx_local_dir",
+                isCached: ok,
+                isComplete: ok,
+                sizeGb: 0.0,
+                missingShards: ok ? 0 : 1,
+                status: status,
+                message: msg,
+                cliCommand: "machybrid pull \(repoId) --convert-local --q-bits \(qBits)"
+            )
+        }
+        return ModelPullResultModel(
+            ok: false,
+            modelId: repoId,
+            backend: "mlx_local_dir",
+            isCached: false,
+            isComplete: false,
+            sizeGb: 0.0,
+            missingShards: 1,
+            status: "convert_failed",
+            message: "Local quantization requires backend daemon and mlx-lm installed.",
+            cliCommand: "machybrid pull \(repoId) --convert-local --q-bits \(qBits)"
         )
     }
 

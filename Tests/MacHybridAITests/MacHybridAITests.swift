@@ -227,4 +227,22 @@ struct MacHybridAITests {
         #expect(CustomCloudProtocolOption.allCases.contains(.openai))
         #expect(CustomCloudProtocolOption.allCases.contains(.anthropic))
     }
+
+    @Test("Apple Foundation Models engine & LocalBackendOption supply-chain trust badges")
+    func testAppleFoundationModelsAndLocalBackendSupplyChainOptions() {
+        #expect(LocalBackendOption.allCases.contains(.appleFoundationModels))
+        #expect(LocalBackendOption.appleFoundationModels.rawValue == "apple_fm")
+        #expect(LocalBackendOption.appleFoundationModels.displayName.contains("Apple-Signed"))
+        #expect(LocalBackendOption.appleFoundationModels.displayName.contains("Zero Hugging Face"))
+
+        let report = AppleFoundationModelsEngine.checkAvailability()
+        #expect(report.modelName.contains("Apple On-Device Foundation Model"))
+        #expect(report.signer.contains("Apple Inc."))
+        #expect(!report.reason.isEmpty)
+
+        // Verify native macOS HIG navigation sections & appearance options
+        #expect(MainWorkspaceSection.allCases == [.chat, .history, .privacyGate])
+        #expect(AppAppearanceOption.allCases == [.system, .light, .dark])
+        #expect(AppAppearanceOption.system.displayName.contains("macOS"))
+    }
 }

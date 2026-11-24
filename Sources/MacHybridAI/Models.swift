@@ -1,5 +1,41 @@
 import Foundation
 
+public enum AppAppearanceOption: String, CaseIterable, Codable, Sendable {
+    case system = "system"
+    case light = "light"
+    case dark = "dark"
+
+    public var displayName: String {
+        switch self {
+        case .system: return "Match macOS System"
+        case .light: return "Light"
+        case .dark: return "Dark"
+        }
+    }
+}
+
+public enum MainWorkspaceSection: String, CaseIterable, Hashable, Sendable {
+    case chat = "chat"
+    case history = "history"
+    case privacyGate = "privacy_gate"
+
+    public var title: String {
+        switch self {
+        case .chat: return "Hybrid Chat"
+        case .history: return "History & iCloud"
+        case .privacyGate: return "Privacy Gate"
+        }
+    }
+
+    public var iconName: String {
+        switch self {
+        case .chat: return "bubble.left.and.text.bubble.right"
+        case .history: return "clock.arrow.circlepath"
+        case .privacyGate: return "key.viewfinder"
+        }
+    }
+}
+
 public enum ComputeModeOption: String, CaseIterable, Codable, Sendable {
     case local = "local"
     case auto = "auto"
@@ -33,6 +69,35 @@ public enum CustomCloudProtocolOption: String, CaseIterable, Codable, Sendable {
         switch self {
         case .openai: return "OpenAI Compatible (/chat/completions)"
         case .anthropic: return "Anthropic Messages (/v1/messages)"
+        }
+    }
+}
+
+public enum LocalBackendOption: String, CaseIterable, Codable, Sendable {
+    case appleFoundationModels = "apple_fm"
+    case mlx = "mlx"
+    case litert = "litert"
+    case ollama = "ollama"
+
+    public var displayName: String {
+        switch self {
+        case .appleFoundationModels:
+            return "Apple Foundation Models (Apple-Signed · Zero Hugging Face)"
+        case .mlx:
+            return "Apple Silicon MLX (Verified Local / First-Party Weights)"
+        case .litert:
+            return "Google LiteRT-LM (Local .litertlm Bundle)"
+        case .ollama:
+            return "Ollama Local Server (127.0.0.1:11434)"
+        }
+    }
+
+    public var trustBadge: String {
+        switch self {
+        case .appleFoundationModels: return "Apple-Signed OS Model"
+        case .mlx: return "Local MLX (Supply-Chain Audited)"
+        case .litert: return "Local Offline Bundle"
+        case .ollama: return "Local Loopback Server"
         }
     }
 }
@@ -636,6 +701,24 @@ public struct CachedModelStatusModel: Identifiable, Codable, Sendable, Equatable
     public let sizeBytes: Int
     public let localPath: String
     public let missingShards: Int
+    public let publisherTrust: String
+    public let isPinned: Bool
+    public let isUsable: Bool
+    public let usabilityNote: String
+
+    public var sizeGbFormatted: String {
+        guard sizeBytes > 0 else { return String(format: "~%.1f GB", estimatedMemoryGb) }
+        return String(format: "%.2f GB", Double(sizeBytes) / 1_073_741_824.0)
+    }
+
+    public var trustDisplayLabel: String {
+        switch publisherTrust {
+        case "apple_signed": return "Apple-Signed"
+        case "local_verified_dir": return "Verified Local Folder"
+        case "first_party": return "First-Party"
+        default: return isPinned ? "SHA-256 Pinned" : "Community HF"
+        }
+    }
 
     public init(
         modelId: String,
@@ -647,7 +730,11 @@ public struct CachedModelStatusModel: Identifiable, Codable, Sendable, Equatable
         isComplete: Bool,
         sizeBytes: Int,
         localPath: String,
-        missingShards: Int = 0
+        missingShards: Int = 0,
+        publisherTrust: String = "community_unverified",
+        isPinned: Bool = false,
+        isUsable: Bool = true,
+        usabilityNote: String = ""
     ) {
         self.modelId = modelId
         self.backend = backend
@@ -659,6 +746,28 @@ public struct CachedModelStatusModel: Identifiable, Codable, Sendable, Equatable
         self.sizeBytes = sizeBytes
         self.localPath = localPath
         self.missingShards = missingShards
+        self.publisherTrust = publisherTrust
+        self.isPinned = isPinned
+        self.isUsable = isUsable
+        self.usabilityNote = usabilityNote
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        modelId = try c.decode(String.self, forKey: .modelId)
+        backend = try c.decode(String.self, forKey: .backend)
+        parameterCount = try c.decode(String.self, forKey: .parameterCount)
+        quantization = try c.decode(String.self, forKey: .quantization)
+        estimatedMemoryGb = try c.decode(Double.self, forKey: .estimatedMemoryGb)
+        isCached = try c.decode(Bool.self, forKey: .isCached)
+        isComplete = try c.decode(Bool.self, forKey: .isComplete)
+        sizeBytes = try c.decode(Int.self, forKey: .sizeBytes)
+        localPath = try c.decode(String.self, forKey: .localPath)
+        missingShards = try c.decodeIfPresent(Int.self, forKey: .missingShards) ?? 0
+        publisherTrust = try c.decodeIfPresent(String.self, forKey: .publisherTrust) ?? "community_unverified"
+        isPinned = try c.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+        isUsable = try c.decodeIfPresent(Bool.self, forKey: .isUsable) ?? isComplete
+        usabilityNote = try c.decodeIfPresent(String.self, forKey: .usabilityNote) ?? ""
     }
 
     enum CodingKeys: String, CodingKey {
@@ -672,6 +781,10 @@ public struct CachedModelStatusModel: Identifiable, Codable, Sendable, Equatable
         case sizeBytes = "size_bytes"
         case localPath = "local_path"
         case missingShards = "missing_shards"
+        case publisherTrust = "publisher_trust"
+        case isPinned = "is_pinned"
+        case isUsable = "is_usable"
+        case usabilityNote = "usability_note"
     }
 }
 

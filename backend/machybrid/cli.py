@@ -16,13 +16,21 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import __version__
-from .agent import AgentRunResult, HybridCLIAgent, diagnose_cli_permissions
+from .agent import AgentRunResult, CLISessionStore, HybridCLIAgent, diagnose_cli_permissions
 from .guardian import GuardianPolicy
+from .model_security import (
+    HUGGINGFACE_BYPASS_WARNING,
+    audit_model_directory,
+    load_model_lockfile,
+    pin_model_to_lockfile,
+)
 from .orchestrator import ComputeMode, HybridOrchestrator
 from .profiler import HardwareProfiler
+from .providers import AppleFoundationModelsProvider
 from .server import create_server
 
 
@@ -84,19 +92,24 @@ def _print_banner(
     )
     mode_str = orchestrator.config.compute_mode.value.upper()
     prov_str = orchestrator.config.cloud_provider
+    sec = orchestrator.get_model_security_settings()
     flags: List[str] = ["Zero Cloud History (store=false)"]
     if plan_mode:
         flags.append("PLAN MODE (Read-Only)")
     if approve_cloud:
         flags.append("CLOUD DIFF GATE ON")
     print(
-        f"  Mode     : {ansi.cyan(mode_str)}  ·  Cloud: {ansi.magenta(prov_str)}  ·  "
-        + ansi.green(" · ".join(flags))
+        f"  Mode     : {ansi.cyan(mode_str)}  ·  Local: {ansi.cyan(orchestrator.config.local_backend)}  ·  "
+        f"Cloud: {ansi.magenta(prov_str)}  ·  " + ansi.green(" · ".join(flags))
     )
+    if sec.allow_unverified_huggingface:
+        print(ansi.yellow("  Security : WARNING — Unverified Hugging Face Supply-Chain Bypass ACTIVE (/security revoke-hf to disable)"))
+    else:
+        print(ansi.green(f"  Security : Strict Model Supply-Chain Protection ACTIVE ({sec.policy.value})"))
     print(
         ansi.dim(
             "  Type a goal or /help for slash commands "
-            "(/ls, /read, /search, /doctor, /mode, /provider, /plan, /hardware, /quit).\n"
+            "(/ls, /read, /search, /doctor, /security, /mode, /provider, /plan, /hardware, /quit).\n"
         )
     )
 
@@ -189,6 +202,77 @@ def _print_hardware_summary(ansi: _ANSI) -> None:
     print()
 
 
+def _print_resume_hint(ansi: _ANSI, conversation_id: str) -> None:
+    if not conversation_id:
+        return
+    print(ansi.dim("\nResume with -c (or command below):"))
+    print(ansi.cyan(f"machybrid --conversation={conversation_id}"))
+
+
+def _print_sessions_table(ansi: _ANSI, store: CLISessionStore) -> List[Dict[str, Any]]:
+    rows = store.list_sessions(limit=20)
+    if not rows:
+        print(ansi.dim("\n  No saved CLI conversations yet.\n"))
+        return rows
+    print(ansi.bold("\nRecent Local CLI Conversations (100% On-Device):"))
+    for row in rows:
+        cid = row["conversation_id"]
+        turns = row["turn_count"]
+        ws_name = os.path.basename(row["workspace"]) or row["workspace"]
+        updated = row["updated_at"][:19].replace("T", " ")
+        preview = row["preview"] or "(no turns)"
+        print(
+            f"  {ansi.cyan(cid)}  "
+            f"{ansi.dim(updated)}  "
+            f"{ansi.bold(ws_name)} ({turns} turn{'s' if turns != 1 else ''})"
+        )
+        print(ansi.dim(f"      {preview}"))
+    print(ansi.dim("\n  Resume latest with `machybrid -c` or any session with `machybrid --conversation=<id>`.\n"))
+    return rows
+
+
+def _print_security_status(ansi: _ANSI, orchestrator: HybridOrchestrator) -> Dict[str, Any]:
+    sec = orchestrator.get_model_security_settings()
+    fm_ok, fm_reason = AppleFoundationModelsProvider.check_availability()
+    lock_path = Path(sec.lockfile_path) if sec.lockfile_path else None
+    locked = load_model_lockfile(lock_path)
+    summary = {
+        "security": sec.to_dict(),
+        "local_backend": orchestrator.config.local_backend,
+        "apple_foundation_models": {"available": fm_ok, "reason": fm_reason},
+        "pinned_models": sorted(locked.keys()),
+    }
+    print(ansi.bold("\nMacHybridAI Model Supply-Chain Security Status:"))
+    policy_badge = (
+        ansi.yellow("BYPASS ENABLED (UNVERIFIED HUGGING FACE ALLOWED)")
+        if sec.allow_unverified_huggingface
+        else ansi.green(f"STRICT PROTECTION ACTIVE ({sec.policy.value})")
+    )
+    print(f"  Policy         : {policy_badge}")
+    print(f"  Local Backend  : {ansi.cyan(orchestrator.config.local_backend)}")
+    fm_badge = ansi.green("AVAILABLE") if fm_ok else ansi.dim("UNAVAILABLE")
+    print(f"  Apple FM (OS)  : {fm_badge} — {fm_reason}")
+    print(f"  Local Dir      : {sec.local_model_dir or '(not set — use --local-model-dir to skip Hugging Face)'}")
+    print("  Hard Locks     : trust_remote_code=False · .py/.bin/.pt/.pkl/.so/.dylib BLOCKED · auto_map & SSTI BLOCKED")
+    print(f"  Trusted Orgs   : {', '.join(summary['security']['trusted_publishers'])}")
+    print(f"  SHA-256 Pins   : {len(locked)} model(s) ({', '.join(sorted(locked.keys())) or 'none'})")
+    if sec.allow_unverified_huggingface:
+        print(ansi.yellow(f"\n  {HUGGINGFACE_BYPASS_WARNING}"))
+    print()
+    return summary
+
+
+def _confirm_huggingface_bypass_interactive(ansi: _ANSI) -> bool:
+    print(ansi.yellow(f"\n  [SECURITY WARNING]\n  {HUGGINGFACE_BYPASS_WARNING}\n"))
+    try:
+        answer = input(
+            ansi.bold("  Type 'I ACCEPT THE RISK' to enable unverified Hugging Face bypass (anything else cancels): ")
+        ).strip()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer == "I ACCEPT THE RISK"
+
+
 def _print_doctor_report(
     ansi: _ANSI,
     workspace_root: str,
@@ -263,7 +347,9 @@ def handle_slash_command(
             + "  /read <path> [start] [end] Instantly read a workspace file with line numbers\n"
             + "  /search <query>            Instantly search code across workspace files\n"
             + "  /run <command>             Run a shell command in workspace (respects Plan Mode & approvals)\n"
-            + "  /doctor                    Run macOS permissions, TCC, MLX/Metal & cache diagnostics\n"
+            + "  /doctor                    Run macOS permissions, TCC, MLX/Metal & supply-chain diagnostics\n"
+            + "  /security [allow-hf|revoke-hf] Inspect or change Model Supply-Chain / Hugging Face bypass setting\n"
+            + "  /sessions                  List saved local CLI conversations & resume commands\n"
             + "  /mode local|auto|hybrid    Switch Split-Compute execution mode\n"
             + "  /provider <id>             Switch Cloud AI (openai, anthropic, gemini, openrouter, xai, groq, deepseek, mistral, perplexity, together, m365_copilot, consensus)\n"
             + "  /providers                 List all supported Cloud AI providers & key status\n"
@@ -282,6 +368,34 @@ def handle_slash_command(
 
     if cmd == "/doctor":
         _print_doctor_report(ansi, agent.workspace_root, orchestrator)
+        return True
+
+    if cmd == "/security":
+        action = parts[1].lower() if len(parts) >= 2 else "status"
+        if action in {"allow-hf", "bypass-on", "enable-bypass"}:
+            if _confirm_huggingface_bypass_interactive(ansi):
+                orchestrator.update_config(
+                    {
+                        "allow_unverified_huggingface": True,
+                        "huggingface_bypass_acknowledged": True,
+                        "persist_security_settings": True,
+                    }
+                )
+                print(ansi.yellow("  WARNING: Unverified Hugging Face bypass ENABLED and saved."))
+            else:
+                print(ansi.green("  Cancelled — Strict Model Supply-Chain Protection remains ACTIVE."))
+            return True
+        if action in {"revoke-hf", "bypass-off", "strict"}:
+            orchestrator.update_config(
+                {
+                    "allow_unverified_huggingface": False,
+                    "huggingface_bypass_acknowledged": False,
+                    "persist_security_settings": True,
+                }
+            )
+            print(ansi.green("  Revoked Hugging Face bypass — Strict Model Supply-Chain Protection is now ACTIVE."))
+            return True
+        _print_security_status(ansi, orchestrator)
         return True
 
     if cmd == "/ls":
@@ -418,9 +532,17 @@ def handle_slash_command(
             print(ansi.dim("  No completed turn yet."))
         return True
 
+    if cmd == "/sessions":
+        _print_sessions_table(ansi, agent.session_store)
+        return True
+
     if cmd == "/clear":
         agent.reset_memory()
-        print(ansi.green("  Cleared conversation context and local PIIVault."))
+        print(
+            ansi.green(
+                f"  Cleared conversation context and local PIIVault. Started new conversation {agent.conversation_id}."
+            )
+        )
         return True
 
     print(ansi.red(f"  Unknown command `{cmd}`. Type /help for available commands."))
@@ -439,6 +561,13 @@ def _run_interactive_repl(
         agent.toolbox.plan_mode,
         agent.approve_cloud_dispatch,
     )
+    if agent.resumed_turn_count > 0:
+        print(
+            ansi.green(
+                f"  Resumed conversation {agent.conversation_id} "
+                f"({agent.resumed_turn_count} prior turn{'s' if agent.resumed_turn_count != 1 else ''}).\n"
+            )
+        )
     last_result_box: List[Optional[AgentRunResult]] = [None]
 
     try:
@@ -480,6 +609,8 @@ def _run_interactive_repl(
     finally:
         orchestrator.shutdown_all_local_resources()
         print(ansi.dim("  Cleaned up local models, RAM API keys, and PIIVault. Goodbye."))
+        if agent._turn_history:
+            _print_resume_hint(ansi, agent.conversation_id)
     return 0
 
 
@@ -540,6 +671,34 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Auto-approve local workspace edits and commands without prompting",
     )
+    parser.add_argument(
+        "--local-backend",
+        choices=["apple_fm", "mlx", "litert", "ollama", "lmstudio"],
+        default=None,
+        help="On-device local backend (apple_fm = Apple-Signed OS Model with zero Hugging Face, mlx, litert, ollama)",
+    )
+    parser.add_argument(
+        "--local-model-dir",
+        default="",
+        help="Load local MLX weights directly from a verified directory on disk (skips Hugging Face Hub)",
+    )
+    parser.add_argument(
+        "--allow-huggingface-bypass",
+        action="store_true",
+        help="WARNING: Explicitly bypass strict supply-chain protection to allow unverified community Hugging Face models",
+    )
+    parser.add_argument(
+        "-c",
+        "--continue",
+        dest="continue_last",
+        action="store_true",
+        help="Resume the most recent local CLI conversation",
+    )
+    parser.add_argument(
+        "--conversation",
+        default="",
+        help="Resume a specific local CLI conversation by UUID (e.g. --conversation=92231dc0-...)",
+    )
     parser.add_argument("--max-steps", type=int, default=6, help="Max autonomous agent tool steps (1-12)")
     parser.add_argument("--json", action="store_true", help="Output structured JSON")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
@@ -560,8 +719,58 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("providers", help="List all supported Cloud AI providers & key status")
     subparsers.add_parser("hardware", help="Inspect Apple Silicon SoC, Metal RAM & local model cache")
     subparsers.add_parser(
+        "sessions",
+        help="List saved local CLI conversations and resume commands",
+    )
+    subparsers.add_parser(
         "doctor",
-        help="Verify macOS filesystem/TCC permissions, MLX/Metal runtime, model cache & CLI PATH",
+        help="Verify macOS filesystem/TCC permissions, Apple Foundation Models, MLX/Metal & supply-chain posture",
+    )
+
+    p_sec = subparsers.add_parser(
+        "security",
+        help="Manage local model supply-chain protection, SHA-256 lockfile pins, and warning-gated Hugging Face bypass",
+    )
+    p_sec.add_argument(
+        "security_action",
+        nargs="?",
+        choices=["status", "allow-hf", "revoke-hf", "audit", "pin"],
+        default="status",
+        help="Security action (default: status)",
+    )
+    p_sec.add_argument(
+        "target",
+        nargs="?",
+        default="",
+        help="Model ID or local model directory path (for `audit` or `pin`)",
+    )
+    p_sec.add_argument(
+        "--confirm-warning",
+        action="store_true",
+        help="Acknowledge the Hugging Face supply-chain security warning non-interactively (for `allow-hf`)",
+    )
+
+    p_pull = subparsers.add_parser(
+        "pull",
+        help="Safely download (*.safetensors + .json only), audit, and SHA-256 pin an MLX model (or locally self-quantize a first-party repo)",
+    )
+    p_pull.add_argument("model_id", help="Model repository ID (e.g. google/gemma-3-4b-it or mlx-community/gemma-3-4b-it-4bit)")
+    p_pull.add_argument(
+        "--no-pin",
+        action="store_true",
+        help="Skip auto-pinning SHA-256 checksums into models.lock.json after audit",
+    )
+    p_pull.add_argument(
+        "--convert-local",
+        action="store_true",
+        help="Quantize a verified first-party repo (apple/*, google/*, Qwen/*) locally into ~/Models/ via mlx_lm.convert",
+    )
+    p_pull.add_argument(
+        "--q-bits",
+        type=int,
+        choices=[4, 8],
+        default=4,
+        help="Quantization bit-width for --convert-local (default: 4)",
     )
 
     p_bench = subparsers.add_parser("benchmark", help="Run Apple Silicon Metal inference benchmark")
@@ -583,7 +792,18 @@ def _normalize_shorthand_args(raw_args: List[str]) -> List[str]:
     Enables both `machybrid "Refactor auth.py"` and
     `machybrid --mode hybrid --provider anthropic "Refactor auth.py"`.
     """
-    known_subcommands = {"run", "inspect", "providers", "hardware", "doctor", "benchmark", "proxy"}
+    known_subcommands = {
+        "run",
+        "inspect",
+        "providers",
+        "hardware",
+        "sessions",
+        "doctor",
+        "security",
+        "pull",
+        "benchmark",
+        "proxy",
+    }
     value_flags = {
         "--mode",
         "--provider",
@@ -592,6 +812,9 @@ def _normalize_shorthand_args(raw_args: List[str]) -> List[str]:
         "--protocol",
         "--workspace",
         "--file",
+        "--local-backend",
+        "--local-model-dir",
+        "--conversation",
         "--max-steps",
     }
     idx = 0
@@ -637,7 +860,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cfg_updates["anthropic_model"] = args.model
         else:
             cfg_updates["openai_model"] = args.model
+    if args.local_backend:
+        cfg_updates["local_backend"] = args.local_backend
+    elif (
+        not args.local_model_dir
+        and not args.allow_huggingface_bypass
+        and not orchestrator.config.local_model_dir
+        and not orchestrator.config.allow_unverified_huggingface
+        and AppleFoundationModelsProvider.is_available()
+    ):
+        # Auto-default to Apple-Signed OS Foundation Models on macOS 26+ (zero Hugging Face)
+        cfg_updates["local_backend"] = "apple_fm"
+    if args.local_model_dir:
+        cfg_updates["local_model_dir"] = args.local_model_dir
+    if args.allow_huggingface_bypass:
+        cfg_updates["allow_unverified_huggingface"] = True
+        cfg_updates["huggingface_bypass_acknowledged"] = True
     orchestrator.update_config(cfg_updates)
+
+    if args.allow_huggingface_bypass and not args.json:
+        print(ansi.yellow(f"\n  [SECURITY WARNING] {HUGGINGFACE_BYPASS_WARNING}\n"), file=sys.stderr)
 
     if args.subcommand == "providers":
         catalog = _public_provider_rows(orchestrator)
@@ -655,6 +897,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _print_hardware_summary(ansi)
         return 0
 
+    if args.subcommand == "sessions":
+        store = CLISessionStore()
+        rows = store.list_sessions(limit=20)
+        if args.json:
+            print(json.dumps({"sessions": rows}, indent=2))
+        else:
+            _print_sessions_table(ansi, store)
+        return 0
+
     if args.subcommand == "doctor":
         checks = diagnose_cli_permissions(workspace_root=args.workspace, orchestrator=orchestrator)
         if args.json:
@@ -662,6 +913,150 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             _print_doctor_report(ansi, args.workspace, orchestrator)
         return 0
+
+    if args.subcommand == "security":
+        action = args.security_action
+        if action == "status":
+            if args.json:
+                sec = orchestrator.get_model_security_settings()
+                fm_ok, fm_reason = AppleFoundationModelsProvider.check_availability()
+                locked = load_model_lockfile(Path(sec.lockfile_path) if sec.lockfile_path else None)
+                print(
+                    json.dumps(
+                        {
+                            "security": sec.to_dict(),
+                            "local_backend": orchestrator.config.local_backend,
+                            "apple_foundation_models": {"available": fm_ok, "reason": fm_reason},
+                            "pinned_models": sorted(locked.keys()),
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                _print_security_status(ansi, orchestrator)
+            return 0
+
+        if action == "allow-hf":
+            confirmed = bool(args.confirm_warning) or (
+                not args.json and _confirm_huggingface_bypass_interactive(ansi)
+            )
+            if not confirmed:
+                if args.json:
+                    print(
+                        json.dumps(
+                            {
+                                "enabled": False,
+                                "error": "Explicit warning acknowledgement required (--confirm-warning).",
+                                "warning": HUGGINGFACE_BYPASS_WARNING,
+                            },
+                            indent=2,
+                        )
+                    )
+                else:
+                    print(ansi.green("Cancelled — Strict Model Supply-Chain Protection remains ACTIVE."))
+                return 1
+            orchestrator.update_config(
+                {
+                    "allow_unverified_huggingface": True,
+                    "huggingface_bypass_acknowledged": True,
+                    "persist_security_settings": True,
+                }
+            )
+            if args.json:
+                print(json.dumps({"enabled": True, "warning": HUGGINGFACE_BYPASS_WARNING}, indent=2))
+            else:
+                print(ansi.yellow("WARNING: Unverified Hugging Face supply-chain bypass ENABLED and saved."))
+            return 0
+
+        if action == "revoke-hf":
+            orchestrator.update_config(
+                {
+                    "allow_unverified_huggingface": False,
+                    "huggingface_bypass_acknowledged": False,
+                    "persist_security_settings": True,
+                }
+            )
+            if args.json:
+                print(json.dumps({"enabled": False, "policy": orchestrator.get_model_security_settings().policy.value}, indent=2))
+            else:
+                print(ansi.green("Revoked Hugging Face bypass — Strict Model Supply-Chain Protection is now ACTIVE."))
+            return 0
+
+        target = str(args.target or "").strip()
+        if not target:
+            print(ansi.red(f"Error: `machybrid security {action}` requires a model ID or local directory path."))
+            return 2
+
+        resolved_dir: Optional[Path] = None
+        is_local_dir = False
+        expanded_candidate = Path(os.path.realpath(os.path.expanduser(target)))
+        if expanded_candidate.is_dir():
+            resolved_dir = expanded_candidate
+            is_local_dir = True
+        else:
+            _, is_complete, _, cached_path, _ = HardwareProfiler.inspect_hf_model_cache(target)
+            if is_complete and cached_path:
+                resolved_dir = Path(cached_path)
+
+        if action == "audit":
+            res = audit_model_directory(
+                model_id=target,
+                model_dir=resolved_dir,
+                settings=orchestrator.get_model_security_settings(),
+                is_local_dir=is_local_dir,
+            )
+            if args.json:
+                print(json.dumps(res.to_dict(), indent=2))
+            else:
+                status = ansi.green("ALLOWED") if res.allowed else ansi.red("BLOCKED")
+                print(f"\nModel Audit [{status}] `{res.model_id}` (trust={res.publisher_trust}, policy={res.policy_applied})")
+                if res.resolved_dir:
+                    print(ansi.dim(f"  Directory     : {res.resolved_dir} ({res.files_scanned} files scanned)"))
+                for warn in res.warnings:
+                    print(ansi.yellow(f"  WARNING       : {warn}"))
+                for err in res.errors:
+                    print(ansi.red(f"  BLOCKED REASON: {err}"))
+                print()
+            return 0 if res.allowed else 1
+
+        if action == "pin":
+            if resolved_dir is None:
+                print(ansi.red(f"Cannot pin `{target}`: model directory not found locally or in Hugging Face cache."))
+                return 1
+            try:
+                sec = orchestrator.get_model_security_settings()
+                lock_path = Path(sec.lockfile_path) if sec.lockfile_path else None
+                entry = pin_model_to_lockfile(model_id=target, model_dir=resolved_dir, lockfile_path=lock_path)
+            except ValueError as exc:
+                print(ansi.red(f"Pin rejected: {exc}"))
+                return 1
+            if args.json:
+                print(json.dumps(entry, indent=2))
+            else:
+                print(ansi.green(f"Pinned `{target}` to SHA-256 lockfile ({entry['file_count']} files, digest {entry['manifest_sha256'][:16]}...)."))
+            return 0
+
+    if args.subcommand == "pull":
+        sec = orchestrator.get_model_security_settings()
+        if args.convert_local:
+            res = HardwareProfiler.convert_first_party_to_local_mlx(
+                repo_id=args.model_id,
+                q_bits=args.q_bits,
+                security_settings=sec,
+            )
+        else:
+            res = HardwareProfiler.pull_or_verify_model(
+                model_id=args.model_id,
+                allow_network_download=True,
+                security_settings=sec,
+                auto_pin=(not args.no_pin),
+            )
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            badge = ansi.green("READY") if res.get("ok") else ansi.red("BLOCKED / FAILED")
+            print(f"\n[{badge}] {res.get('message', '')}\n")
+        return 0 if res.get("ok") else 1
 
     if args.subcommand == "benchmark":
         bench = HardwareProfiler.run_benchmark(model_id=args.local_model)
@@ -723,6 +1118,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         }
         print(f"{tag_map.get(stage, ansi.dim('  [Agent]'))} {msg}")
 
+    session_store = CLISessionStore()
+    resolved_conversation_id: Optional[str] = None
+    if args.conversation:
+        try:
+            canonical_id = CLISessionStore.validate_conversation_id(args.conversation)
+        except ValueError as exc:
+            if args.json:
+                print(json.dumps({"error": str(exc)}, indent=2))
+            else:
+                print(ansi.red(f"Error: {exc}"))
+            return 1
+        existing_session = session_store.load_session(canonical_id)
+        if existing_session is None:
+            msg = f"Conversation `{canonical_id}` not found in local CLI sessions."
+            if args.json:
+                print(json.dumps({"error": msg}, indent=2))
+            else:
+                print(ansi.red(f"Error: {msg}"))
+                print(ansi.dim("Run `machybrid sessions` to list saved local conversations."))
+            return 1
+        resolved_conversation_id = canonical_id
+    elif args.continue_last:
+        latest = session_store.find_latest_session(workspace=args.workspace)
+        if latest is not None:
+            resolved_conversation_id = str(latest["conversation_id"])
+        elif not args.json:
+            print(ansi.dim("  No previous conversation found to resume — starting a new conversation."))
+
     agent = HybridCLIAgent(
         orchestrator=orchestrator,
         workspace_root=args.workspace,
@@ -741,11 +1164,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             else (lambda payload, count, cats: _interactive_cloud_approval(ansi, payload, count, cats))
         ),
         event_callback=_on_event,
+        conversation_id=resolved_conversation_id,
+        session_store=session_store,
     )
 
     if args.subcommand == "run":
         goal_text = " ".join(args.goal)
         try:
+            if agent.resumed_turn_count > 0 and not args.json:
+                print(
+                    ansi.dim(
+                        f"  [Resumed conversation {agent.conversation_id} "
+                        f"({agent.resumed_turn_count} prior turn{'s' if agent.resumed_turn_count != 1 else ''})]"
+                    )
+                )
             result = agent.run(
                 goal=goal_text,
                 attached_files=args.file,
@@ -757,6 +1189,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(result.final_output)
                 print()
                 _print_receipt(ansi, result, verbose=True)
+                _print_resume_hint(ansi, result.conversation_id)
         finally:
             orchestrator.shutdown_all_local_resources()
         return 0

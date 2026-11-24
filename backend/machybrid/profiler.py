@@ -19,20 +19,45 @@ import json
 import os
 import platform
 import plistlib
-import subprocess
+import re
+import subprocess  # nosec B404
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .model_security import (
+    ModelSecuritySettings,
+    audit_model_directory,
+    classify_model_publisher,
+    pin_model_to_lockfile,
+)
+
+
+SAFE_DOWNLOAD_ALLOW_PATTERNS: List[str] = [
+    "*.safetensors",
+    "model.safetensors.index.json",
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "vocab.json",
+    "merges.txt",
+]
+
+_SAFE_LOCAL_SLUG_RE = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
+
 
 @dataclass(frozen=True)
 class CachedModelStatus:
-    """Status of a locally cached model on disk (HuggingFace MLX, LiteRT, or Ollama)."""
+    """Status of a locally cached or self-quantized model on disk (MLX HF cache, ~/Models, LiteRT, or Ollama)."""
 
     model_id: str
-    backend: str  # "mlx" | "litert" | "ollama"
+    backend: str  # "apple_fm" | "mlx_local_dir" | "mlx" | "litert" | "ollama"
     parameter_count: str
     quantization: str
     estimated_memory_gb: float
@@ -41,6 +66,10 @@ class CachedModelStatus:
     size_bytes: int
     local_path: str
     missing_shards: int = 0
+    publisher_trust: str = "community_unverified"
+    is_pinned: bool = False
+    is_usable: bool = True
+    usability_note: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -157,7 +186,9 @@ class MacHardwareProfile:
 class HardwareProfiler:
     """Profiles Apple Silicon hardware, Metal GPU budgets, and local model caches."""
 
-    # Curated catalog of Apple Silicon MLX models with memory footprints
+    # Curated catalog of Apple Silicon MLX models with memory footprints & supply-chain trust tier.
+    # NOTE: Community orgs (`mlx-community`, `lmstudio-community`) require either a pinned SHA-256
+    # lockfile entry or explicit opt-in via the warning-gated Hugging Face bypass.
     KNOWN_MLX_CATALOG: List[Dict[str, Any]] = [
         {
             "model_id": "mlx-community/gemma-3-4b-it-4bit",
@@ -167,7 +198,8 @@ class HardwareProfiler:
             "tps": "90–140 tok/s",
             "role": "fast_interactive",
             "kv_bits": None,
-            "rationale": "Ultra-fast local model (~2.6 GB); ideal for Station 1 private file extraction, low-latency chat, and speculative draft generation.",
+            "publisher_trust": "community_unverified",
+            "rationale": "Ultra-fast local model (~2.6 GB); ideal for Station 1 private file extraction and low-latency chat (community MLX conversion — pin SHA-256 or opt into HF bypass).",
         },
         {
             "model_id": "mlx-community/gemma-3-12b-it-4bit",
@@ -177,6 +209,7 @@ class HardwareProfiler:
             "tps": "45–65 tok/s",
             "role": "balanced_default",
             "kv_bits": 8,
+            "publisher_trust": "community_unverified",
             "rationale": "Strong mid-size model (~7.2 GB) that leaves >30 GB free on 48 GB Macs for large multi-file KV caches.",
         },
         {
@@ -187,6 +220,7 @@ class HardwareProfiler:
             "tps": "32–45 tok/s",
             "role": "balanced_default",
             "kv_bits": 8,
+            "publisher_trust": "community_unverified",
             "rationale": "Optimal 4-bit quantization for 24–48 GB Pro/Max chips: ~2x faster memory-bandwidth decode than 8-bit while using <45% of Metal working set.",
         },
         {
@@ -197,6 +231,7 @@ class HardwareProfiler:
             "tps": "28–40 tok/s",
             "role": "deep_reasoning",
             "kv_bits": 8,
+            "publisher_trust": "community_unverified",
             "rationale": "Sweet-spot 31B model in 4-bit (~18.2 GB): fits comfortably inside a 37.4 GB Metal working set with ~19 GB headroom for long-context KV cache.",
         },
         {
@@ -207,17 +242,8 @@ class HardwareProfiler:
             "tps": "14–22 tok/s",
             "role": "deep_reasoning",
             "kv_bits": 8,
+            "publisher_trust": "community_unverified",
             "rationale": "Near-lossless 8-bit 31B model (~33 GB). Requires >=48 GB Unified RAM (37.4 GB Metal working set) and benefits from 8-bit KV cache quantization.",
-        },
-        {
-            "model_id": "mlx-community/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit",
-            "params": "40B",
-            "quant": "8-bit",
-            "mem_gb": 42.5,
-            "tps": "10–16 tok/s",
-            "role": "deep_reasoning",
-            "kv_bits": 4,
-            "rationale": "40B 8-bit model (~42.5 GB); exceeds the 37.4 GB recommended Metal working set on 48 GB Macs (best on >=64 GB Unified Memory, or use 4-bit variant on 48 GB).",
         },
     ]
 
@@ -609,17 +635,116 @@ class HardwareProfiler:
         return _store((True, is_complete, total_bytes, str(target_snap), missing_shards))
 
     @classmethod
-    def scan_cached_models(cls, hf_hub_dir: Optional[Path] = None) -> List[CachedModelStatus]:
-        """Scans the local HuggingFace cache and matches against the catalog plus any custom local MLX repos."""
+    def _evaluate_cached_usability(
+        cls,
+        model_id: str,
+        snap_path: str,
+        is_complete: bool,
+        missing_shards: int,
+        is_local_dir: bool,
+        security_settings: ModelSecuritySettings,
+    ) -> Tuple[str, bool, bool, str]:
+        """Returns `(publisher_trust, is_pinned, is_usable, usability_note)` for a discovered local model."""
+        model_dir = Path(snap_path) if snap_path else None
+        audit = audit_model_directory(
+            model_id=model_id,
+            model_dir=model_dir,
+            settings=security_settings,
+            is_local_dir=is_local_dir,
+        )
+        is_pinned = audit.locked_sha256_verified is True
+        if not is_complete:
+            return (
+                audit.publisher_trust,
+                is_pinned,
+                False,
+                f"Incomplete download ({missing_shards} missing shard(s))",
+            )
+        if audit.allowed:
+            if audit.publisher_trust == "local_verified_dir":
+                note = "Ready (Verified Local Folder — Zero Hugging Face)"
+            elif audit.publisher_trust == "first_party":
+                note = "Ready (First-Party Publisher)"
+            elif is_pinned:
+                note = "Ready (SHA-256 Lockfile Pinned)"
+            elif audit.bypass_used:
+                note = "Usable (Hugging Face Bypass Active)"
+            else:
+                note = "Ready"
+            return audit.publisher_trust, is_pinned, True, note
+
+        first_err = audit.errors[0] if audit.errors else "Blocked by supply-chain policy"
+        if "Blocked unverified Hugging Face" in first_err:
+            note = "Downloaded — Blocked by Strict Policy (Click Audit & Pin SHA-256 or enable HF Bypass)"
+        else:
+            note = f"Blocked: {first_err[:120]}"
+        return audit.publisher_trust, is_pinned, False, note
+
+    @classmethod
+    def scan_cached_models(
+        cls,
+        hf_hub_dir: Optional[Path] = None,
+        local_models_dir: Optional[Path] = None,
+        security_settings: Optional[ModelSecuritySettings] = None,
+    ) -> List[CachedModelStatus]:
+        """Scans local ~/Models folders & HuggingFace cache, reporting exact disk size and usability."""
+        sec = security_settings or ModelSecuritySettings.load()
         hub_root = hf_hub_dir or Path(
             os.environ.get(
                 "HF_HUB_CACHE",
                 os.path.expanduser("~/.cache/huggingface/hub"),
             )
         )
+        models_root = local_models_dir or Path(os.path.expanduser("~/Models"))
         results: List[CachedModelStatus] = []
         seen_ids = set()
 
+        # 1. Scan verified local self-quantized folders in ~/Models (zero Hugging Face Hub!)
+        try:
+            if models_root.is_dir():
+                for child in sorted(models_root.iterdir()):
+                    if not child.is_dir() or child.name.startswith("."):
+                        continue
+                    cfg_file = child / "config.json"
+                    if not cfg_file.is_file():
+                        continue
+                    shards = [p for p in child.iterdir() if p.is_file() and p.suffix == ".safetensors"]
+                    size_bytes = sum(p.stat().st_size for p in shards if p.exists())
+                    is_complete = len(shards) > 0 and size_bytes > 0
+                    resolved_str = str(child.resolve())
+                    trust, is_pinned, is_usable, note = cls._evaluate_cached_usability(
+                        model_id=resolved_str,
+                        snap_path=resolved_str,
+                        is_complete=is_complete,
+                        missing_shards=0 if is_complete else 1,
+                        is_local_dir=True,
+                        security_settings=sec,
+                    )
+                    est_gb = round(size_bytes / (1024**3) * 1.15, 1) if size_bytes > 0 else 4.0
+                    quant = "4-bit" if "4bit" in child.name.lower() else ("8-bit" if "8bit" in child.name.lower() else "local")
+                    seen_ids.add(resolved_str)
+                    results.append(
+                        CachedModelStatus(
+                            model_id=resolved_str,
+                            backend="mlx_local_dir",
+                            parameter_count="Local",
+                            quantization=quant,
+                            estimated_memory_gb=est_gb,
+                            is_cached=True,
+                            is_complete=is_complete,
+                            size_bytes=size_bytes,
+                            local_path=resolved_str,
+                            missing_shards=0 if is_complete else 1,
+                            publisher_trust=trust,
+                            is_pinned=is_pinned,
+                            is_usable=is_usable,
+                            usability_note=note,
+                        )
+                    )
+        except OSError:
+            pass
+
+        # 2. Scan catalog MLX models in HuggingFace cache
         for entry in cls.KNOWN_MLX_CATALOG:
             repo_id = str(entry["model_id"])
             seen_ids.add(repo_id)
@@ -627,6 +752,14 @@ class HardwareProfiler:
                 repo_id, hf_hub_dir=hub_root
             )
             if is_cached:
+                trust, is_pinned, is_usable, note = cls._evaluate_cached_usability(
+                    model_id=repo_id,
+                    snap_path=snap_path,
+                    is_complete=is_complete,
+                    missing_shards=missing,
+                    is_local_dir=False,
+                    security_settings=sec,
+                )
                 results.append(
                     CachedModelStatus(
                         model_id=repo_id,
@@ -639,10 +772,14 @@ class HardwareProfiler:
                         size_bytes=size_bytes,
                         local_path=snap_path,
                         missing_shards=missing,
+                        publisher_trust=trust,
+                        is_pinned=is_pinned,
+                        is_usable=is_usable,
+                        usability_note=note,
                     )
                 )
 
-        # Also scan any other `models--*` directories in HF hub cache
+        # 3. Also scan any other `models--*` directories in HF hub cache
         if hub_root.is_dir():
             for child in sorted(hub_root.iterdir()):
                 if not child.is_dir() or not child.name.startswith("models--"):
@@ -658,6 +795,14 @@ class HardwareProfiler:
                 )
                 est_gb = round(size_bytes / (1024**3) * 1.15, 1) if size_bytes > 0 else 8.0
                 quant = "4-bit" if "4bit" in repo_id.lower() else ("8-bit" if "8bit" in repo_id.lower() else "fp16")
+                trust, is_pinned, is_usable, note = cls._evaluate_cached_usability(
+                    model_id=repo_id,
+                    snap_path=snap_path,
+                    is_complete=is_complete,
+                    missing_shards=missing,
+                    is_local_dir=False,
+                    security_settings=sec,
+                )
                 results.append(
                     CachedModelStatus(
                         model_id=repo_id,
@@ -670,6 +815,10 @@ class HardwareProfiler:
                         size_bytes=size_bytes,
                         local_path=snap_path,
                         missing_shards=missing,
+                        publisher_trust=trust,
+                        is_pinned=is_pinned,
+                        is_usable=is_usable,
+                        usability_note=note,
                     )
                 )
 
@@ -853,11 +1002,15 @@ class HardwareProfiler:
         model_id: str,
         hf_hub_dir: Optional[Path] = None,
         allow_network_download: bool = False,
+        security_settings: Optional[ModelSecuritySettings] = None,
+        auto_pin: bool = False,
     ) -> Dict[str, Any]:
-        """Verifies or downloads a catalog MLX model into the local HuggingFace cache safely.
+        """Verifies or safely downloads an MLX model using strict allow_patterns + supply-chain audit.
 
-        Strict allowlist & `_is_safe_repo_id` validation prevent any path injection (CWE-22).
+        Strict allowlist, `_is_safe_repo_id` validation, and `SAFE_DOWNLOAD_ALLOW_PATTERNS` prevent
+        path injection (CWE-22) and ensure `.py`/`.bin`/`.pt`/`.pkl` files are never downloaded.
         """
+        sec = security_settings or ModelSecuritySettings.load()
         cleaned = (model_id or "").strip()
         if not cls._is_safe_repo_id(cleaned):
             return {
@@ -868,6 +1021,7 @@ class HardwareProfiler:
                 "is_complete": False,
                 "size_gb": 0.0,
                 "missing_shards": 0,
+                "local_path": "",
                 "status": "invalid_model_id",
                 "message": "Invalid model identifier rejected by security policy.",
                 "cli_command": "",
@@ -882,11 +1036,31 @@ class HardwareProfiler:
                 est_gb = float(entry["mem_gb"])
                 break
 
+        publisher_trust = classify_model_publisher(canonical_id)
         is_cached, is_complete, size_bytes, snap_path, missing = cls.inspect_hf_model_cache(
             canonical_id, hf_hub_dir=hf_hub_dir
         )
 
+        # Block unverified community network downloads unless user explicitly enabled HF bypass
         if not is_complete and allow_network_download:
+            if publisher_trust == "community_unverified" and not sec.allow_unverified_huggingface:
+                return {
+                    "ok": False,
+                    "model_id": canonical_id,
+                    "backend": "mlx",
+                    "is_cached": is_cached,
+                    "is_complete": False,
+                    "size_gb": round(size_bytes / (1024**3), 2) if size_bytes > 0 else est_gb,
+                    "missing_shards": missing,
+                    "local_path": snap_path,
+                    "status": "blocked_by_supply_chain_policy",
+                    "message": (
+                        f"Blocked network download of unverified community repo `{canonical_id}`. "
+                        "Use a first-party org (`apple/*`, `google/*`, `Qwen/*`) with local quantization, "
+                        "or enable the warning-gated Hugging Face bypass in Settings -> Local & Security."
+                    ),
+                    "cli_command": f"machybrid security allow-hf && machybrid pull {canonical_id}",
+                }
             try:
                 from huggingface_hub import snapshot_download  # type: ignore
 
@@ -894,6 +1068,7 @@ class HardwareProfiler:
                     repo_id=canonical_id,
                     revision="main",
                     local_files_only=False,
+                    allow_patterns=SAFE_DOWNLOAD_ALLOW_PATTERNS,
                 )
                 cls._hf_inspect_cache.clear()
                 is_cached, is_complete, size_bytes, snap_path, missing = cls.inspect_hf_model_cache(
@@ -908,21 +1083,64 @@ class HardwareProfiler:
                     "is_complete": is_complete,
                     "size_gb": round(size_bytes / (1024**3), 2) if size_bytes > 0 else est_gb,
                     "missing_shards": missing,
+                    "local_path": snap_path,
                     "status": "download_deferred",
-                    "message": f"Direct download unavailable ({exc}). Run: huggingface-cli download {canonical_id}",
-                    "cli_command": f"huggingface-cli download {canonical_id}",
+                    "message": f"Direct download unavailable ({exc}). Run: machybrid pull {canonical_id}",
+                    "cli_command": f"machybrid pull {canonical_id}",
                 }
+
+        # Run supply-chain audit and optional SHA-256 lockfile pin when weights are complete
+        pinned_sha = ""
+        if is_complete and snap_path:
+            audit = audit_model_directory(
+                model_id=canonical_id,
+                model_dir=Path(snap_path),
+                settings=ModelSecuritySettings(
+                    allow_unverified_huggingface=True,
+                    huggingface_bypass_acknowledged=True,
+                    lockfile_path=sec.lockfile_path,
+                ),
+            )
+            if not audit.allowed:
+                return {
+                    "ok": False,
+                    "model_id": canonical_id,
+                    "backend": "mlx",
+                    "is_cached": True,
+                    "is_complete": True,
+                    "size_gb": round(size_bytes / (1024**3), 2) if size_bytes > 0 else est_gb,
+                    "missing_shards": 0,
+                    "local_path": snap_path,
+                    "status": "audit_failed",
+                    "message": f"Supply-chain audit REJECTED `{canonical_id}`: {'; '.join(audit.errors)}",
+                    "cli_command": f"machybrid security audit {canonical_id}",
+                }
+            if auto_pin:
+                try:
+                    lock_path = Path(sec.lockfile_path) if sec.lockfile_path else None
+                    pin_entry = pin_model_to_lockfile(
+                        model_id=canonical_id,
+                        model_dir=Path(snap_path),
+                        lockfile_path=lock_path,
+                    )
+                    pinned_sha = str(pin_entry.get("manifest_sha256", ""))
+                except Exception:
+                    pass
 
         size_gb = round(size_bytes / (1024**3), 2) if size_bytes > 0 else est_gb
         if is_complete:
-            status = "ready"
-            msg = f"{canonical_id} is verified complete in local cache ({size_gb} GB)."
+            status = "ready_pinned" if pinned_sha else "ready"
+            msg = (
+                f"{canonical_id} verified complete ({size_gb} GB) and SHA-256 pinned ({pinned_sha[:12]}...)."
+                if pinned_sha
+                else f"{canonical_id} is verified complete in local cache ({size_gb} GB)."
+            )
         elif is_cached:
             status = "incomplete_shards"
-            msg = f"{canonical_id} is missing {missing} weight shard(s). Run: huggingface-cli download {canonical_id}"
+            msg = f"{canonical_id} is missing {missing} weight shard(s). Run: machybrid pull {canonical_id}"
         else:
             status = "not_cached"
-            msg = f"{canonical_id} is not yet cached locally (~{est_gb} GB). Run: huggingface-cli download {canonical_id}"
+            msg = f"{canonical_id} is not yet cached locally (~{est_gb} GB). Run: machybrid pull {canonical_id}"
 
         return {
             "ok": is_complete,
@@ -935,8 +1153,103 @@ class HardwareProfiler:
             "local_path": snap_path,
             "status": status,
             "message": msg,
-            "cli_command": f"huggingface-cli download {canonical_id}",
+            "cli_command": f"machybrid pull {canonical_id}",
+            "pinned_sha256": pinned_sha,
+            "publisher_trust": publisher_trust,
         }
+
+    @classmethod
+    def convert_first_party_to_local_mlx(
+        cls,
+        repo_id: str,
+        q_bits: int = 4,
+        models_root: Optional[Path] = None,
+        security_settings: Optional[ModelSecuritySettings] = None,
+    ) -> Dict[str, Any]:
+        """Quantizes a first-party repo (`apple/*`, `google/*`, `Qwen/*`, etc.) locally into ~/Models/ and pins SHA-256."""
+        cleaned = (repo_id or "").strip()
+        if not cls._is_safe_repo_id(cleaned) or classify_model_publisher(cleaned) != "first_party":
+            return {
+                "ok": False,
+                "model_id": cleaned,
+                "status": "rejected_untrusted_source",
+                "message": (
+                    f"Local self-quantization only accepts verified first-party repos "
+                    f"(`apple/*`, `google/*`, `Qwen/*`, `meta-llama/*`, `mistralai/*`, `microsoft/*`), got `{cleaned}`."
+                ),
+            }
+
+        bits = 8 if int(q_bits) >= 8 else 4
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", cleaned.split("/")[-1]).strip("-")
+        if not slug or not _SAFE_LOCAL_SLUG_RE.match(slug):
+            return {"ok": False, "model_id": cleaned, "status": "invalid_slug", "message": "Invalid output directory name."}
+
+        base_dir = Path(os.path.realpath(str(models_root or Path(os.path.expanduser("~/Models")))))
+        out_dir = base_dir / f"{slug}-mlx-{bits}bit"
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            proc = subprocess.run(  # nosec B603
+                [
+                    sys.executable,
+                    "-m",
+                    "mlx_lm",
+                    "convert",
+                    "--hf-path",
+                    cleaned,
+                    "--mlx-path",
+                    str(out_dir),
+                    "--quantize",
+                    "--q-bits",
+                    str(bits),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3600.0,
+                check=False,
+            )
+            if proc.returncode != 0:
+                return {
+                    "ok": False,
+                    "model_id": cleaned,
+                    "output_dir": str(out_dir),
+                    "status": "convert_failed",
+                    "message": (proc.stderr or proc.stdout or "mlx_lm.convert failed").strip()[-300:],
+                }
+
+            sec = security_settings or ModelSecuritySettings.load()
+            audit = audit_model_directory(
+                model_id=str(out_dir),
+                model_dir=out_dir,
+                settings=sec,
+                is_local_dir=True,
+            )
+            if not audit.allowed:
+                return {
+                    "ok": False,
+                    "model_id": str(out_dir),
+                    "output_dir": str(out_dir),
+                    "status": "audit_failed",
+                    "message": "; ".join(audit.errors),
+                }
+            lock_path = Path(sec.lockfile_path) if sec.lockfile_path else None
+            pin_entry = pin_model_to_lockfile(model_id=str(out_dir), model_dir=out_dir, lockfile_path=lock_path)
+            return {
+                "ok": True,
+                "model_id": str(out_dir),
+                "output_dir": str(out_dir),
+                "status": "ready_local_quantized",
+                "pinned_sha256": pin_entry["manifest_sha256"],
+                "message": f"Quantized `{cleaned}` locally ({bits}-bit MLX) to {out_dir} and pinned SHA-256.",
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "model_id": cleaned,
+                "output_dir": str(out_dir),
+                "status": "convert_error",
+                "message": f"Local conversion failed: {exc}",
+            }
 
     @classmethod
     def run_benchmark(
@@ -1042,7 +1355,11 @@ class HardwareProfiler:
         )
 
     @classmethod
-    def profile(cls, hf_hub_dir: Optional[Path] = None) -> MacHardwareProfile:
+    def profile(
+        cls,
+        hf_hub_dir: Optional[Path] = None,
+        security_settings: Optional[ModelSecuritySettings] = None,
+    ) -> MacHardwareProfile:
         """Generates a complete live `MacHardwareProfile` of the host Mac and its local models."""
         static = cls.get_static_hardware_info()
         io_stats = cls.read_ioaccelerator_stats()
@@ -1054,7 +1371,10 @@ class HardwareProfiler:
             cpu_busy=cpu_busy,
             gpu_busy=gpu_busy,
         )
-        cached_models = cls.scan_cached_models(hf_hub_dir=hf_hub_dir)
+        cached_models = cls.scan_cached_models(
+            hf_hub_dir=hf_hub_dir,
+            security_settings=security_settings,
+        )
         selected_primary, selected_fast, kv_bits, recs = cls.select_optimal_models(
             hf_hub_dir=hf_hub_dir,
             prefer_cached_only=True,
