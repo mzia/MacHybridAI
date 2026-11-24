@@ -143,6 +143,66 @@ public enum AppleFoundationModelsEngine {
         )
     }
 
+    /// Streams incremental text deltas 100% locally using Apple's signed `SystemLanguageModel`.
+    public static func stream(
+        prompt: String,
+        systemInstruction: String? = nil,
+        onDelta: @escaping @Sendable (String) -> Void
+    ) async -> GenerationResponse {
+        #if canImport(FoundationModels)
+        if #available(macOS 26.0, *) {
+            let status = checkAvailability()
+            guard status.available else {
+                return GenerationResponse(
+                    ok: false,
+                    outputText: "",
+                    modelName: modelDisplayName,
+                    signer: signerLabel,
+                    error: status.reason
+                )
+            }
+            do {
+                let session: LanguageModelSession
+                if let inst = systemInstruction, !inst.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    session = LanguageModelSession(model: .default, instructions: inst)
+                } else {
+                    session = LanguageModelSession(model: .default)
+                }
+                let stream = session.streamResponse(to: prompt)
+                var accumulated = ""
+                for try await snapshot in stream {
+                    let full = snapshot.content
+                    if full.count > accumulated.count, full.hasPrefix(accumulated) {
+                        let delta = String(full.dropFirst(accumulated.count))
+                        accumulated = full
+                        if !delta.isEmpty {
+                            onDelta(delta)
+                        }
+                    } else if full != accumulated {
+                        accumulated = full
+                    }
+                }
+                return GenerationResponse(
+                    ok: true,
+                    outputText: accumulated,
+                    modelName: modelDisplayName,
+                    signer: signerLabel,
+                    error: nil
+                )
+            } catch {
+                return GenerationResponse(
+                    ok: false,
+                    outputText: "",
+                    modelName: modelDisplayName,
+                    signer: signerLabel,
+                    error: "Apple Foundation Models streaming error: \(error.localizedDescription)"
+                )
+            }
+        }
+        #endif
+        return await generate(prompt: prompt, systemInstruction: systemInstruction)
+    }
+
     /// Handles headless CLI flags (`--apple-fm-check`, `--apple-fm-generate`) before launching SwiftUI.
     /// Returns an exit code if handled, or `nil` to continue launching the GUI app.
     public static func handleHeadlessCommandIfPresent(arguments: [String]) -> Int32? {

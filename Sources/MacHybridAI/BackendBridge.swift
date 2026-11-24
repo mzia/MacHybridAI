@@ -20,10 +20,11 @@ import Vision
 public final class DaemonManager: ObservableObject, @unchecked Sendable {
     public static let shared = DaemonManager()
 
-    /// Published so the UI can show a "daemon starting…" indicator.
-    @Published public private(set) var state: DaemonState = .notStarted
+    /// Published so the UI can show engine readiness (Pure Swift Native by default — zero Python daemon).
+    @Published public private(set) var state: DaemonState = .nativeSwift
 
     public enum DaemonState: Equatable, Sendable {
+        case nativeSwift
         case notStarted
         case starting
         case running(port: Int)
@@ -43,6 +44,15 @@ public final class DaemonManager: ObservableObject, @unchecked Sendable {
     private let readyTimeoutSeconds: TimeInterval = 5
 
     private init() {}
+
+    /// Marks the 100% Pure Swift native engine as ready without spawning any Python subprocess.
+    public func markNativeSwiftReady() {
+        if Thread.isMainThread {
+            state = .nativeSwift
+        } else {
+            DispatchQueue.main.async { self.state = .nativeSwift }
+        }
+    }
 
     /// Start the daemon if not already running. Safe to call from any context.
     public func ensureRunning(backendDir: String, pythonPath: String) {
@@ -88,9 +98,10 @@ public final class DaemonManager: ObservableObject, @unchecked Sendable {
         return nil
     }
 
-    /// Unloads all local models (MLX Metal cache & local Ollama models), stops child proxies,
-    /// and terminates the daemon process cleanly when MacHybridAI quits.
+    /// Wipes in-memory API keys, unloads any cached resources, and stops any optional helper process on quit.
     public func stop() {
+        NativeSwiftEngine.shared.clearSecretsAndUnload()
+
         let (proc, activePort): (Process?, Int) = lock.withLock {
             let p = _process
             let port = _port
@@ -438,32 +449,293 @@ public struct LocalVisionOCRScrubber: Sendable {
     }
 }
 
-/// Manages saving user chat and prompt history to Local Mac Storage or iCloud Drive,
-/// with configurable auto-delete retention periods (`24h`, `7d`, `30d`, `90d`, `never`).
+/// Manages saving user chat and prompt history to Local Mac Storage, iCloud Drive,
+/// or Google Drive, with configurable auto-delete retention periods (`24h`, `7d`, `30d`, `90d`, `never`)
+/// and 1-click shareable Markdown exports directly into the synced cloud drive folder.
 /// Note: Nothing is ever retained in any Cloud AI provider's history (`store=false`).
 public final class PromptHistoryStore: @unchecked Sendable {
     public let localDirectoryURL: URL
     public let iCloudDirectoryURL: URL
+    private let lock = NSLock()
+    private var _googleDriveDirectoryURL: URL
+
+    private static let customGoogleDriveDefaultsKey = "MacHybridAI.customGoogleDriveDirectory"
+
+    public var googleDriveDirectoryURL: URL {
+        lock.withLock { _googleDriveDirectoryURL }
+    }
 
     public init(
         customLocalDirectory: URL? = nil,
-        customICloudDirectory: URL? = nil
+        customICloudDirectory: URL? = nil,
+        customGoogleDriveDirectory: URL? = nil
     ) {
         let home = FileManager.default.homeDirectoryForCurrentUser
         self.localDirectoryURL = customLocalDirectory ?? home
             .appendingPathComponent("Library/Application Support/MacHybridAI/history", isDirectory: true)
         self.iCloudDirectoryURL = customICloudDirectory ?? home
             .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs/MacHybridAI", isDirectory: true)
+        if let customGDrive = customGoogleDriveDirectory {
+            self._googleDriveDirectoryURL = customGDrive
+        } else if let savedPath = UserDefaults.standard.string(forKey: Self.customGoogleDriveDefaultsKey),
+                  !savedPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            self._googleDriveDirectoryURL = URL(fileURLWithPath: savedPath, isDirectory: true)
+        } else {
+            self._googleDriveDirectoryURL = Self.detectGoogleDriveDirectory(homeDirectory: home)
+        }
+    }
+
+    /// Auto-detects the macOS Google Drive for Desktop File Provider mount (`~/Library/CloudStorage/GoogleDrive-*/My Drive/MacHybridAI`).
+    public static func detectGoogleDriveDirectory(
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> URL {
+        let cloudStorage = homeDirectory.appendingPathComponent("Library/CloudStorage", isDirectory: true)
+        if let entries = try? FileManager.default.contentsOfDirectory(
+            at: cloudStorage,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            let gdriveMounts = entries
+                .filter { $0.lastPathComponent.hasPrefix("GoogleDrive-") }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            if let firstMount = gdriveMounts.first {
+                let myDrive = firstMount.appendingPathComponent("My Drive", isDirectory: true)
+                if FileManager.default.fileExists(atPath: myDrive.path) {
+                    return myDrive.appendingPathComponent("MacHybridAI", isDirectory: true)
+                }
+                return firstMount.appendingPathComponent("MacHybridAI", isDirectory: true)
+            }
+        }
+        return homeDirectory
+            .appendingPathComponent("Google Drive/My Drive/MacHybridAI", isDirectory: true)
+    }
+
+    public func setCustomGoogleDriveDirectory(_ directoryURL: URL?) {
+        let resolved: URL
+        if let dir = directoryURL {
+            resolved = dir.lastPathComponent == "MacHybridAI"
+                ? dir
+                : dir.appendingPathComponent("MacHybridAI", isDirectory: true)
+            UserDefaults.standard.set(resolved.path, forKey: Self.customGoogleDriveDefaultsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.customGoogleDriveDefaultsKey)
+            resolved = Self.detectGoogleDriveDirectory()
+        }
+        lock.withLock {
+            _googleDriveDirectoryURL = resolved
+        }
+    }
+
+    public func directoryURL(for location: HistoryStorageOption) -> URL {
+        switch location {
+        case .localMac:
+            return localDirectoryURL
+        case .iCloudDrive:
+            return iCloudDirectoryURL
+        case .googleDrive:
+            return googleDriveDirectoryURL
+        }
     }
 
     public func fileURL(for location: HistoryStorageOption) -> URL {
-        let dir = location == .iCloudDrive ? iCloudDirectoryURL : localDirectoryURL
-        return dir.appendingPathComponent("chat_history.json")
+        directoryURL(for: location).appendingPathComponent("chat_history.json")
+    }
+
+    /// Folder inside the active storage drive where shareable Markdown prompt files are written.
+    public func sharedDirectoryURL(for location: HistoryStorageOption) -> URL {
+        directoryURL(for: location).appendingPathComponent("Shared", isDirectory: true)
     }
 
     public func isICloudAvailable() -> Bool {
         let parent = iCloudDirectoryURL.deletingLastPathComponent()
         return FileManager.default.fileExists(atPath: parent.path) || FileManager.default.fileExists(atPath: iCloudDirectoryURL.path)
+    }
+
+    public func isGoogleDriveAvailable() -> Bool {
+        let dir = googleDriveDirectoryURL
+        let parent = dir.deletingLastPathComponent()
+        return FileManager.default.fileExists(atPath: parent.path) || FileManager.default.fileExists(atPath: dir.path)
+    }
+
+    public func isStorageAvailable(_ location: HistoryStorageOption) -> Bool {
+        switch location {
+        case .localMac: return true
+        case .iCloudDrive: return isICloudAvailable()
+        case .googleDrive: return isGoogleDriveAvailable()
+        }
+    }
+
+    /// Formats a clean, cross-platform filename slug (safe for macOS, iCloud Drive, and Google Drive).
+    public static func sanitizeFilenameSlug(_ rawTitle: String, fallback: String = "prompt") -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_ "))
+        let filtered = rawTitle.unicodeScalars.map { allowed.contains($0) ? Character($0) : " " }
+        let collapsed = String(filtered)
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: "-")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-_."))
+        let trimmed = String(collapsed.prefix(52))
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+
+    /// Renders a conversation as a clean, shareable Markdown document with optional Privacy Gate PII redaction.
+    public func renderMarkdown(
+        for conversation: ChatConversationModel,
+        redactPII: Bool = true,
+        guardian: SwiftNativeGuardian = SwiftNativeGuardian()
+    ) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withFullDate, .withTime, .withSpaceBetweenDateAndTime]
+        let dateString = formatter.string(from: conversation.updatedAt)
+        let privacyBadge = redactPII
+            ? "Privacy Gate Redacted (PII Removed Before Share)"
+            : "Full Content (Unredacted)"
+
+        let safeTitle: String
+        if redactPII {
+            safeTitle = guardian.redactAndRestorePreview(text: conversation.title, policy: .strictRedact).sanitized
+        } else {
+            safeTitle = conversation.title
+        }
+
+        var lines: [String] = [
+            "# \(safeTitle)",
+            "",
+            "- **Shared from**: MacHybridAI (\(conversation.storageLocation.title))",
+            "- **Updated**: \(dateString)",
+            "- **Privacy**: \(privacyBadge)",
+            "- **Cloud AI Retention**: None (`store=false`)",
+            "",
+            "---",
+            "",
+        ]
+
+        for msg in conversation.messages {
+            let speaker = msg.role == "user" ? "Prompt" : "Response"
+            let modeLabel = msg.computeMode.uppercased()
+            let providerNote = msg.cloudProvider.isEmpty || msg.cloudProvider == "none"
+                ? "On-Device"
+                : msg.cloudProvider
+            let body: String
+            if redactPII {
+                if msg.role == "user", let sanitized = msg.sanitizedCloudPrompt, !sanitized.isEmpty {
+                    body = sanitized
+                } else {
+                    body = guardian.redactAndRestorePreview(text: msg.content, policy: .strictRedact).sanitized
+                }
+            } else {
+                body = msg.content
+            }
+
+            lines.append("## \(speaker) · \(modeLabel) (\(providerNote))")
+            lines.append("")
+            lines.append(body)
+            lines.append("")
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    /// Renders a single prompt or response bubble as a shareable Markdown snippet.
+    public func renderMarkdown(
+        for message: ChatMessageModel,
+        conversationTitle: String,
+        storageLocation: HistoryStorageOption,
+        redactPII: Bool = true,
+        guardian: SwiftNativeGuardian = SwiftNativeGuardian()
+    ) -> String {
+        let speaker = message.role == "user" ? "Prompt" : "Response"
+        let privacyBadge = redactPII ? "Privacy Gate Redacted" : "Full Content"
+        let safeTitle = redactPII
+            ? guardian.redactAndRestorePreview(text: conversationTitle, policy: .strictRedact).sanitized
+            : conversationTitle
+        let body: String
+        if redactPII {
+            if message.role == "user", let sanitized = message.sanitizedCloudPrompt, !sanitized.isEmpty {
+                body = sanitized
+            } else {
+                body = guardian.redactAndRestorePreview(text: message.content, policy: .strictRedact).sanitized
+            }
+        } else {
+            body = message.content
+        }
+
+        return [
+            "# \(safeTitle) — \(speaker)",
+            "",
+            "- **Shared from**: MacHybridAI (\(storageLocation.title))",
+            "- **Mode**: \(message.computeMode.uppercased())",
+            "- **Privacy**: \(privacyBadge)",
+            "",
+            "---",
+            "",
+            body,
+            "",
+        ].joined(separator: "\n")
+    }
+
+    /// Exports a full conversation as a synced `.md` file inside `<ActiveDrive>/MacHybridAI/Shared/`.
+    public func exportShareableConversation(
+        _ conversation: ChatConversationModel,
+        to location: HistoryStorageOption,
+        redactPII: Bool = true,
+        guardian: SwiftNativeGuardian = SwiftNativeGuardian()
+    ) -> URL? {
+        let sharedDir = sharedDirectoryURL(for: location)
+        let slug = Self.sanitizeFilenameSlug(conversation.title, fallback: "conversation")
+        let suffix = redactPII ? "redacted" : "full"
+        let shortId = String(conversation.id.prefix(8))
+        let fileName = "\(slug)-\(shortId)-\(suffix).md"
+        let fileURL = sharedDir.appendingPathComponent(fileName)
+
+        let markdown = renderMarkdown(for: conversation, redactPII: redactPII, guardian: guardian)
+        do {
+            try FileManager.default.createDirectory(at: sharedDir, withIntermediateDirectories: true)
+            try Data(markdown.utf8).write(to: fileURL, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: fileURL.path)
+            return fileURL
+        } catch {
+            return nil
+        }
+    }
+
+    /// Exports a single prompt/response message as a synced `.md` file inside `<ActiveDrive>/MacHybridAI/Shared/`.
+    public func exportShareableMessage(
+        _ message: ChatMessageModel,
+        conversationTitle: String,
+        to location: HistoryStorageOption,
+        redactPII: Bool = true,
+        guardian: SwiftNativeGuardian = SwiftNativeGuardian()
+    ) -> URL? {
+        let sharedDir = sharedDirectoryURL(for: location)
+        let slug = Self.sanitizeFilenameSlug(conversationTitle, fallback: "prompt")
+        let roleTag = message.role == "user" ? "prompt" : "response"
+        let suffix = redactPII ? "redacted" : "full"
+        let shortId = String(message.id.prefix(6))
+        let fileName = "\(slug)-\(roleTag)-\(shortId)-\(suffix).md"
+        let fileURL = sharedDir.appendingPathComponent(fileName)
+
+        let markdown = renderMarkdown(
+            for: message,
+            conversationTitle: conversationTitle,
+            storageLocation: location,
+            redactPII: redactPII,
+            guardian: guardian
+        )
+        do {
+            try FileManager.default.createDirectory(at: sharedDir, withIntermediateDirectories: true)
+            try Data(markdown.utf8).write(to: fileURL, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: fileURL.path)
+            return fileURL
+        } catch {
+            return nil
+        }
+    }
+
+    /// Returns a Google Drive web search URL targeting the exact exported filename for 1-click link sharing.
+    public static func googleDriveWebSearchURL(for fileURL: URL) -> URL? {
+        var comps = URLComponents(string: "https://drive.google.com/drive/search")
+        comps?.queryItems = [URLQueryItem(name: "q", value: fileURL.lastPathComponent)]
+        return comps?.url
     }
 
     public func loadConversations(
@@ -561,15 +833,14 @@ public final class BackendBridge: Sendable {
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) } ?? "/usr/bin/python3"
     }
 
+    /// Initializes the 100% Pure Swift macOS engine (zero Python daemon spawned on launch).
     public func ensureDaemonStarted() {
-        guard let backendDir = resolveBackendDirectory() else { return }
-        DaemonManager.shared.ensureRunning(backendDir: backendDir, pythonPath: pythonPath)
+        DaemonManager.shared.markNativeSwiftReady()
     }
 
+    /// History is persisted natively by `PromptHistoryStore` (Local, iCloud Drive, or Google Drive).
     public func sendHistoryActionAsync(_ body: [String: String]) {
-        Task.detached(priority: .utility) {
-            _ = self.invoke(method: "POST", path: "/v1/history", body: body)
-        }
+        _ = body
     }
 
     private static func prepareAttachedFileContext(_ attachedFiles: [String]) -> (labels: [String], inlineContext: String) {
@@ -664,59 +935,54 @@ public final class BackendBridge: Sendable {
 
     // MARK: – Token streaming (SSE)
 
-    /// Connects to `POST /v1/tasks/stream` and calls `onToken` for every token
-    /// as it arrives from the MLX model or hybrid pipeline.
-    /// Call from a background thread — blocks until the stream ends or an error occurs.
-    ///
-    /// - Parameters:
-    ///   - prompt: Raw user prompt (Privacy Gate runs server-side before streaming starts).
-    ///   - mode: Compute mode (local / hybrid / auto).
-    ///   - sessionId: Optional session ID for history continuity.
-    ///   - onToken: Called on each token string as it streams in.
-    ///   - onReceipt: Called once at stream end with the final receipt dictionary.
+    /// Executes a task natively in Pure Swift (`NativeSwiftEngine`), streaming incremental tokens
+    /// directly from Apple Foundation Models (`FoundationModels` on macOS 26+), Ollama/LM Studio,
+    /// or stateless Cloud AI APIs — with zero Python subprocess required.
     public func streamTask(
         prompt: String,
         mode: ComputeModeOption,
         cloudProvider: CloudProviderOption,
+        guardianPolicy: GuardianPolicyOption = .reversibleMask,
         attachedFiles: [String] = [],
         sessionId: String? = nil,
         approvedSanitizedPrompt: String? = nil,
         onToken: @escaping @Sendable (String) -> Void,
         onReceipt: @escaping @Sendable ([String: Any]) -> Void
     ) {
-        guard let port = DaemonManager.shared.waitUntilReady(timeout: 8) else {
-            onReceipt([:])
-            return
-        }
+        let (_, inlineContext) = Self.prepareAttachedFileContext(attachedFiles)
+        let result = NativeSwiftEngine.shared.runTask(
+            prompt: prompt,
+            mode: mode,
+            cloudProvider: cloudProvider,
+            guardianPolicy: guardianPolicy,
+            attachedFiles: attachedFiles,
+            inlineFileContext: inlineContext,
+            sessionId: sessionId,
+            approvedSanitizedPrompt: approvedSanitizedPrompt,
+            onToken: onToken
+        )
 
-        guard let url = URL(string: "http://127.0.0.1:\(port)/v1/tasks/stream") else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 300   // long-running streams need a generous timeout
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-
-        let (fileLabels, inlineContext) = Self.prepareAttachedFileContext(attachedFiles)
-        var body: [String: Any] = [
-            "prompt": prompt,
-            "mode": mode.rawValue,
-            "cloud_provider": cloudProvider.rawValue,
-            "file_paths": fileLabels,
-            "inline_file_context": inlineContext,
+        let encoder = JSONEncoder()
+        var receiptDict: [String: Any] = [
+            "type": "receipt",
+            "final_output": result.finalOutput,
         ]
-        if let sessionId { body["session_id"] = sessionId }
-        if let approvedSanitizedPrompt, !approvedSanitizedPrompt.isEmpty {
-            body["approved_sanitized_prompt"] = approvedSanitizedPrompt
+        if let recData = try? encoder.encode(result.receipt),
+           let recObj = try? JSONSerialization.jsonObject(with: recData) {
+            receiptDict["receipt"] = recObj
         }
-        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-
-        // Use a delegate-based URLSession so we can process data as it arrives.
-        let delegate = SSEStreamDelegate(onToken: onToken, onReceipt: onReceipt)
-        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
-        let task = session.dataTask(with: req)
-        task.resume()
-        delegate.waitUntilDone()
-        session.invalidateAndCancel()
+        if let stData = try? encoder.encode(result.stations),
+           let stObj = try? JSONSerialization.jsonObject(with: stData) {
+            receiptDict["stations"] = stObj
+        }
+        if let telData = try? encoder.encode(result.telemetry),
+           let telObj = try? JSONSerialization.jsonObject(with: telData) {
+            receiptDict["telemetry"] = telObj
+        }
+        if let sanitized = result.cloudPromptSent {
+            receiptDict["cloud_prompt_sent"] = sanitized
+        }
+        onReceipt(receiptDict)
     }
 
     public func runTask(
@@ -728,34 +994,16 @@ public final class BackendBridge: Sendable {
         sessionId: String? = nil,
         approvedSanitizedPrompt: String? = nil
     ) -> TaskResultModel {
-        let (fileLabels, inlineContext) = Self.prepareAttachedFileContext(attachedFiles)
-        var body: [String: Any] = [
-            "prompt": prompt,
-            "mode": mode.rawValue,
-            "cloud_provider": cloudProvider.rawValue,
-            "file_paths": fileLabels,
-            "inline_file_context": inlineContext,
-        ]
-        if let sessionId {
-            body["session_id"] = sessionId
-        }
-        if let approvedSanitizedPrompt, !approvedSanitizedPrompt.isEmpty {
-            body["approved_sanitized_prompt"] = approvedSanitizedPrompt
-        }
-
-        if let data = invoke(method: "POST", path: "/v1/tasks/run", body: body),
-           let decoded = try? JSONDecoder().decode(TaskResultModel.self, from: data) {
-            return decoded
-        }
-
-        // Native Swift fallback execution
-        return runNativeFallbackTask(
+        let (_, inlineContext) = Self.prepareAttachedFileContext(attachedFiles)
+        return NativeSwiftEngine.shared.runTask(
             prompt: prompt,
             mode: mode,
             cloudProvider: cloudProvider,
             guardianPolicy: guardianPolicy,
             attachedFiles: attachedFiles,
-            sessionId: sessionId
+            inlineFileContext: inlineContext,
+            sessionId: sessionId,
+            approvedSanitizedPrompt: approvedSanitizedPrompt
         )
     }
 
@@ -781,37 +1029,11 @@ public final class BackendBridge: Sendable {
     }
 
     public func fetchHardwareProfile() -> MacHardwareProfileModel {
-        if let data = invoke(method: "GET", path: "/v1/hardware/profile", body: [:]),
-           let decoded = try? JSONDecoder().decode(MacHardwareProfileModel.self, from: data) {
-            return decoded
-        }
-        return nativeHardwareProfileFallback()
+        NativeSwiftEngine.shared.fetchHardwareProfile()
     }
 
     public func runHardwareBenchmark(modelId: String? = nil) -> HardwareBenchmarkResultModel {
-        var body: [String: Any] = ["max_tokens": 24]
-        if let modelId, !modelId.isEmpty {
-            body["model_id"] = modelId
-        }
-        if let data = invoke(method: "POST", path: "/v1/hardware/benchmark", body: body),
-           let decoded = try? JSONDecoder().decode(HardwareBenchmarkResultModel.self, from: data) {
-            return decoded
-        }
-        let target = modelId ?? "mlx-community/gemma-3-4b-it-4bit"
-        return HardwareBenchmarkResultModel(
-            modelId: target,
-            backend: "calibrated-estimate",
-            ttftMs: 140.0,
-            prefillTps: 420.0,
-            decodeTps: 108.5,
-            peakMemoryGb: 2.6,
-            tokensGenerated: 24,
-            durationMs: 220,
-            thermalState: nativeThermalStateString(),
-            memoryPressurePct: 48,
-            guardrailActive: false,
-            guardrailReason: ""
-        )
+        NativeSwiftEngine.shared.runHardwareBenchmark(modelId: modelId)
     }
 
     public func pullOrVerifyLocalModel(
@@ -819,38 +1041,39 @@ public final class BackendBridge: Sendable {
         allowDownload: Bool = false,
         autoPin: Bool = true
     ) -> ModelPullResultModel {
-        let body: [String: Any] = [
-            "model_id": modelId,
-            "allow_download": allowDownload,
-            "auto_pin": autoPin,
-        ]
-        if let data = invoke(method: "POST", path: "/v1/hardware/models/pull", body: body),
-           let decoded = try? JSONDecoder().decode(ModelPullResultModel.self, from: data) {
-            return decoded
-        }
-        return ModelPullResultModel(
-            ok: false,
+        NativeSwiftEngine.shared.pullOrVerifyLocalModel(
             modelId: modelId,
-            backend: "mlx",
-            isCached: false,
-            isComplete: false,
-            sizeGb: 4.0,
-            missingShards: 1,
-            status: "not_cached",
-            message: "Run: machybrid pull \(modelId)",
-            cliCommand: "machybrid pull \(modelId)"
+            allowDownload: allowDownload,
+            autoPin: autoPin
         )
     }
 
+    /// Optional power-user converter: invokes `mlx_lm.convert` via optional Python CLI if installed.
     public func convertFirstPartyLocalModel(repoId: String, qBits: Int = 4) -> ModelPullResultModel {
+        let cleaned = repoId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard NativeModelSecurity.isSafeRepoId(cleaned),
+              NativeModelSecurity.classifyPublisher(modelId: cleaned) == "first_party" else {
+            return ModelPullResultModel(
+                ok: false,
+                modelId: cleaned,
+                backend: "mlx_local_dir",
+                isCached: false,
+                isComplete: false,
+                sizeGb: 0.0,
+                missingShards: 1,
+                status: "rejected_untrusted_source",
+                message: "Local self-quantization only accepts verified first-party repos (apple/*, google/*, Qwen/*, meta-llama/*, mistralai/*, microsoft/*).",
+                cliCommand: "machybrid pull \(cleaned) --convert-local --q-bits \(qBits)"
+            )
+        }
         let body: [String: Any] = [
-            "model_id": repoId,
+            "model_id": cleaned,
             "q_bits": qBits,
         ]
-        if let data = invoke(method: "POST", path: "/v1/hardware/models/convert", body: body),
+        if let data = invokePythonJSON(method: "POST", path: "/v1/hardware/models/convert", body: body),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             let ok = (json["ok"] as? Bool) ?? false
-            let outModel = (json["model_id"] as? String) ?? repoId
+            let outModel = (json["model_id"] as? String) ?? cleaned
             let status = (json["status"] as? String) ?? (ok ? "ready_local_quantized" : "convert_failed")
             let msg = (json["message"] as? String) ?? ""
             return ModelPullResultModel(
@@ -863,39 +1086,33 @@ public final class BackendBridge: Sendable {
                 missingShards: ok ? 0 : 1,
                 status: status,
                 message: msg,
-                cliCommand: "machybrid pull \(repoId) --convert-local --q-bits \(qBits)"
+                cliCommand: "machybrid pull \(cleaned) --convert-local --q-bits \(qBits)"
             )
         }
         return ModelPullResultModel(
             ok: false,
-            modelId: repoId,
+            modelId: cleaned,
             backend: "mlx_local_dir",
             isCached: false,
             isComplete: false,
             sizeGb: 0.0,
             missingShards: 1,
             status: "convert_failed",
-            message: "Local quantization requires backend daemon and mlx-lm installed.",
-            cliCommand: "machybrid pull \(repoId) --convert-local --q-bits \(qBits)"
+            message: "Optional local FP16->MLX conversion requires the Python `mlx-lm` CLI (`machybrid pull \(cleaned) --convert-local --q-bits \(qBits)`).",
+            cliCommand: "machybrid pull \(cleaned) --convert-local --q-bits \(qBits)"
         )
     }
 
     public func updateBackendConfig(body: [String: Any]) {
-        _ = invoke(method: "POST", path: "/v1/config", body: body)
+        NativeSwiftEngine.shared.updateConfig(fields: body)
     }
 
-    /// Asynchronously syncs string config updates and optional in-memory API keys to `POST /v1/config`.
+    /// Updates string config fields and RAM-only API keys directly inside `NativeSwiftEngine`.
     public func syncCloudProviderConfigAsync(
         fields: [String: String],
         apiKeys: [String: String] = [:]
     ) {
-        Task.detached(priority: .utility) {
-            var payload: [String: Any] = fields
-            if !apiKeys.isEmpty {
-                payload["api_keys"] = apiKeys
-            }
-            _ = self.invoke(method: "POST", path: "/v1/config", body: payload)
-        }
+        NativeSwiftEngine.shared.updateConfig(fields: fields, apiKeys: apiKeys)
     }
 
     private func nativeThermalStateString() -> String {

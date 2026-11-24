@@ -113,6 +113,38 @@ class TestPromptHistoryAndZeroCloudRetention(unittest.TestCase):
             self.assertTrue(hist["cloud_ai_zero_retention"])
             self.assertEqual(hist["session_count"], 1)
 
+    def test_google_drive_storage_and_shared_markdown_export(self) -> None:
+        with tempfile.TemporaryDirectory() as gdrive_dir:
+            mgr = PromptHistoryManager(
+                storage_location=HistoryStorageLocation.GDRIVE,
+                retention_policy=HistoryRetentionPolicy.DAYS_30,
+                custom_gdrive_dir=gdrive_dir,
+            )
+            session = mgr.record_exchange(
+                prompt="Draft board deck for Sam Reyes (sam.reyes@meridian.io)",
+                response_text="Board deck outline ready.",
+                compute_mode="hybrid",
+                cloud_provider="gemini",
+                sanitized_cloud_prompt="Draft board deck for [PERSON_1] ([EMAIL_1])",
+                pii_masked_count=2,
+                pii_restored_count=2,
+            )
+            status = mgr.status_dict()
+            self.assertEqual(status["storage_location"], "gdrive")
+            self.assertTrue(status["gdrive_available"])
+
+            exported = mgr.export_session_to_shared_folder(
+                session_id=session.session_id,
+                use_sanitized=True,
+            )
+            self.assertIsNotNone(exported)
+            assert exported is not None
+            self.assertTrue(exported.is_file())
+            self.assertEqual(exported.parent.name, "Shared")
+            content = exported.read_text(encoding="utf-8")
+            self.assertIn("[EMAIL_1]", content)
+            self.assertNotIn("sam.reyes@meridian.io", content)
+
 
 if __name__ == "__main__":
     unittest.main()

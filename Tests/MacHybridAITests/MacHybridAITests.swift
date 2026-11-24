@@ -245,4 +245,154 @@ struct MacHybridAITests {
         #expect(AppAppearanceOption.allCases == [.system, .light, .dark])
         #expect(AppAppearanceOption.system.displayName.contains("macOS"))
     }
+
+    @Test("Cloud prompt storage (iCloud & Google Drive) exports PII-redacted and full shareable Markdown files")
+    func testCloudDriveStorageAndShareableMarkdownExport() throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let localDir = tempBase.appendingPathComponent("local", isDirectory: true)
+        let icloudDir = tempBase.appendingPathComponent("icloud", isDirectory: true)
+        let gdriveDir = tempBase.appendingPathComponent("gdrive", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+
+        let store = PromptHistoryStore(
+            customLocalDirectory: localDir,
+            customICloudDirectory: icloudDir,
+            customGoogleDriveDirectory: gdriveDir
+        )
+
+        #expect(HistoryStorageOption.allCases.contains(.googleDrive))
+        #expect(HistoryStorageOption.iCloudDrive.isCloudBacked == true)
+        #expect(HistoryStorageOption.googleDrive.isCloudBacked == true)
+        #expect(HistoryStorageOption.localMac.isCloudBacked == false)
+
+        let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
+        let userMsg = ChatMessageModel(
+            role: "user",
+            content: "Review Q4 memo for Sam Reyes (sam.reyes@meridian.io, 415-555-2671).",
+            createdAt: baseDate,
+            computeMode: "hybrid",
+            cloudProvider: "gemini"
+        )
+        let assistantMsg = ChatMessageModel(
+            role: "assistant",
+            content: "Completed Q4 analysis for Sam Reyes (sam.reyes@meridian.io).",
+            createdAt: baseDate.addingTimeInterval(5),
+            computeMode: "hybrid",
+            cloudProvider: "gemini"
+        )
+        let conv = ChatConversationModel(
+            title: "../Q4 Deal Memo: Sam Reyes",
+            createdAt: baseDate,
+            updatedAt: baseDate.addingTimeInterval(5),
+            storageLocation: .googleDrive,
+            retentionPolicy: .days30,
+            messages: [userMsg, assistantMsg]
+        )
+
+        store.saveConversations([conv], to: .googleDrive)
+        let loaded = store.loadConversations(from: .googleDrive, now: baseDate.addingTimeInterval(60))
+        #expect(loaded.count == 1)
+
+        // 1. Export PII-redacted conversation to Google Drive Shared/ folder
+        let redactedURL = try #require(
+            store.exportShareableConversation(conv, to: .googleDrive, redactPII: true)
+        )
+        #expect(redactedURL.path.hasPrefix(gdriveDir.appendingPathComponent("Shared").path))
+        #expect(!redactedURL.lastPathComponent.contains(".."))
+        let redactedText = try String(contentsOf: redactedURL, encoding: .utf8)
+        #expect(!redactedText.contains("sam.reyes@meridian.io"))
+        #expect(!redactedText.contains("415-555-2671"))
+        #expect(redactedText.contains("Privacy Gate Redacted"))
+
+        // 2. Export full conversation to iCloud Drive Shared/ folder
+        let fullURL = try #require(
+            store.exportShareableConversation(conv, to: .iCloudDrive, redactPII: false)
+        )
+        #expect(fullURL.path.hasPrefix(icloudDir.appendingPathComponent("Shared").path))
+        let fullText = try String(contentsOf: fullURL, encoding: .utf8)
+        #expect(fullText.contains("sam.reyes@meridian.io"))
+
+        // 3. Export single prompt snippet & build Google Drive Web search URL
+        let snippetURL = try #require(
+            store.exportShareableMessage(userMsg, conversationTitle: conv.title, to: .googleDrive, redactPII: true)
+        )
+        let snippetText = try String(contentsOf: snippetURL, encoding: .utf8)
+        #expect(!snippetText.contains("sam.reyes@meridian.io"))
+        let gdriveWebURL = try #require(PromptHistoryStore.googleDriveWebSearchURL(for: snippetURL))
+        #expect(gdriveWebURL.absoluteString.hasPrefix("https://drive.google.com/drive/search?q="))
+    }
+
+    @Test("Pure Swift NativeSwiftEngine enforces supply-chain audit, CryptoKit SHA-256 pinning, and runs with zero Python daemon")
+    func testPureSwiftNativeEngineSupplyChainAndZeroPythonExecution() throws {
+        // 1. Engine launches directly into Pure Swift Native mode with zero Python daemon
+        BackendBridge.shared.ensureDaemonStarted()
+        #expect(DaemonManager.shared.state == .nativeSwift)
+
+        // 2. Path containment guard blocks system directories outside home/temp
+        #expect(NativeModelSecurity.sanitizeLocalDirectory("/etc") == nil)
+        #expect(NativeModelSecurity.sanitizeLocalDirectory("/usr/bin") == nil)
+
+        // 3. Native Swift supply-chain audit & CryptoKit SHA-256 lockfile verification
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let modelDir = tempBase.appendingPathComponent("clean_model", isDirectory: true)
+        let lockfile = tempBase.appendingPathComponent("models.lock.json")
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+
+        try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
+        try Data("{\"model_type\":\"gemma3\"}".utf8).write(to: modelDir.appendingPathComponent("config.json"))
+        try Data("{\"chat_template\":\"{{ messages }}\"}".utf8).write(to: modelDir.appendingPathComponent("tokenizer_config.json"))
+        try Data("SAFETENSORS_WEIGHTS_BYTES_1234567890".utf8).write(to: modelDir.appendingPathComponent("model.safetensors"))
+
+        // Strict policy blocks unpinned community repo
+        let blocked = NativeModelSecurity.auditModel(
+            modelId: "mlx-community/gemma-3-4b-it-4bit",
+            modelDir: modelDir,
+            allowUnverifiedHuggingFace: false,
+            lockfileURL: lockfile
+        )
+        #expect(blocked.allowed == false)
+
+        // Pin via CryptoKit SHA-256 -> passes under strict policy
+        let digest = try #require(
+            NativeModelSecurity.pinModel(
+                modelId: "mlx-community/gemma-3-4b-it-4bit",
+                modelDir: modelDir,
+                lockfileURL: lockfile
+            )
+        )
+        #expect(digest.count == 64)
+
+        let pinnedAudit = NativeModelSecurity.auditModel(
+            modelId: "mlx-community/gemma-3-4b-it-4bit",
+            modelDir: modelDir,
+            allowUnverifiedHuggingFace: false,
+            lockfileURL: lockfile
+        )
+        #expect(pinnedAudit.allowed == true)
+        #expect(pinnedAudit.lockedSha256Verified == true)
+
+        // Tamper 1 byte -> MUST FAIL CLOSED
+        try Data("TAMPERED_WEIGHTS_9999".utf8).write(to: modelDir.appendingPathComponent("model.safetensors"))
+        let tamperedAudit = NativeModelSecurity.auditModel(
+            modelId: "mlx-community/gemma-3-4b-it-4bit",
+            modelDir: modelDir,
+            allowUnverifiedHuggingFace: false,
+            lockfileURL: lockfile
+        )
+        #expect(tamperedAudit.allowed == false)
+        #expect(tamperedAudit.lockedSha256Verified == false)
+
+        // 4. Pure Swift 4-Station Hybrid task returns real 64-char CryptoKit SHA-256 receipts
+        let res = NativeSwiftEngine.shared.runTask(
+            prompt: "Compare Q4 ARR for Contact: Sam Reyes (sam.reyes@meridian.io).",
+            mode: .hybrid,
+            cloudProvider: .gemini,
+            guardianPolicy: .reversibleMask,
+            attachedFiles: []
+        )
+        #expect(res.receipt.outboundPayloadSha256.count == 64)
+        #expect(res.receipt.receiptSignatureSha256.count == 64)
+        #expect(!(res.cloudPromptSent?.contains("sam.reyes@meridian.io") ?? true))
+        #expect(res.finalOutput.contains("sam.reyes@meridian.io"))
+    }
 }

@@ -22,7 +22,7 @@ public enum MainWorkspaceSection: String, CaseIterable, Hashable, Sendable {
     public var title: String {
         switch self {
         case .chat: return "Hybrid Chat"
-        case .history: return "History & iCloud"
+        case .history: return "History & Cloud"
         case .privacyGate: return "Privacy Gate"
         }
     }
@@ -228,11 +228,13 @@ public enum GuardianPolicyOption: String, CaseIterable, Codable, Sendable {
 public enum HistoryStorageOption: String, CaseIterable, Codable, Sendable {
     case localMac = "local"
     case iCloudDrive = "icloud"
+    case googleDrive = "gdrive"
 
     public var title: String {
         switch self {
         case .localMac: return "On This Mac Only"
         case .iCloudDrive: return "iCloud Drive"
+        case .googleDrive: return "Google Drive"
         }
     }
 
@@ -242,6 +244,8 @@ public enum HistoryStorageOption: String, CaseIterable, Codable, Sendable {
             return "~/Library/Application Support/MacHybridAI/history"
         case .iCloudDrive:
             return "~/Library/Mobile Documents/com~apple~CloudDocs/MacHybridAI"
+        case .googleDrive:
+            return "~/Library/CloudStorage/GoogleDrive-*/My Drive/MacHybridAI"
         }
     }
 
@@ -249,6 +253,19 @@ public enum HistoryStorageOption: String, CaseIterable, Codable, Sendable {
         switch self {
         case .localMac: return "internaldrive.fill"
         case .iCloudDrive: return "icloud.and.arrow.up.fill"
+        case .googleDrive: return "cloud.fill"
+        }
+    }
+
+    public var isCloudBacked: Bool {
+        self == .iCloudDrive || self == .googleDrive
+    }
+
+    public var shareActionLabel: String {
+        switch self {
+        case .localMac: return "Share Prompt File…"
+        case .iCloudDrive: return "Share via iCloud Drive…"
+        case .googleDrive: return "Share via Google Drive…"
         }
     }
 }
