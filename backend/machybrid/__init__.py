@@ -25,12 +25,14 @@ from .m365_proxy import (
     M365ToolEmulator,
 )
 from .model_security import (
-    HUGGINGFACE_BYPASS_WARNING,
+    FIRST_PARTY_MODEL_ORGS,
+    HUGGINGFACE_OVERRIDE_WARNING,
     ModelAuditResult,
     ModelSecuritySettings,
     ModelTrustPolicy,
     audit_model_directory,
     pin_model_to_lockfile,
+    sanitize_local_model_dir,
 )
 from .orchestrator import (
     ComputeMode,
@@ -76,12 +78,14 @@ __all__ = [
     "M365CopilotProxyManager",
     "M365ModelCatalog",
     "M365ToolEmulator",
-    "HUGGINGFACE_BYPASS_WARNING",
+    "FIRST_PARTY_MODEL_ORGS",
+    "HUGGINGFACE_OVERRIDE_WARNING",
     "ModelAuditResult",
     "ModelSecuritySettings",
     "ModelTrustPolicy",
     "audit_model_directory",
     "pin_model_to_lockfile",
+    "sanitize_local_model_dir",
     "ComputeMode",
     "ExecutionReceipt",
     "HybridConfig",

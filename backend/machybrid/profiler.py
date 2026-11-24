@@ -33,6 +33,7 @@ from .model_security import (
     audit_model_directory,
     classify_model_publisher,
     pin_model_to_lockfile,
+    sanitize_local_model_dir,
 )
 
 
@@ -667,8 +668,8 @@ class HardwareProfiler:
                 note = "Ready (First-Party Publisher)"
             elif is_pinned:
                 note = "Ready (SHA-256 Lockfile Pinned)"
-            elif audit.bypass_used:
-                note = "Usable (Hugging Face Bypass Active)"
+            elif audit.override_used:
+                note = "Usable (Hugging Face Override Active)"
             else:
                 note = "Ready"
             return audit.publisher_trust, is_pinned, True, note
@@ -1091,13 +1092,14 @@ class HardwareProfiler:
 
         # Run supply-chain audit and optional SHA-256 lockfile pin when weights are complete
         pinned_sha = ""
-        if is_complete and snap_path:
+        safe_snap = sanitize_local_model_dir(snap_path) if (is_complete and snap_path) else None
+        if is_complete and safe_snap is not None:
             audit = audit_model_directory(
                 model_id=canonical_id,
-                model_dir=Path(snap_path),
+                model_dir=safe_snap,
                 settings=ModelSecuritySettings(
                     allow_unverified_huggingface=True,
-                    huggingface_bypass_acknowledged=True,
+                    huggingface_override_acknowledged=True,
                     lockfile_path=sec.lockfile_path,
                 ),
             )
@@ -1120,7 +1122,7 @@ class HardwareProfiler:
                     lock_path = Path(sec.lockfile_path) if sec.lockfile_path else None
                     pin_entry = pin_model_to_lockfile(
                         model_id=canonical_id,
-                        model_dir=Path(snap_path),
+                        model_dir=safe_snap,
                         lockfile_path=lock_path,
                     )
                     pinned_sha = str(pin_entry.get("manifest_sha256", ""))
@@ -1184,8 +1186,12 @@ class HardwareProfiler:
         if not slug or not _SAFE_LOCAL_SLUG_RE.match(slug):
             return {"ok": False, "model_id": cleaned, "status": "invalid_slug", "message": "Invalid output directory name."}
 
-        base_dir = Path(os.path.realpath(str(models_root or Path(os.path.expanduser("~/Models")))))
-        out_dir = base_dir / f"{slug}-mlx-{bits}bit"
+        base_str = os.path.normpath(os.path.realpath(str(models_root or Path(os.path.expanduser("~/Models")))))
+        out_str = os.path.normpath(os.path.join(base_str, f"{slug}-mlx-{bits}bit"))
+        if not out_str.startswith(base_str + os.sep):
+            return {"ok": False, "model_id": cleaned, "status": "invalid_slug", "message": "Invalid output directory name."}
+        base_dir = Path(base_str)
+        out_dir = Path(out_str)
         base_dir.mkdir(parents=True, exist_ok=True)
 
         try:

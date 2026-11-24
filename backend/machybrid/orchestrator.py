@@ -32,7 +32,7 @@ from .history import (
 )
 from .local_rag import LocalWorkspaceRAG
 from .m365_proxy import M365CopilotProxyManager, M365ModelCatalog, M365ProxySettings
-from .model_security import ModelSecuritySettings
+from .model_security import ModelSecuritySettings, sanitize_local_model_dir
 from .profiler import HardwareProfiler
 from .providers import (
     CLOUD_PROVIDER_PRESETS,
@@ -76,7 +76,7 @@ class HybridConfig:
     local_base_url: str = "http://127.0.0.1:11434/v1"
     litert_model_path: str = "~/.litert-lm/models/gemma4-26b/model.litertlm"
     allow_unverified_huggingface: bool = False
-    huggingface_bypass_acknowledged: bool = False
+    huggingface_override_acknowledged: bool = False
     apple_signed_only: bool = False
     local_model_dir: str = ""
     model_lockfile_path: str = ""
@@ -112,7 +112,7 @@ class HybridConfig:
             "local_base_url": self.local_base_url,
             "litert_model_path": self.litert_model_path,
             "allow_unverified_huggingface": self.allow_unverified_huggingface,
-            "huggingface_bypass_acknowledged": self.huggingface_bypass_acknowledged,
+            "huggingface_override_acknowledged": self.huggingface_override_acknowledged,
             "apple_signed_only": self.apple_signed_only,
             "local_model_dir": self.local_model_dir,
             "model_lockfile_path": self.model_lockfile_path,
@@ -237,15 +237,15 @@ class HybridOrchestrator:
         self.config = config or HybridConfig()
         # Hydrate persisted user supply-chain security settings when using default config
         if config is None:
-            saved_sec = ModelSecuritySettings.load()
-            self.config.allow_unverified_huggingface = saved_sec.allow_unverified_huggingface
-            self.config.huggingface_bypass_acknowledged = saved_sec.huggingface_bypass_acknowledged
-            self.config.apple_signed_only = saved_sec.apple_signed_only
-            if saved_sec.local_model_dir:
-                self.config.local_model_dir = saved_sec.local_model_dir
-            if saved_sec.lockfile_path:
-                self.config.model_lockfile_path = saved_sec.lockfile_path
-            self.config.require_lockfile_match = saved_sec.require_lockfile_match
+            saved_policy = ModelSecuritySettings.load()
+            self.config.allow_unverified_huggingface = saved_policy.allow_unverified_huggingface
+            self.config.huggingface_override_acknowledged = saved_policy.huggingface_override_acknowledged
+            self.config.apple_signed_only = saved_policy.apple_signed_only
+            if saved_policy.local_model_dir:
+                self.config.local_model_dir = saved_policy.local_model_dir
+            if saved_policy.lockfile_path:
+                self.config.model_lockfile_path = saved_policy.lockfile_path
+            self.config.require_lockfile_match = saved_policy.require_lockfile_match
         self.guardian = PIIGuardian(
             policy=self.config.guardian_policy,
             custom_sensitive_terms=self.config.custom_sensitive_terms,
@@ -276,7 +276,7 @@ class HybridOrchestrator:
         """Returns the active local model supply-chain security settings."""
         return ModelSecuritySettings(
             allow_unverified_huggingface=self.config.allow_unverified_huggingface,
-            huggingface_bypass_acknowledged=self.config.huggingface_bypass_acknowledged,
+            huggingface_override_acknowledged=self.config.huggingface_override_acknowledged,
             apple_signed_only=self.config.apple_signed_only,
             local_model_dir=self.config.local_model_dir,
             lockfile_path=self.config.model_lockfile_path,
@@ -313,17 +313,23 @@ class HybridOrchestrator:
         if "allow_unverified_huggingface" in updates:
             self.config.allow_unverified_huggingface = bool(updates["allow_unverified_huggingface"])
             security_changed = True
-        if "huggingface_bypass_acknowledged" in updates:
-            self.config.huggingface_bypass_acknowledged = bool(updates["huggingface_bypass_acknowledged"])
+        if "huggingface_override_acknowledged" in updates:
+            self.config.huggingface_override_acknowledged = bool(updates["huggingface_override_acknowledged"])
             security_changed = True
         if "apple_signed_only" in updates:
             self.config.apple_signed_only = bool(updates["apple_signed_only"])
             security_changed = True
         if "local_model_dir" in updates:
-            self.config.local_model_dir = str(updates["local_model_dir"] or "").strip()
-            security_changed = True
-        if "model_lockfile_path" in updates:
-            self.config.model_lockfile_path = str(updates["model_lockfile_path"] or "").strip()
+            raw_dir = str(updates["local_model_dir"] or "").strip()
+            if not raw_dir:
+                self.config.local_model_dir = ""
+            else:
+                safe_dir = sanitize_local_model_dir(raw_dir)
+                if safe_dir is None:
+                    raise ValueError(
+                        "Invalid local_model_dir: directory must reside inside your home or temp folder."
+                    )
+                self.config.local_model_dir = str(safe_dir)
             security_changed = True
         if "require_lockfile_match" in updates:
             self.config.require_lockfile_match = bool(updates["require_lockfile_match"])

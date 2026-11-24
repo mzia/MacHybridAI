@@ -349,7 +349,7 @@ final class HybridAppViewModel: ObservableObject {
             BackendBridge.shared.updateBackendConfig(
                 body: [
                     "allow_unverified_huggingface": allow,
-                    "huggingface_bypass_acknowledged": allow,
+                    "huggingface_override_acknowledged": allow,
                     "persist_security_settings": true,
                 ]
             )

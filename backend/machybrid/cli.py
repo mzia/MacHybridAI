@@ -23,7 +23,7 @@ from . import __version__
 from .agent import AgentRunResult, CLISessionStore, HybridCLIAgent, diagnose_cli_permissions
 from .guardian import GuardianPolicy
 from .model_security import (
-    HUGGINGFACE_BYPASS_WARNING,
+    HUGGINGFACE_OVERRIDE_WARNING,
     audit_model_directory,
     load_model_lockfile,
     pin_model_to_lockfile,
@@ -232,41 +232,41 @@ def _print_sessions_table(ansi: _ANSI, store: CLISessionStore) -> List[Dict[str,
 
 
 def _print_security_status(ansi: _ANSI, orchestrator: HybridOrchestrator) -> Dict[str, Any]:
-    sec = orchestrator.get_model_security_settings()
+    policy_cfg = orchestrator.get_model_security_settings()
     fm_ok, fm_reason = AppleFoundationModelsProvider.check_availability()
-    lock_path = Path(sec.lockfile_path) if sec.lockfile_path else None
+    lock_path = Path(policy_cfg.lockfile_path) if policy_cfg.lockfile_path else None
     locked = load_model_lockfile(lock_path)
     summary = {
-        "security": sec.to_dict(),
+        "security": policy_cfg.to_dict(),
         "local_backend": orchestrator.config.local_backend,
         "apple_foundation_models": {"available": fm_ok, "reason": fm_reason},
         "pinned_models": sorted(locked.keys()),
     }
     print(ansi.bold("\nMacHybridAI Model Supply-Chain Security Status:"))
     policy_badge = (
-        ansi.yellow("BYPASS ENABLED (UNVERIFIED HUGGING FACE ALLOWED)")
-        if sec.allow_unverified_huggingface
-        else ansi.green(f"STRICT PROTECTION ACTIVE ({sec.policy.value})")
+        ansi.yellow("OVERRIDE ENABLED (UNVERIFIED HUGGING FACE ALLOWED)")
+        if policy_cfg.allow_unverified_huggingface
+        else ansi.green(f"STRICT PROTECTION ACTIVE ({policy_cfg.policy.value})")
     )
     print(f"  Policy         : {policy_badge}")
     print(f"  Local Backend  : {ansi.cyan(orchestrator.config.local_backend)}")
     fm_badge = ansi.green("AVAILABLE") if fm_ok else ansi.dim("UNAVAILABLE")
     print(f"  Apple FM (OS)  : {fm_badge} — {fm_reason}")
-    print(f"  Local Dir      : {sec.local_model_dir or '(not set — use --local-model-dir to skip Hugging Face)'}")
+    print(f"  Local Dir      : {policy_cfg.local_model_dir or '(not set — use --local-model-dir to skip Hugging Face)'}")
     print("  Hard Locks     : trust_remote_code=False · .py/.bin/.pt/.pkl/.so/.dylib BLOCKED · auto_map & SSTI BLOCKED")
-    print(f"  Trusted Orgs   : {', '.join(summary['security']['trusted_publishers'])}")
+    print(f"  First-Party    : {', '.join(summary['security']['first_party_orgs'])}")
     print(f"  SHA-256 Pins   : {len(locked)} model(s) ({', '.join(sorted(locked.keys())) or 'none'})")
-    if sec.allow_unverified_huggingface:
-        print(ansi.yellow(f"\n  {HUGGINGFACE_BYPASS_WARNING}"))
+    if policy_cfg.allow_unverified_huggingface:
+        print(ansi.yellow(f"\n  {HUGGINGFACE_OVERRIDE_WARNING}"))
     print()
     return summary
 
 
-def _confirm_huggingface_bypass_interactive(ansi: _ANSI) -> bool:
-    print(ansi.yellow(f"\n  [SECURITY WARNING]\n  {HUGGINGFACE_BYPASS_WARNING}\n"))
+def _confirm_huggingface_override_interactive(ansi: _ANSI) -> bool:
+    print(ansi.yellow(f"\n  [SECURITY WARNING]\n  {HUGGINGFACE_OVERRIDE_WARNING}\n"))
     try:
         answer = input(
-            ansi.bold("  Type 'I ACCEPT THE RISK' to enable unverified Hugging Face bypass (anything else cancels): ")
+            ansi.bold("  Type 'I ACCEPT THE RISK' to enable unverified Hugging Face override (anything else cancels): ")
         ).strip()
     except (EOFError, KeyboardInterrupt):
         return False
@@ -373,15 +373,15 @@ def handle_slash_command(
     if cmd == "/security":
         action = parts[1].lower() if len(parts) >= 2 else "status"
         if action in {"allow-hf", "bypass-on", "enable-bypass"}:
-            if _confirm_huggingface_bypass_interactive(ansi):
+            if _confirm_huggingface_override_interactive(ansi):
                 orchestrator.update_config(
                     {
                         "allow_unverified_huggingface": True,
-                        "huggingface_bypass_acknowledged": True,
+                        "huggingface_override_acknowledged": True,
                         "persist_security_settings": True,
                     }
                 )
-                print(ansi.yellow("  WARNING: Unverified Hugging Face bypass ENABLED and saved."))
+                print(ansi.yellow("  WARNING: Unverified Hugging Face override ENABLED and saved."))
             else:
                 print(ansi.green("  Cancelled — Strict Model Supply-Chain Protection remains ACTIVE."))
             return True
@@ -389,11 +389,11 @@ def handle_slash_command(
             orchestrator.update_config(
                 {
                     "allow_unverified_huggingface": False,
-                    "huggingface_bypass_acknowledged": False,
+                    "huggingface_override_acknowledged": False,
                     "persist_security_settings": True,
                 }
             )
-            print(ansi.green("  Revoked Hugging Face bypass — Strict Model Supply-Chain Protection is now ACTIVE."))
+            print(ansi.green("  Revoked Hugging Face override — Strict Model Supply-Chain Protection is now ACTIVE."))
             return True
         _print_security_status(ansi, orchestrator)
         return True
@@ -875,11 +875,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cfg_updates["local_model_dir"] = args.local_model_dir
     if args.allow_huggingface_bypass:
         cfg_updates["allow_unverified_huggingface"] = True
-        cfg_updates["huggingface_bypass_acknowledged"] = True
+        cfg_updates["huggingface_override_acknowledged"] = True
     orchestrator.update_config(cfg_updates)
 
     if args.allow_huggingface_bypass and not args.json:
-        print(ansi.yellow(f"\n  [SECURITY WARNING] {HUGGINGFACE_BYPASS_WARNING}\n"), file=sys.stderr)
+        print(ansi.yellow(f"\n  [SECURITY WARNING] {HUGGINGFACE_OVERRIDE_WARNING}\n"), file=sys.stderr)
 
     if args.subcommand == "providers":
         catalog = _public_provider_rows(orchestrator)
@@ -918,13 +918,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action = args.security_action
         if action == "status":
             if args.json:
-                sec = orchestrator.get_model_security_settings()
+                policy_cfg = orchestrator.get_model_security_settings()
                 fm_ok, fm_reason = AppleFoundationModelsProvider.check_availability()
-                locked = load_model_lockfile(Path(sec.lockfile_path) if sec.lockfile_path else None)
+                locked = load_model_lockfile(Path(policy_cfg.lockfile_path) if policy_cfg.lockfile_path else None)
                 print(
                     json.dumps(
                         {
-                            "security": sec.to_dict(),
+                            "security": policy_cfg.to_dict(),
                             "local_backend": orchestrator.config.local_backend,
                             "apple_foundation_models": {"available": fm_ok, "reason": fm_reason},
                             "pinned_models": sorted(locked.keys()),
@@ -938,7 +938,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if action == "allow-hf":
             confirmed = bool(args.confirm_warning) or (
-                not args.json and _confirm_huggingface_bypass_interactive(ansi)
+                not args.json and _confirm_huggingface_override_interactive(ansi)
             )
             if not confirmed:
                 if args.json:
@@ -947,7 +947,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             {
                                 "enabled": False,
                                 "error": "Explicit warning acknowledgement required (--confirm-warning).",
-                                "warning": HUGGINGFACE_BYPASS_WARNING,
+                                "warning": HUGGINGFACE_OVERRIDE_WARNING,
                             },
                             indent=2,
                         )
@@ -958,28 +958,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             orchestrator.update_config(
                 {
                     "allow_unverified_huggingface": True,
-                    "huggingface_bypass_acknowledged": True,
+                    "huggingface_override_acknowledged": True,
                     "persist_security_settings": True,
                 }
             )
             if args.json:
-                print(json.dumps({"enabled": True, "warning": HUGGINGFACE_BYPASS_WARNING}, indent=2))
+                print(json.dumps({"enabled": True, "warning": HUGGINGFACE_OVERRIDE_WARNING}, indent=2))
             else:
-                print(ansi.yellow("WARNING: Unverified Hugging Face supply-chain bypass ENABLED and saved."))
+                print(ansi.yellow("WARNING: Unverified Hugging Face supply-chain override ENABLED and saved."))
             return 0
 
         if action == "revoke-hf":
             orchestrator.update_config(
                 {
                     "allow_unverified_huggingface": False,
-                    "huggingface_bypass_acknowledged": False,
+                    "huggingface_override_acknowledged": False,
                     "persist_security_settings": True,
                 }
             )
             if args.json:
                 print(json.dumps({"enabled": False, "policy": orchestrator.get_model_security_settings().policy.value}, indent=2))
             else:
-                print(ansi.green("Revoked Hugging Face bypass — Strict Model Supply-Chain Protection is now ACTIVE."))
+                print(ansi.green("Revoked Hugging Face override — Strict Model Supply-Chain Protection is now ACTIVE."))
             return 0
 
         target = str(args.target or "").strip()

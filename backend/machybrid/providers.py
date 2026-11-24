@@ -37,6 +37,7 @@ from .model_security import (
     ModelAuditResult,
     ModelSecuritySettings,
     audit_model_directory,
+    sanitize_local_model_dir,
 )
 from .profiler import HardwareProfiler
 
@@ -313,9 +314,11 @@ class MLXProvider:
         self.temperature = temperature
         self.system_instruction = system_instruction
         self.security_settings = security_settings or ModelSecuritySettings.load()
-        self.local_model_dir = (local_model_dir or self.security_settings.local_model_dir or "").strip()
+        raw_local_dir = (local_model_dir or self.security_settings.local_model_dir or "").strip()
+        safe_local_dir = sanitize_local_model_dir(raw_local_dir) if raw_local_dir else None
+        self.local_model_dir = str(safe_local_dir) if safe_local_dir is not None else ""
         self._model_id = (
-            os.path.realpath(os.path.expanduser(self.local_model_dir))
+            self.local_model_dir
             if self.local_model_dir
             else self._resolve_model(model)
         )
@@ -454,10 +457,10 @@ class MLXProvider:
         target_dir: Optional[Path] = None
         is_local_dir = bool(self.local_model_dir)
         if is_local_dir:
-            target_dir = Path(self._model_id)
-            if not target_dir.is_dir():
+            target_dir = sanitize_local_model_dir(self.local_model_dir)
+            if target_dir is None or not target_dir.is_dir():
                 return self._local_fallback_response(
-                    prompt, local_files_context, reason=f"local_model_dir_not_found: {target_dir}"
+                    prompt, local_files_context, reason="local_model_dir_not_found"
                 )
         else:
             _, is_complete, _, local_path, _ = HardwareProfiler.inspect_hf_model_cache(self._model_id)
@@ -472,7 +475,7 @@ class MLXProvider:
                         prompt, local_files_context, reason="model_weights_not_cached"
                     )
             if local_path:
-                target_dir = Path(local_path)
+                target_dir = sanitize_local_model_dir(local_path)
 
         # Supply-chain security verification BEFORE loading weights into memory
         audit = audit_model_directory(
@@ -502,7 +505,7 @@ class MLXProvider:
                     "audit_errors": list(audit.errors),
                 },
             )
-        if audit.bypass_used and audit.warnings:
+        if audit.override_used and audit.warnings:
             print(f"\n[MacHybridAI] {audit.warnings[0]}\n", file=sys.stderr)
 
         sys_inst = system_instruction or self.system_instruction
@@ -544,7 +547,7 @@ class MLXProvider:
                     "elapsed_s": round(elapsed_s, 2),
                     "unified_memory_gb": self.unified_memory_gb(),
                     "publisher_trust": audit.publisher_trust,
-                    "huggingface_bypass_used": audit.bypass_used,
+                    "huggingface_override_used": audit.override_used,
                     "supply_chain_warning": audit.warnings[0] if audit.warnings else "",
                     "trust_remote_code": False,
                 },
@@ -661,14 +664,14 @@ class MLXProvider:
                 is_local_dir = bool(self.local_model_dir)
                 target_dir: Optional[Path] = None
                 if is_local_dir:
-                    target_dir = Path(self._model_id)
+                    target_dir = sanitize_local_model_dir(self.local_model_dir)
                     os.environ["HF_HUB_OFFLINE"] = "1"
                 else:
                     _, is_complete, _, local_path, _ = HardwareProfiler.inspect_hf_model_cache(self._model_id)
                     if is_complete:
                         os.environ["HF_HUB_OFFLINE"] = "1"
                     if local_path:
-                        target_dir = Path(local_path)
+                        target_dir = sanitize_local_model_dir(local_path)
 
                 audit = audit_model_directory(
                     model_id=self._model_id,
@@ -681,7 +684,8 @@ class MLXProvider:
                     raise PermissionError("; ".join(audit.errors))
 
                 # Always load from resolved local snapshot/dir when available & lock trust_remote_code=False
-                load_target = str(target_dir) if (target_dir is not None and target_dir.is_dir()) else self._model_id
+                safe_load_dir = sanitize_local_model_dir(str(target_dir)) if target_dir is not None else None
+                load_target = str(safe_load_dir) if (safe_load_dir is not None and safe_load_dir.is_dir()) else self._model_id
                 try:
                     model, tokenizer = load(
                         load_target,
@@ -961,7 +965,9 @@ class LocalModelProvider:
         self.base_url = base_url.rstrip("/")
         self.litert_model_path = os.path.abspath(os.path.expanduser(litert_model_path))
         self.security_settings = security_settings or ModelSecuritySettings.load()
-        self.local_model_dir = (local_model_dir or self.security_settings.local_model_dir or "").strip()
+        raw_dir = (local_model_dir or self.security_settings.local_model_dir or "").strip()
+        safe_dir = sanitize_local_model_dir(raw_dir) if raw_dir else None
+        self.local_model_dir = str(safe_dir) if safe_dir is not None else ""
 
     def generate(
         self,

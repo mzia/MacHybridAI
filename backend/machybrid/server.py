@@ -516,11 +516,11 @@ def dispatch_request(
                 ],
             }
         if path == "/v1/security/models":
-            sec = orchestrator.get_model_security_settings()
+            policy_cfg = orchestrator.get_model_security_settings()
             fm_ok, fm_reason = AppleFoundationModelsProvider.check_availability()
             locked = load_model_lockfile()
             return HTTPStatus.OK, {
-                "security": sec.to_dict(),
+                "security": policy_cfg.to_dict(),
                 "apple_foundation_models": {
                     "available": fm_ok,
                     "reason": fm_reason,

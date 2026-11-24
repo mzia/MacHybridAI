@@ -12,11 +12,12 @@ from unittest.mock import MagicMock, patch
 
 from machybrid.cli import main
 from machybrid.model_security import (
-    HUGGINGFACE_BYPASS_WARNING,
+    HUGGINGFACE_OVERRIDE_WARNING,
     ModelSecuritySettings,
     ModelTrustPolicy,
     audit_model_directory,
     pin_model_to_lockfile,
+    sanitize_local_model_dir,
 )
 from machybrid.orchestrator import HybridOrchestrator
 from machybrid.profiler import SAFE_DOWNLOAD_ALLOW_PATTERNS, HardwareProfiler
@@ -68,51 +69,51 @@ class TestModelSupplyChainSecurity(unittest.TestCase):
             self.assertEqual(res_comm.publisher_trust, "community_unverified")
             self.assertTrue(any("Blocked unverified Hugging Face" in e for e in res_comm.errors))
 
-    def test_explicit_huggingface_bypass_allows_community_with_warning_but_still_blocks_malicious_files(self) -> None:
-        bypass = ModelSecuritySettings(
+    def test_explicit_huggingface_override_allows_community_with_warning_but_still_blocks_malicious_files(self) -> None:
+        override = ModelSecuritySettings(
             allow_unverified_huggingface=True,
-            huggingface_bypass_acknowledged=True,
+            huggingface_override_acknowledged=True,
         )
-        self.assertEqual(bypass.policy, ModelTrustPolicy.HUGGINGFACE_BYPASS)
+        self.assertEqual(override.policy, ModelTrustPolicy.HUGGINGFACE_OVERRIDE)
 
         with tempfile.TemporaryDirectory() as tmp:
             clean_dir = _make_clean_model_dir(Path(tmp) / "clean")
             res_ok = audit_model_directory(
-                "mlx-community/gemma-3-4b-it-4bit", model_dir=clean_dir, settings=bypass
+                "mlx-community/gemma-3-4b-it-4bit", model_dir=clean_dir, settings=override
             )
             self.assertTrue(res_ok.allowed)
-            self.assertTrue(res_ok.bypass_used)
-            self.assertIn(HUGGINGFACE_BYPASS_WARNING, res_ok.warnings)
+            self.assertTrue(res_ok.override_used)
+            self.assertIn(HUGGINGFACE_OVERRIDE_WARNING, res_ok.warnings)
 
-            # Even with bypass ON, pickle/Python/executable files are HARD BLOCKED!
+            # Even with override ON, pickle/Python/executable files are HARD BLOCKED!
             evil_dir = _make_clean_model_dir(Path(tmp) / "evil_py")
             (evil_dir / "modeling_custom.py").write_text("import os\n", encoding="utf-8")
             res_py = audit_model_directory(
-                "mlx-community/gemma-3-4b-it-4bit", model_dir=evil_dir, settings=bypass
+                "mlx-community/gemma-3-4b-it-4bit", model_dir=evil_dir, settings=override
             )
             self.assertFalse(res_py.allowed)
             self.assertTrue(any("pickle/executable" in e for e in res_py.errors))
 
-            # Even with bypass ON, Jinja2 SSTI in chat_template is HARD BLOCKED!
+            # Even with override ON, Jinja2 SSTI in chat_template is HARD BLOCKED!
             ssti_dir = _make_clean_model_dir(Path(tmp) / "evil_ssti")
             (ssti_dir / "tokenizer_config.json").write_text(
                 json.dumps({"chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}"}),
                 encoding="utf-8",
             )
             res_ssti = audit_model_directory(
-                "mlx-community/gemma-3-4b-it-4bit", model_dir=ssti_dir, settings=bypass
+                "mlx-community/gemma-3-4b-it-4bit", model_dir=ssti_dir, settings=override
             )
             self.assertFalse(res_ssti.allowed)
             self.assertTrue(any("suspicious pattern" in e for e in res_ssti.errors))
 
-            # Even with bypass ON, auto_map in config.json is HARD BLOCKED!
+            # Even with override ON, auto_map in config.json is HARD BLOCKED!
             automap_dir = _make_clean_model_dir(Path(tmp) / "evil_automap")
             (automap_dir / "config.json").write_text(
                 json.dumps({"model_type": "custom", "auto_map": {"AutoModel": "evil.Model"}}),
                 encoding="utf-8",
             )
             res_am = audit_model_directory(
-                "mlx-community/gemma-3-4b-it-4bit", model_dir=automap_dir, settings=bypass
+                "mlx-community/gemma-3-4b-it-4bit", model_dir=automap_dir, settings=override
             )
             self.assertFalse(res_am.allowed)
             self.assertTrue(any("auto_map" in e for e in res_am.errors))
@@ -333,6 +334,41 @@ class TestModelSupplyChainSecurity(unittest.TestCase):
             )
             self.assertFalse(bad_conv["ok"])
             self.assertEqual(bad_conv["status"], "rejected_untrusted_source")
+
+    def test_path_injection_guards_reject_paths_outside_home_and_temp(self) -> None:
+        # 1. System directories outside home/temp are strictly rejected
+        self.assertIsNone(sanitize_local_model_dir("/etc"))
+        self.assertIsNone(sanitize_local_model_dir("/etc/passwd"))
+        self.assertIsNone(sanitize_local_model_dir("/usr/bin"))
+        self.assertIsNone(sanitize_local_model_dir("/tmp/../../etc/passwd"))
+
+        # 2. HTTP POST /v1/config rejects local_model_dir outside home/temp
+        orch = HybridOrchestrator()
+        code, body = dispatch_request(orch, "POST", "/v1/config", {"local_model_dir": "/etc"})
+        self.assertEqual(int(code), 400)
+        self.assertIn("error", body)
+
+        # 3. HTTP POST /v1/config cannot overwrite model_lockfile_path
+        orig_lock = orch.config.model_lockfile_path
+        code2, body2 = dispatch_request(
+            orch,
+            "POST",
+            "/v1/config",
+            {"model_lockfile_path": "/etc/passwd", "huggingface_override_acknowledged": True},
+        )
+        self.assertEqual(int(code2), 200)
+        self.assertEqual(orch.config.model_lockfile_path, orig_lock)
+        self.assertTrue(body2["huggingface_override_acknowledged"])
+
+        # 4. Valid temp directory is accepted by sanitize_local_model_dir and POST /v1/config
+        with tempfile.TemporaryDirectory() as tmp:
+            clean_dir = _make_clean_model_dir(Path(tmp) / "safe_model")
+            self.assertIsNotNone(sanitize_local_model_dir(str(clean_dir)))
+            code3, body3 = dispatch_request(
+                orch, "POST", "/v1/config", {"local_model_dir": str(clean_dir)}
+            )
+            self.assertEqual(int(code3), 200)
+            self.assertEqual(Path(body3["local_model_dir"]).resolve(), clean_dir.resolve())
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -33,10 +34,10 @@ class ModelTrustPolicy(str, Enum):
 
     APPLE_SIGNED_ONLY = "apple_signed_only"
     STRICT_VERIFIED = "strict_verified"
-    HUGGINGFACE_BYPASS = "huggingface_bypass"
+    HUGGINGFACE_OVERRIDE = "huggingface_override"
 
 
-TRUSTED_FIRST_PARTY_PUBLISHERS = frozenset(
+FIRST_PARTY_MODEL_ORGS = frozenset(
     {
         "apple",
         "google",
@@ -78,8 +79,8 @@ _SUSPICIOUS_TEMPLATE_TOKENS = (
     "exec(",
 )
 
-HUGGINGFACE_BYPASS_WARNING = (
-    "SECURITY WARNING: Unverified Hugging Face Supply-Chain Bypass is ENABLED. "
+HUGGINGFACE_OVERRIDE_WARNING = (
+    "SECURITY WARNING: Unverified Hugging Face Supply-Chain Override is ENABLED. "
     "Community repositories (such as mlx-community/* or lmstudio-community/*) are NOT "
     "signed by Apple and may be modified by third-party contributors. "
     "Remote Python code (trust_remote_code=False) and pickle/executable files (.py/.bin/.pt/.pkl) "
@@ -96,12 +97,40 @@ def default_lockfile_path() -> Path:
     return Path(os.path.expanduser("~/.config/machybrid/models.lock.json"))
 
 
+def sanitize_local_model_dir(raw_dir: str) -> Optional[Path]:
+    """Validates that a local model directory path resides strictly inside the user's home or temp directory.
+
+    Applies explicit `os.path.normpath` + prefix containment checks to prevent CWE-22 path injection.
+    """
+    cleaned = (raw_dir or "").strip()
+    if not cleaned or "\x00" in cleaned:
+        return None
+    home_root = os.path.normpath(os.path.realpath(os.path.expanduser("~"))) + os.sep
+    tmp_root = os.path.normpath(os.path.realpath(tempfile.gettempdir())) + os.sep
+    normalized = os.path.normpath(os.path.realpath(os.path.expanduser(cleaned)))
+    if normalized.startswith(home_root):
+        return Path(normalized)
+    if normalized.startswith(tmp_root):
+        return Path(normalized)
+    return None
+
+
+def _sanitize_lockfile_path(lockfile_path: Optional[Path]) -> Path:
+    """Resolves and validates a lockfile path within the user's home or temp directory."""
+    if lockfile_path is None:
+        return default_lockfile_path()
+    safe = sanitize_local_model_dir(str(lockfile_path))
+    if safe is None:
+        return default_lockfile_path()
+    return safe
+
+
 @dataclass
 class ModelSecuritySettings:
     """User-controlled local model supply-chain security settings."""
 
     allow_unverified_huggingface: bool = False
-    huggingface_bypass_acknowledged: bool = False
+    huggingface_override_acknowledged: bool = False
     apple_signed_only: bool = False
     local_model_dir: str = ""
     lockfile_path: str = ""
@@ -112,22 +141,22 @@ class ModelSecuritySettings:
         if self.apple_signed_only and not self.allow_unverified_huggingface:
             return ModelTrustPolicy.APPLE_SIGNED_ONLY
         if self.allow_unverified_huggingface:
-            return ModelTrustPolicy.HUGGINGFACE_BYPASS
+            return ModelTrustPolicy.HUGGINGFACE_OVERRIDE
         return ModelTrustPolicy.STRICT_VERIFIED
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "policy": self.policy.value,
             "allow_unverified_huggingface": self.allow_unverified_huggingface,
-            "huggingface_bypass_acknowledged": self.huggingface_bypass_acknowledged,
+            "huggingface_override_acknowledged": self.huggingface_override_acknowledged,
             "apple_signed_only": self.apple_signed_only,
             "local_model_dir": self.local_model_dir,
             "lockfile_path": self.lockfile_path or str(default_lockfile_path()),
             "require_lockfile_match": self.require_lockfile_match,
-            "trusted_publishers": sorted(TRUSTED_FIRST_PARTY_PUBLISHERS),
+            "first_party_orgs": sorted(FIRST_PARTY_MODEL_ORGS),
             "trust_remote_code_forced_false": True,
             "pickle_and_python_files_blocked": True,
-            "warning": HUGGINGFACE_BYPASS_WARNING if self.allow_unverified_huggingface else "",
+            "warning": HUGGINGFACE_OVERRIDE_WARNING if self.allow_unverified_huggingface else "",
         }
 
     @classmethod
@@ -141,12 +170,16 @@ class ModelSecuritySettings:
                     settings.allow_unverified_huggingface = bool(
                         raw.get("allow_unverified_huggingface", False)
                     )
-                    settings.huggingface_bypass_acknowledged = bool(
-                        raw.get("huggingface_bypass_acknowledged", False)
+                    settings.huggingface_override_acknowledged = bool(
+                        raw.get("huggingface_override_acknowledged", False)
                     )
                     settings.apple_signed_only = bool(raw.get("apple_signed_only", False))
-                    settings.local_model_dir = str(raw.get("local_model_dir", "") or "")
-                    settings.lockfile_path = str(raw.get("lockfile_path", "") or "")
+                    raw_dir = str(raw.get("local_model_dir", "") or "").strip()
+                    safe_dir = sanitize_local_model_dir(raw_dir) if raw_dir else None
+                    settings.local_model_dir = str(safe_dir) if safe_dir is not None else ""
+                    raw_lock = str(raw.get("lockfile_path", "") or "").strip()
+                    safe_lock = sanitize_local_model_dir(raw_lock) if raw_lock else None
+                    settings.lockfile_path = str(safe_lock) if safe_lock is not None else ""
                     settings.require_lockfile_match = bool(
                         raw.get("require_lockfile_match", False)
                     )
@@ -154,13 +187,15 @@ class ModelSecuritySettings:
             pass
 
         # Environment override for CI/headless explicit opt-in
-        env_bypass = os.environ.get("MACHYBRID_ALLOW_HF_BYPASS", "").strip().lower()
-        if env_bypass in {"1", "true", "yes"}:
+        env_override = os.environ.get("MACHYBRID_ALLOW_HF_OVERRIDE", "").strip().lower()
+        if env_override in {"1", "true", "yes"}:
             settings.allow_unverified_huggingface = True
-            settings.huggingface_bypass_acknowledged = True
+            settings.huggingface_override_acknowledged = True
         env_local_dir = os.environ.get("MACHYBRID_LOCAL_MODEL_DIR", "").strip()
         if env_local_dir:
-            settings.local_model_dir = env_local_dir
+            safe_env_dir = sanitize_local_model_dir(env_local_dir)
+            if safe_env_dir is not None:
+                settings.local_model_dir = str(safe_env_dir)
         return settings
 
     def save(self, config_path: Optional[Path] = None) -> Path:
@@ -168,7 +203,7 @@ class ModelSecuritySettings:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "allow_unverified_huggingface": self.allow_unverified_huggingface,
-            "huggingface_bypass_acknowledged": self.huggingface_bypass_acknowledged,
+            "huggingface_override_acknowledged": self.huggingface_override_acknowledged,
             "apple_signed_only": self.apple_signed_only,
             "local_model_dir": self.local_model_dir,
             "lockfile_path": self.lockfile_path,
@@ -186,7 +221,7 @@ class ModelAuditResult:
     model_id: str
     publisher_trust: str  # "apple_signed" | "local_verified_dir" | "first_party" | "community_unverified"
     policy_applied: str
-    bypass_used: bool = False
+    override_used: bool = False
     warnings: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     locked_sha256_verified: Optional[bool] = None
@@ -207,7 +242,7 @@ def classify_model_publisher(model_id: str, is_local_dir: bool = False) -> str:
     if "/" not in cleaned:
         return "community_unverified"
     org = cleaned.split("/", 1)[0].strip().lower()
-    if org in TRUSTED_FIRST_PARTY_PUBLISHERS:
+    if org in FIRST_PARTY_MODEL_ORGS:
         return "first_party"
     return "community_unverified"
 
@@ -225,7 +260,9 @@ def _sha256_file(path: Path) -> str:
 
 def compute_model_directory_digest(model_dir: Path) -> Tuple[str, Dict[str, str]]:
     """Computes a deterministic SHA-256 manifest digest over config, tokenizer, and safetensors files."""
-    resolved = Path(os.path.realpath(str(model_dir)))
+    resolved = sanitize_local_model_dir(str(model_dir))
+    if resolved is None:
+        raise ValueError("Model directory must reside inside your home or temp directory.")
     file_hashes: Dict[str, str] = {}
     target_names = {"config.json", "tokenizer_config.json", "model.safetensors.index.json"}
     for entry in sorted(resolved.iterdir(), key=lambda p: p.name):
@@ -241,7 +278,7 @@ def compute_model_directory_digest(model_dir: Path) -> Tuple[str, Dict[str, str]
 
 
 def load_model_lockfile(lockfile_path: Optional[Path] = None) -> Dict[str, Any]:
-    path = lockfile_path or default_lockfile_path()
+    path = _sanitize_lockfile_path(lockfile_path)
     try:
         if path.is_file():
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -260,7 +297,9 @@ def pin_model_to_lockfile(
     lockfile_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Computes SHA-256 digests for `model_dir` and pins `model_id` in `models.lock.json`."""
-    resolved = Path(os.path.realpath(str(model_dir)))
+    resolved = sanitize_local_model_dir(str(model_dir))
+    if resolved is None:
+        raise ValueError("Model directory must reside inside your home or temp directory.")
     if not resolved.is_dir():
         raise ValueError(f"Model directory does not exist: {resolved}")
 
@@ -282,7 +321,7 @@ def pin_model_to_lockfile(
         "files": file_hashes,
     }
 
-    path = lockfile_path or default_lockfile_path()
+    path = _sanitize_lockfile_path(lockfile_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     existing: Dict[str, Any] = {}
     if path.is_file():
@@ -299,18 +338,24 @@ def pin_model_to_lockfile(
 
 
 def _find_forbidden_files(model_dir: Path) -> List[str]:
+    safe_dir = sanitize_local_model_dir(str(model_dir))
+    if safe_dir is None:
+        return []
     bad: List[str] = []
-    for root, _, files in os.walk(model_dir):
+    for root, _, files in os.walk(safe_dir):
         for fname in sorted(files):
             ext = Path(fname).suffix.lower()
             if ext in FORBIDDEN_MODEL_EXTENSIONS:
-                bad.append(os.path.relpath(os.path.join(root, fname), model_dir))
+                bad.append(os.path.relpath(os.path.join(root, fname), safe_dir))
     return bad
 
 
 def _audit_tokenizer_config(model_dir: Path) -> List[str]:
     issues: List[str] = []
-    tok_cfg = model_dir / "tokenizer_config.json"
+    safe_dir = sanitize_local_model_dir(str(model_dir))
+    if safe_dir is None:
+        return issues
+    tok_cfg = safe_dir / "tokenizer_config.json"
     if not tok_cfg.is_file():
         return issues
     try:
@@ -344,7 +389,7 @@ def audit_model_directory(
     trust = classify_model_publisher(model_id, is_local_dir=is_local_dir)
     warnings: List[str] = []
     errors: List[str] = []
-    bypass_used = False
+    override_used = False
     files_scanned = 0
     resolved_str = ""
     locked_verified: Optional[bool] = None
@@ -356,25 +401,29 @@ def audit_model_directory(
             model_id=model_id,
             publisher_trust="apple_signed",
             policy_applied=cfg.policy.value,
-            bypass_used=False,
+            override_used=False,
             warnings=[],
             errors=[],
             locked_sha256_verified=True,
         )
 
-    # 2. If apple_signed_only is active and user did NOT enable bypass, block all non-Apple/non-local-dir models
+    # 2. If apple_signed_only is active and user did NOT enable override, block all non-Apple/non-local-dir models
     if cfg.apple_signed_only and not cfg.allow_unverified_huggingface and trust != "local_verified_dir":
         errors.append(
             f"Blocked `{model_id}`: Apple-Signed Only policy is active. "
             "Use `--local-backend apple_fm` (Apple Foundation Models), `--local-model-dir <path>`, "
-            "or explicitly enable the warning-gated Hugging Face bypass."
+            "or explicitly enable the warning-gated Hugging Face override."
         )
 
     # 3. Inspect local directory contents for forbidden pickle/Python files & malicious tokenizer configs
     resolved_path: Optional[Path] = None
     if model_dir is not None:
-        candidate = Path(os.path.realpath(str(model_dir)))
-        if candidate.is_dir():
+        candidate = sanitize_local_model_dir(str(model_dir))
+        if candidate is None:
+            errors.append(
+                f"Blocked unsafe model directory outside allowed home/temp roots for `{model_id}`."
+            )
+        elif candidate.is_dir():
             resolved_path = candidate
             resolved_str = str(candidate)
             for _, _, files in os.walk(candidate):
@@ -399,7 +448,7 @@ def audit_model_directory(
             errors.extend(_audit_tokenizer_config(candidate))
 
     # 4. Check lockfile SHA-256 verification (if pinned or required)
-    lock_path = Path(cfg.lockfile_path) if cfg.lockfile_path else default_lockfile_path()
+    lock_path = _sanitize_lockfile_path(Path(cfg.lockfile_path) if cfg.lockfile_path else None)
     lock_entries = load_model_lockfile(lock_path)
     pinned = lock_entries.get(model_id)
     if pinned and resolved_path is not None:
@@ -426,23 +475,23 @@ def audit_model_directory(
             f"Blocked `{model_id}`: `require_lockfile_match` is enabled and this model is not pinned in {lock_path}."
         )
 
-    # 5. Publisher trust policy enforcement (blocks unverified Hugging Face orgs unless bypass enabled)
+    # 5. Publisher trust policy enforcement (blocks unverified Hugging Face orgs unless override enabled)
     if trust == "community_unverified":
         if locked_verified is True:
             warnings.append(
                 f"Community model `{model_id}` allowed because its SHA-256 digest matches your local lockfile."
             )
         elif cfg.allow_unverified_huggingface:
-            bypass_used = True
-            warnings.append(HUGGINGFACE_BYPASS_WARNING)
+            override_used = True
+            warnings.append(HUGGINGFACE_OVERRIDE_WARNING)
         else:
             errors.append(
                 f"Blocked unverified Hugging Face community model `{model_id}` under strict supply-chain protection. "
                 "Options: (1) use Apple-signed `--local-backend apple_fm` (macOS 26+), "
                 "(2) load a verified local folder via `--local-model-dir <path>`, "
                 "(3) pin an audited copy with `machybrid security pin`, or "
-                "(4) explicitly opt into the warning-gated bypass (`machybrid security allow-hf`, "
-                "`--allow-huggingface-bypass`, or Settings -> Supply-Chain Protection)."
+                "(4) explicitly opt into the warning-gated override (`machybrid security allow-hf`, "
+                "`--allow-huggingface-bypass`, or Settings -> Local & Security)."
             )
 
     return ModelAuditResult(
@@ -450,7 +499,7 @@ def audit_model_directory(
         model_id=model_id,
         publisher_trust=trust,
         policy_applied=cfg.policy.value,
-        bypass_used=bypass_used,
+        override_used=override_used,
         warnings=warnings,
         errors=errors,
         locked_sha256_verified=locked_verified,
